@@ -63,7 +63,7 @@ pub fn read_state(module_path: &Path) -> StateContent {
 /// Priority:
 /// 1. Backend-configured local path from `.terraform/terraform.tfstate`
 /// 2. `terraform.tfstate` in the module directory
-fn resolve_state_path(module_path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_state_path(module_path: &Path) -> Option<PathBuf> {
     let backend_meta = module_path.join(".terraform").join("terraform.tfstate");
     if let Ok(content) = std::fs::read_to_string(&backend_meta) {
         if let Ok(meta) = serde_json::from_str::<BackendMeta>(&content) {

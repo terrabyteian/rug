@@ -163,7 +163,6 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// A single unit of work: run a terraform command in a module directory.
-#[derive(Debug)]
 pub struct Task {
     pub id: usize,
     pub module_path: PathBuf,
@@ -180,6 +179,9 @@ pub struct Task {
     /// Resource operation counts parsed from the plan/apply/destroy summary line.
     /// None until a summary line has been seen in the task output.
     pub resource_counts: Option<ResourceCounts>,
+    /// Handle for aborting the spawned tokio task (killing the subprocess).
+    /// None for tasks that are still in the module queue (not yet spawned).
+    pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl Task {

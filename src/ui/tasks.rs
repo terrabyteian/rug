@@ -31,6 +31,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .map(|(display_pos, &vec_idx)| {
             let task = &app.tasks[vec_idx];
             let is_selected = Some(display_pos) == selected_display_pos;
+            let is_multi = app.task_multi_select.contains(&task.id);
 
             let status_style = match &task.status {
                 TaskStatus::Pending   => Style::default().fg(Color::DarkGray),
@@ -48,8 +49,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 format!("  {elapsed}")
             };
 
+            let check = if is_multi { "✓ " } else { "  " };
+
             let mut spans = vec![
-                Span::styled(format!(" {icon} "), status_style),
+                Span::styled(check.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{icon} "), status_style),
                 Span::raw(format!("{:<20} ", task.module_name)),
                 Span::styled(format!("{:<8}", task.command), Style::default().fg(Color::Blue)),
                 Span::styled(elapsed_part, Style::default().fg(Color::DarkGray)),

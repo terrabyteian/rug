@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod discovery;
+mod lock;
 mod module;
 mod plan_cache;
 mod runner;

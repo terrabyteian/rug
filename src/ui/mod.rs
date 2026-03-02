@@ -55,7 +55,7 @@ fn event_loop<B: ratatui::backend::Backend>(
             match event::read()? {
             Event::Mouse(mouse) => {
                 // Hard overlays absorb all mouse events.
-                if app.pending_quit || app.pending_confirm.is_some() || app.filter_active { continue; }
+                if app.pending_quit || app.pending_confirm.is_some() || !app.pending_cancel_task.is_empty() || app.filter_active { continue; }
 
                 // State explorer: only pass scroll events through.
                 if app.state_explorer.is_some() {
@@ -172,6 +172,19 @@ fn event_loop<B: ratatui::backend::Backend>(
                         }
                         _ => {
                             app.cancel_confirm();
+                        }
+                    }
+                    continue;
+                }
+
+                // Cancel-task confirmation intercepts all keys.
+                if !app.pending_cancel_task.is_empty() {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            app.cancel_staged_tasks();
+                        }
+                        _ => {
+                            app.pending_cancel_task.clear();
                         }
                     }
                     continue;
@@ -303,16 +316,21 @@ fn event_loop<B: ratatui::backend::Backend>(
                     } }
 
                     // Module actions.
-                    KeyCode::Char(' ') => {
-                        if app.focus == Focus::Modules {
+                    KeyCode::Char(' ') => match app.focus {
+                        Focus::Modules => {
                             if key.modifiers.contains(KeyModifiers::CONTROL) {
                                 app.range_select();
                             } else {
                                 app.toggle_multi_select();
                             }
                         }
-                    }
-                    KeyCode::Char('c') => app.multi_select.clear(),
+                        Focus::Tasks => { app.toggle_task_select(); }
+                        Focus::Output => {}
+                    },
+                    KeyCode::Char('c') => match app.focus {
+                        Focus::Tasks => app.task_multi_select.clear(),
+                        _ => app.multi_select.clear(),
+                    },
                     KeyCode::Enter => {
                         if app.focus == Focus::Modules {
                             app.open_state_explorer();
@@ -330,6 +348,10 @@ fn event_loop<B: ratatui::backend::Backend>(
                     // Destructive commands require confirmation.
                     KeyCode::Char('a') => app.request_apply_confirm(),
                     KeyCode::Char('d') => app.request_destroy_confirm(),
+                    KeyCode::Char('U') => app.request_force_unlock_confirm(),
+
+                    // Cancel the selected task (with confirmation).
+                    KeyCode::Char('C') => app.request_cancel_task_confirm(),
 
                     // Depth limiter.
                     KeyCode::Char('[') => app.decrease_depth(),
@@ -410,6 +432,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     if let Some(confirm) = &app.pending_confirm {
         render_confirm(f, area, confirm);
     }
+
+    if !app.pending_cancel_task.is_empty() {
+        let tasks: Vec<(&str, &str)> = app.pending_cancel_task.iter()
+            .filter_map(|&id| app.tasks.iter().find(|t| t.id == id))
+            .map(|t| (t.module_name.as_str(), t.command.as_str()))
+            .collect();
+        if !tasks.is_empty() {
+            render_cancel_task_confirm(f, area, &tasks);
+        }
+    }
 }
 
 fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
@@ -422,9 +454,9 @@ fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     let help_text = "\
 j/k ↑/↓   Navigate lists or scroll output
 g / G      Jump to first / last
-Space      Toggle module multi-select
+Space      Toggle multi-select (Modules or Tasks pane)
 Ctrl+Space Range-select modules
-c          Clear selection
+c          Clear selection (current pane)
 Enter      State explorer (Modules) / Fullscreen (Output)
 Esc        Close overlay / clear filter
 i          Init selected modules
@@ -432,6 +464,8 @@ u          Init -upgrade selected modules
 p          Plan selected modules
 a          Apply selected modules
 d          Destroy selected modules
+U          Force-unlock state (if locked)
+C          Cancel selected task
 /          Filter modules by name
 [ / ]      Decrease / increase depth
 r          Refresh module list
@@ -440,7 +474,7 @@ h / ?      Toggle this help
 q / Ctrl-C Quit";
 
     let width = 52u16;
-    let height = 22u16;
+    let height = 24u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width.min(area.width), height.min(area.height));
@@ -537,9 +571,32 @@ fn render_confirm(
                 ),
             },
             ConfirmKind::Destroy | ConfirmKind::InitUpgrade => Span::raw(""),
+            ConfirmKind::ForceUnlock => {
+                if let Some(id) = &target.lock_id {
+                    let short_id = if id.len() > 8 {
+                        format!("{}…", &id[..8])
+                    } else {
+                        id.clone()
+                    };
+                    let who = target.lock_who.as_deref().unwrap_or("?");
+                    Span::styled(
+                        format!("lock {short_id}  by {who}"),
+                        Style::default().fg(Color::Yellow),
+                    )
+                } else {
+                    Span::raw("")
+                }
+            }
         };
 
         lines.push(Line::from(vec![name_span, plan_span]));
+    }
+
+    if confirm.kind == ConfirmKind::ForceUnlock {
+        lines.push(Line::from(Span::styled(
+            "  \u{26a0} Force-removes the state lock",
+            Style::default().fg(Color::Red),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -567,6 +624,64 @@ fn render_confirm(
                     .title(format!(" Confirm {label} "))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Red)),
+            )
+            .alignment(Alignment::Left),
+        popup,
+    );
+}
+
+fn render_cancel_task_confirm(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    tasks: &[(&str, &str)],
+) {
+    use ratatui::{
+        layout::{Alignment, Rect},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph},
+    };
+
+    let n = tasks.len();
+    let noun = if n == 1 { "task" } else { "tasks" };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("  Cancel {n} {noun}:"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for &(module_name, command) in tasks {
+        lines.push(Line::from(vec![
+            Span::raw(format!("    • {:<20} ", module_name)),
+            Span::styled(command.to_string(), Style::default().fg(Color::Blue)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[y] Cancel task(s)", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled("[any] Keep running", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let height = (lines.len() + 2) as u16;
+    let width = 52u16.min(area.width);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" Cancel {n} Task(s) "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
             )
             .alignment(Alignment::Left),
         popup,

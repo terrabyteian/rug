@@ -9,6 +9,9 @@ use crate::task::{TaskEvent, TaskEventSender};
 /// Spawn a task in a background tokio task, emitting events to `tx`.
 /// Per-module sequencing is handled at the app level; by the time this is
 /// called the task is ready to compete for a semaphore slot and run.
+///
+/// Returns an `AbortHandle` that can be used to cancel the task at any point
+/// (semaphore-waiting, process-running, or I/O-draining).
 pub fn spawn_task(
     task_id: usize,
     module_path: std::path::PathBuf,
@@ -18,7 +21,7 @@ pub fn spawn_task(
     args: Vec<String>,
     tx: TaskEventSender,
     semaphore: Arc<Semaphore>,
-) {
+) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         let _permit = semaphore.acquire_owned().await.unwrap();
 
@@ -73,5 +76,5 @@ pub fn spawn_task(
 
         let success = status.map(|s| s.success()).unwrap_or(false);
         let _ = tx_fin.send(TaskEvent::Finished { task_id, success });
-    });
+    }).abort_handle()
 }

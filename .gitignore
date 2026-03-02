@@ -4,3 +4,4 @@
 fixtures/.state/
 **/.terraform/
 **/*.tfstate.backup
+**/*.tfstate.*.backup

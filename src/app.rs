@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::config::Config;
+use crate::lock::{read_lock_info, parse_lock_from_output};
 use crate::module::Module;
 use crate::plan_cache::PlanCache;
 use crate::runner::spawn_task;
@@ -45,6 +46,10 @@ pub struct ConfirmTarget {
     pub module_name: String,
     /// Human-readable plan age ("2m ago") or None if no prior plan.
     pub plan_age: Option<String>,
+    /// Lock ID (for ForceUnlock confirmations).
+    pub lock_id: Option<String>,
+    /// Lock holder (for ForceUnlock confirmations).
+    pub lock_who: Option<String>,
 }
 
 /// Which destructive operation is waiting for confirmation.
@@ -53,6 +58,7 @@ pub enum ConfirmKind {
     Apply,
     Destroy,
     InitUpgrade,
+    ForceUnlock,
 }
 
 impl ConfirmKind {
@@ -61,6 +67,7 @@ impl ConfirmKind {
             Self::Apply => "APPLY",
             Self::Destroy => "DESTROY",
             Self::InitUpgrade => "INIT -UPGRADE",
+            Self::ForceUnlock => "FORCE UNLOCK",
         }
     }
 }
@@ -210,6 +217,8 @@ pub struct App {
     /// Visible-list position of the last Space press; used as the anchor for
     /// Ctrl+Space range selection.
     pub multi_select_anchor: Option<usize>,
+    /// Tasks currently multi-selected (task IDs).
+    pub task_multi_select: Vec<usize>,
     /// Filter string for the module list.
     pub filter: String,
     pub filter_active: bool,
@@ -218,6 +227,8 @@ pub struct App {
     pub show_help: bool,
     /// Staged destructive command awaiting user confirmation.
     pub pending_confirm: Option<PendingConfirm>,
+    /// Task IDs staged for cancel confirmation (`C` key). Empty = no dialog.
+    pub pending_cancel_task: Vec<usize>,
     /// Set when the user pressed `q` while tasks were still running.
     /// The TUI stays alive until all tasks finish (or user force-quits).
     pub pending_quit: bool,
@@ -259,11 +270,13 @@ impl App {
             focus: Focus::Modules,
             multi_select: Vec::new(),
             multi_select_anchor: None,
+            task_multi_select: Vec::new(),
             filter: String::new(),
             filter_active: false,
             max_depth: None,
             show_help: false,
             pending_confirm: None,
+            pending_cancel_task: Vec::new(),
             pending_quit: false,
             output_fullscreen: false,
             h_split_col: None,
@@ -413,6 +426,16 @@ impl App {
             self.multi_select.push(real_idx);
         }
         self.multi_select_anchor = Some(self.selected_module);
+    }
+
+    /// Toggle the currently highlighted task in/out of `task_multi_select`.
+    pub fn toggle_task_select(&mut self) {
+        let Some(task_id) = self.selected_task_id else { return };
+        if let Some(pos) = self.task_multi_select.iter().position(|&id| id == task_id) {
+            self.task_multi_select.remove(pos);
+        } else {
+            self.task_multi_select.push(task_id);
+        }
     }
 
     /// Add all visible modules between the last Space anchor and the cursor to
@@ -601,12 +624,13 @@ impl App {
             finished_at: None,
             plan_output_path: plan_output_path.clone(),
             resource_counts: None,
+            abort_handle: None,
         });
 
         if !self.running_modules.contains(&module_path) {
             // Module is idle: start immediately.
             self.running_modules.insert(module_path.clone());
-            spawn_task(
+            let handle = spawn_task(
                 task_id,
                 module_path,
                 module.display_name.clone(),
@@ -616,6 +640,9 @@ impl App {
                 self.event_tx.clone(),
                 self.semaphore.clone(),
             );
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                t.abort_handle = Some(handle);
+            }
         } else {
             // Module is busy: slot as the single pending task, cancelling any
             // previously-queued task that hasn't started yet.
@@ -656,6 +683,8 @@ impl App {
                 module_idx: i,
                 module_name: m.display_name.clone(),
                 plan_age: self.plan_cache.get(&m.path).map(|e| e.age_str()),
+                lock_id: None,
+                lock_who: None,
             })
             .collect();
 
@@ -676,7 +705,9 @@ impl App {
             .map(|(i, m)| ConfirmTarget {
                 module_idx: i,
                 module_name: m.display_name.clone(),
-                plan_age: None, // destroy doesn't use plan files
+                plan_age: None,
+                lock_id: None,
+                lock_who: None,
             })
             .collect();
 
@@ -689,11 +720,26 @@ impl App {
     /// Execute the confirmed command. Call after user presses `y`.
     pub fn confirm_execute(&mut self) {
         if let Some(confirm) = self.pending_confirm.take() {
-            let indices: Vec<usize> = confirm.targets.iter().map(|t| t.module_idx).collect();
             match confirm.kind {
-                ConfirmKind::Apply => self.enqueue_apply_for(&indices),
-                ConfirmKind::Destroy => self.enqueue_destroy_for(&indices),
-                ConfirmKind::InitUpgrade => self.enqueue_init_upgrade_for(&indices),
+                ConfirmKind::Apply => {
+                    let indices: Vec<usize> = confirm.targets.iter().map(|t| t.module_idx).collect();
+                    self.enqueue_apply_for(&indices);
+                }
+                ConfirmKind::Destroy => {
+                    let indices: Vec<usize> = confirm.targets.iter().map(|t| t.module_idx).collect();
+                    self.enqueue_destroy_for(&indices);
+                }
+                ConfirmKind::InitUpgrade => {
+                    let indices: Vec<usize> = confirm.targets.iter().map(|t| t.module_idx).collect();
+                    self.enqueue_init_upgrade_for(&indices);
+                }
+                ConfirmKind::ForceUnlock => {
+                    let pairs: Vec<(usize, String)> = confirm.targets
+                        .into_iter()
+                        .filter_map(|t| t.lock_id.map(|id| (t.module_idx, id)))
+                        .collect();
+                    self.enqueue_force_unlock_for(&pairs);
+                }
             }
         }
     }
@@ -710,6 +756,8 @@ impl App {
                 module_idx: i,
                 module_name: m.display_name.clone(),
                 plan_age: None,
+                lock_id: None,
+                lock_who: None,
             })
             .collect();
 
@@ -728,8 +776,162 @@ impl App {
         self.maybe_auto_select_task(first_new_idx);
     }
 
+    /// Detect a lock for a module by parsing the output of its most recent
+    /// terminal task that contains a "Lock Info:" block.
+    ///
+    /// Used as a fallback for remote/S3 backends that don't write a local
+    /// `.lock.info` file but do print the lock details to stdout/stderr when
+    /// lock acquisition fails.
+    fn detect_lock_from_tasks(&self, module_idx: usize) -> Option<crate::lock::LockInfo> {
+        let module_path = &self.modules[module_idx].path;
+        self.tasks.iter()
+            .filter(|t| &t.module_path == module_path && t.status.is_terminal())
+            .filter_map(|t| {
+                let lock = parse_lock_from_output(&t.output_lines)?;
+                Some((t.finished_at, lock))
+            })
+            .max_by_key(|(fa, _)| *fa)
+            .map(|(_, lock)| lock)
+    }
+
+    /// Stage `force-unlock` for confirmation.
+    ///
+    /// Detects lock info from a local `.lock.info` file first; if not found,
+    /// falls back to parsing the "Lock Info:" block from recent task output
+    /// (works for any backend — S3, remote, etc.).
+    /// If no lock is detected for any target, returns silently.
+    pub fn request_force_unlock_confirm(&mut self) {
+        let targets = self.target_indices();
+        if targets.is_empty() { return; }
+
+        let confirm_targets: Vec<ConfirmTarget> = targets
+            .iter()
+            .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
+            .filter_map(|(i, m)| {
+                let lock = read_lock_info(&m.path)
+                    .or_else(|| self.detect_lock_from_tasks(i))?;
+                Some(ConfirmTarget {
+                    module_idx: i,
+                    module_name: m.display_name.clone(),
+                    plan_age: None,
+                    lock_id: Some(lock.id),
+                    lock_who: Some(lock.who),
+                })
+            })
+            .collect();
+
+        if confirm_targets.is_empty() { return; }
+
+        self.pending_confirm = Some(PendingConfirm {
+            kind: ConfirmKind::ForceUnlock,
+            targets: confirm_targets,
+        });
+    }
+
+    /// Enqueue `force-unlock -force <lock_id>` for each (module_idx, lock_id) pair.
+    fn enqueue_force_unlock_for(&mut self, targets: &[(usize, String)]) {
+        if targets.is_empty() { return; }
+        let first_new_idx = self.tasks.len();
+        for (idx, lock_id) in targets {
+            self.push_task(*idx, "force-unlock", vec!["-force".to_string(), lock_id.clone()], None);
+        }
+        self.maybe_auto_select_task(first_new_idx);
+    }
+
     pub fn cancel_confirm(&mut self) {
         self.pending_confirm = None;
+    }
+
+    /// Stage tasks for cancel confirmation.
+    ///
+    /// Targets `task_multi_select` if non-empty, otherwise the highlighted task.
+    /// Filters out already-terminal tasks. No-op if nothing active remains.
+    pub fn request_cancel_task_confirm(&mut self) {
+        let candidates: Vec<usize> = if self.task_multi_select.is_empty() {
+            self.selected_task_id.into_iter().collect()
+        } else {
+            self.task_multi_select.clone()
+        };
+
+        let active: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&id| {
+                self.tasks.iter()
+                    .find(|t| t.id == id)
+                    .map(|t| !t.status.is_terminal())
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if !active.is_empty() {
+            self.pending_cancel_task = active;
+        }
+    }
+
+    /// Execute cancellation for all staged task IDs, then clear staging + multi-select.
+    pub fn cancel_staged_tasks(&mut self) {
+        let ids = std::mem::take(&mut self.pending_cancel_task);
+        for id in ids {
+            self.cancel_task(id);
+        }
+        self.task_multi_select.clear();
+    }
+
+    /// Cancel a single task by ID (if not already terminal).
+    ///
+    /// - Queued (not yet spawned): removed from the module queue.
+    /// - Pending/Running (spawned): the tokio task is aborted, killing the
+    ///   subprocess via `kill_on_drop`. The next queued task for the module
+    ///   (if any) is started immediately.
+    fn cancel_task(&mut self, task_id: usize) {
+        let (status, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
+            Some(t) => (t.status.clone(), t.module_path.clone()),
+            None => return,
+        };
+
+        if status.is_terminal() { return; }
+
+        // Case 1: task is queued (waiting for the current task on this module to finish).
+        if let Some(queued) = self.module_queues.get(&module_path) {
+            if queued.task_id == task_id {
+                self.module_queues.remove(&module_path);
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                    t.status = TaskStatus::Cancelled;
+                    t.finished_at = Some(std::time::Instant::now());
+                }
+                return;
+            }
+        }
+
+        // Case 2: task is spawned (Pending waiting for semaphore, or Running).
+        // Abort the tokio task — kill_on_drop kills the child process.
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            if let Some(handle) = t.abort_handle.take() {
+                handle.abort();
+            }
+            t.status = TaskStatus::Cancelled;
+            t.finished_at = Some(std::time::Instant::now());
+        }
+
+        // Remove the module from the running set and start next queued task.
+        self.running_modules.remove(&module_path);
+        if let Some(queued) = self.module_queues.remove(&module_path) {
+            let module_name = self.modules[queued.module_idx].display_name.clone();
+            let handle = spawn_task(
+                queued.task_id,
+                module_path.clone(),
+                module_name,
+                self.config.binary.clone(),
+                queued.command,
+                queued.args,
+                self.event_tx.clone(),
+                self.semaphore.clone(),
+            );
+            self.running_modules.insert(module_path);
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == queued.task_id) {
+                t.abort_handle = Some(handle);
+            }
+        }
     }
 
     // ── State explorer ───────────────────────────────────────────────────────
@@ -1166,6 +1368,14 @@ impl App {
                     }
                 }
                 TaskEvent::Finished { task_id, success } => {
+                    // Skip stale Finished events for tasks that were already
+                    // cancelled (e.g. task completed naturally just before abort).
+                    let already_cancelled = self.tasks.iter()
+                        .find(|t| t.id == task_id)
+                        .map(|t| t.status == TaskStatus::Cancelled)
+                        .unwrap_or(false);
+                    if already_cancelled { continue; }
+
                     // Collect plan info and module path before the mutable borrow below.
                     let (plan_info, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
                         Some(t) => {
@@ -1193,9 +1403,9 @@ impl App {
                     if let Some(path) = module_path {
                         if let Some(queued) = self.module_queues.remove(&path) {
                             let module = &self.modules[queued.module_idx];
-                            spawn_task(
+                            let handle = spawn_task(
                                 queued.task_id,
-                                path,
+                                path.clone(),
                                 module.display_name.clone(),
                                 self.config.binary.clone(),
                                 queued.command,
@@ -1203,6 +1413,9 @@ impl App {
                                 self.event_tx.clone(),
                                 self.semaphore.clone(),
                             );
+                            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == queued.task_id) {
+                                t.abort_handle = Some(handle);
+                            }
                         } else {
                             self.running_modules.remove(&path);
                         }
