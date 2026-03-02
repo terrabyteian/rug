@@ -1,0 +1,18 @@
+[package]
+name = "rug"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rug"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
