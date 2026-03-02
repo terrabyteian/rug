@@ -46,7 +46,7 @@ for cmd in cargo zig gh; do
   fi
 done
 
-if ! cargo zigbuild --version &>/dev/null 2>&1; then
+if ! command -v cargo-zigbuild &>/dev/null; then
   echo "ERROR: cargo-zigbuild not installed — run: cargo install cargo-zigbuild" >&2
   exit 1
 fi
