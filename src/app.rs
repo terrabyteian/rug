@@ -219,6 +219,9 @@ pub struct App {
     pub multi_select_anchor: Option<usize>,
     /// Tasks currently multi-selected (task IDs).
     pub task_multi_select: Vec<usize>,
+    /// Spinner frame counter, incremented each drain_events call (~10 Hz).
+    /// Used by the UI to animate the Cancelling status indicator.
+    pub spinner_tick: u8,
     /// Filter string for the module list.
     pub filter: String,
     pub filter_active: bool,
@@ -271,6 +274,7 @@ impl App {
             multi_select: Vec::new(),
             multi_select_anchor: None,
             task_multi_select: Vec::new(),
+            spinner_tick: 0,
             filter: String::new(),
             filter_active: false,
             max_depth: None,
@@ -624,7 +628,7 @@ impl App {
             finished_at: None,
             plan_output_path: plan_output_path.clone(),
             resource_counts: None,
-            abort_handle: None,
+            cancel_handle: None,
         });
 
         if !self.running_modules.contains(&module_path) {
@@ -641,7 +645,7 @@ impl App {
                 self.semaphore.clone(),
             );
             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                t.abort_handle = Some(handle);
+                t.cancel_handle = Some(handle);
             }
         } else {
             // Module is busy: slot as the single pending task, cancelling any
@@ -877,12 +881,13 @@ impl App {
         self.task_multi_select.clear();
     }
 
-    /// Cancel a single task by ID (if not already terminal).
+    /// Cancel a single task by ID.
     ///
-    /// - Queued (not yet spawned): removed from the module queue.
-    /// - Pending/Running (spawned): the tokio task is aborted, killing the
-    ///   subprocess via `kill_on_drop`. The next queued task for the module
-    ///   (if any) is started immediately.
+    /// - Queued (not yet spawned): removed from the module queue immediately.
+    /// - Pending/Running (spawned, first call): sends SIGINT for graceful
+    ///   shutdown; status becomes `Cancelling`. Module cleanup happens when
+    ///   the process actually exits (via the `Finished` event in drain_events).
+    /// - Cancelling (spawned, second call): sends SIGKILL immediately.
     fn cancel_task(&mut self, task_id: usize) {
         let (status, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
             Some(t) => (t.status.clone(), t.module_path.clone()),
@@ -891,7 +896,7 @@ impl App {
 
         if status.is_terminal() { return; }
 
-        // Case 1: task is queued (waiting for the current task on this module to finish).
+        // Case 1: task is queued (not yet spawned).
         if let Some(queued) = self.module_queues.get(&module_path) {
             if queued.task_id == task_id {
                 self.module_queues.remove(&module_path);
@@ -903,34 +908,23 @@ impl App {
             }
         }
 
-        // Case 2: task is spawned (Pending waiting for semaphore, or Running).
-        // Abort the tokio task — kill_on_drop kills the child process.
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-            if let Some(handle) = t.abort_handle.take() {
-                handle.abort();
+        // Case 2: already cancelling — escalate to SIGKILL.
+        if status == TaskStatus::Cancelling {
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                if let Some(handle) = t.cancel_handle.as_mut() {
+                    handle.force_kill();
+                }
             }
-            t.status = TaskStatus::Cancelled;
-            t.finished_at = Some(std::time::Instant::now());
+            return;
         }
 
-        // Remove the module from the running set and start next queued task.
-        self.running_modules.remove(&module_path);
-        if let Some(queued) = self.module_queues.remove(&module_path) {
-            let module_name = self.modules[queued.module_idx].display_name.clone();
-            let handle = spawn_task(
-                queued.task_id,
-                module_path.clone(),
-                module_name,
-                self.config.binary.clone(),
-                queued.command,
-                queued.args,
-                self.event_tx.clone(),
-                self.semaphore.clone(),
-            );
-            self.running_modules.insert(module_path);
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == queued.task_id) {
-                t.abort_handle = Some(handle);
+        // Case 3: spawned and running — send SIGINT, enter Cancelling state.
+        // Module queue cleanup is deferred until the Finished event arrives.
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            if let Some(handle) = t.cancel_handle.as_mut() {
+                handle.cancel();
             }
+            t.status = TaskStatus::Cancelling;
         }
     }
 
@@ -1349,6 +1343,7 @@ impl App {
 
     /// Drain pending task events (non-blocking).
     pub fn drain_events(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 TaskEvent::Started { task_id } => {
@@ -1369,17 +1364,24 @@ impl App {
                 }
                 TaskEvent::Finished { task_id, success } => {
                     // Skip stale Finished events for tasks that were already
-                    // cancelled (e.g. task completed naturally just before abort).
+                    // fully cancelled (e.g. task completed just before SIGINT).
+                    // Cancelling tasks are NOT skipped — we need the event to
+                    // transition them to Cancelled and clean up the module queue.
                     let already_cancelled = self.tasks.iter()
                         .find(|t| t.id == task_id)
                         .map(|t| t.status == TaskStatus::Cancelled)
                         .unwrap_or(false);
                     if already_cancelled { continue; }
 
+                    let is_cancelling = self.tasks.iter()
+                        .find(|t| t.id == task_id)
+                        .map(|t| t.status == TaskStatus::Cancelling)
+                        .unwrap_or(false);
+
                     // Collect plan info and module path before the mutable borrow below.
                     let (plan_info, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
                         Some(t) => {
-                            let plan = if success {
+                            let plan = if success && !is_cancelling {
                                 t.plan_output_path.as_ref().map(|p| (t.module_path.clone(), p.clone()))
                             } else {
                                 None
@@ -1390,7 +1392,14 @@ impl App {
                     };
 
                     if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                        task.status = if success { TaskStatus::Success } else { TaskStatus::Failed };
+                        task.cancel_handle = None;
+                        task.status = if is_cancelling {
+                            TaskStatus::Cancelled
+                        } else if success {
+                            TaskStatus::Success
+                        } else {
+                            TaskStatus::Failed
+                        };
                         task.finished_at = Some(std::time::Instant::now());
                     }
 
@@ -1414,7 +1423,7 @@ impl App {
                                 self.semaphore.clone(),
                             );
                             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == queued.task_id) {
-                                t.abort_handle = Some(handle);
+                                t.cancel_handle = Some(handle);
                             }
                         } else {
                             self.running_modules.remove(&path);

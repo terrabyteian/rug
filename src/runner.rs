@@ -4,14 +4,16 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::task::{TaskEvent, TaskEventSender};
+use crate::task::{CancelHandle, TaskEvent, TaskEventSender};
 
 /// Spawn a task in a background tokio task, emitting events to `tx`.
-/// Per-module sequencing is handled at the app level; by the time this is
-/// called the task is ready to compete for a semaphore slot and run.
 ///
-/// Returns an `AbortHandle` that can be used to cancel the task at any point
-/// (semaphore-waiting, process-running, or I/O-draining).
+/// Returns a `CancelHandle` with two escalation levels:
+///   1. `cancel()`     → sends SIGINT (same as Ctrl+C); waits indefinitely for
+///                        the process to exit gracefully so tofu can release
+///                        locks and print its interrupt message.
+///   2. `force_kill()` → sends SIGKILL immediately if the process is still
+///                        running after a graceful-cancel request.
 pub fn spawn_task(
     task_id: usize,
     module_path: std::path::PathBuf,
@@ -21,12 +23,26 @@ pub fn spawn_task(
     args: Vec<String>,
     tx: TaskEventSender,
     semaphore: Arc<Semaphore>,
-) -> tokio::task::AbortHandle {
-    tokio::spawn(async move {
-        let _permit = semaphore.acquire_owned().await.unwrap();
+) -> CancelHandle {
+    let (sigint_tx,  mut sigint_rx)  = tokio::sync::oneshot::channel::<()>();
+    let (sigkill_tx, mut sigkill_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let tx_line = tx.clone();
-        let tx_fin = tx.clone();
+    tokio::spawn(async move {
+        // Acquire semaphore slot; allow both cancel signals to abort the wait.
+        let _permit = tokio::select! {
+            result = semaphore.acquire_owned() => match result {
+                Ok(p) => p,
+                Err(_) => return,
+            },
+            _ = &mut sigint_rx  => {
+                let _ = tx.send(TaskEvent::Finished { task_id, success: false });
+                return;
+            },
+            _ = &mut sigkill_rx => {
+                let _ = tx.send(TaskEvent::Finished { task_id, success: false });
+                return;
+            },
+        };
 
         let mut cmd = Command::new(&binary);
         cmd.arg(&command)
@@ -41,20 +57,22 @@ pub fn spawn_task(
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx_fin.send(TaskEvent::Line {
+                let _ = tx.send(TaskEvent::Line {
                     task_id,
                     line: format!("error: failed to spawn: {e}"),
                 });
-                let _ = tx_fin.send(TaskEvent::Finished { task_id, success: false });
+                let _ = tx.send(TaskEvent::Finished { task_id, success: false });
                 return;
             }
         };
 
+        let pid = child.id();
+
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let tx_out = tx_line.clone();
-        let tx_err = tx_line.clone();
+        let tx_out = tx.clone();
+        let tx_err = tx.clone();
 
         let out_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
@@ -70,11 +88,47 @@ pub fn spawn_task(
             }
         });
 
-        let status = child.wait().await;
-        out_task.await.ok();
-        err_task.await.ok();
+        let success = tokio::select! {
+            // Natural completion.
+            status = child.wait() => {
+                out_task.await.ok();
+                err_task.await.ok();
+                status.map(|s| s.success()).unwrap_or(false)
+            },
 
-        let success = status.map(|s| s.success()).unwrap_or(false);
-        let _ = tx_fin.send(TaskEvent::Finished { task_id, success });
-    }).abort_handle()
+            // Graceful cancel: send SIGINT then wait indefinitely.
+            // A second escalation (force_kill) can arrive via sigkill_rx.
+            _ = &mut sigint_rx => {
+                if let Some(pid) = pid {
+                    #[cfg(unix)]
+                    unsafe { libc::kill(pid as i32, libc::SIGINT); }
+                }
+                // Wait for graceful exit OR an explicit force-kill.
+                tokio::select! {
+                    _ = child.wait() => {},
+                    _ = sigkill_rx => {
+                        child.kill().await.ok();
+                        child.wait().await.ok();
+                    },
+                }
+                out_task.await.ok();
+                err_task.await.ok();
+                false
+            },
+
+            // Direct force-kill (e.g. second cancel before first completes,
+            // or sigkill sent without a prior sigint).
+            _ = &mut sigkill_rx => {
+                child.kill().await.ok();
+                child.wait().await.ok();
+                out_task.await.ok();
+                err_task.await.ok();
+                false
+            },
+        };
+
+        let _ = tx.send(TaskEvent::Finished { task_id, success });
+    });
+
+    CancelHandle::new(sigint_tx, sigkill_tx)
 }

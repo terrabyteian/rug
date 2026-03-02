@@ -8,6 +8,8 @@ use tokio::sync::mpsc;
 pub enum TaskStatus {
     Pending,
     Running,
+    /// SIGINT sent; waiting for the process to exit gracefully.
+    Cancelling,
     Success,
     Failed,
     Cancelled,
@@ -16,11 +18,12 @@ pub enum TaskStatus {
 impl TaskStatus {
     pub fn icon(&self) -> &'static str {
         match self {
-            Self::Pending => "○",
-            Self::Running => "⟳",
-            Self::Success => "✓",
-            Self::Failed => "✗",
-            Self::Cancelled => "⊘",
+            Self::Pending    => "○",
+            Self::Running    => "⟳",
+            Self::Cancelling => "◐",   // overridden with animated frames in tasks.rs
+            Self::Success    => "✓",
+            Self::Failed     => "✗",
+            Self::Cancelled  => "⊘",
         }
     }
 
@@ -162,6 +165,35 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Handle for cancelling a spawned task.
+///
+/// First call to `cancel()` sends SIGINT (graceful shutdown — same as Ctrl+C).
+/// If the process hasn't exited by the time `force_kill()` is called, SIGKILL
+/// is sent immediately. Both methods are idempotent.
+pub struct CancelHandle {
+    sigint:  Option<tokio::sync::oneshot::Sender<()>>,
+    sigkill: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl CancelHandle {
+    pub fn new(
+        sigint:  tokio::sync::oneshot::Sender<()>,
+        sigkill: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self { sigint: Some(sigint), sigkill: Some(sigkill) }
+    }
+
+    /// Send SIGINT — graceful shutdown. No-op if already sent.
+    pub fn cancel(&mut self) {
+        if let Some(tx) = self.sigint.take() { let _ = tx.send(()); }
+    }
+
+    /// Send SIGKILL — immediate termination. No-op if already sent.
+    pub fn force_kill(&mut self) {
+        if let Some(tx) = self.sigkill.take() { let _ = tx.send(()); }
+    }
+}
+
 /// A single unit of work: run a terraform command in a module directory.
 pub struct Task {
     pub id: usize,
@@ -179,9 +211,9 @@ pub struct Task {
     /// Resource operation counts parsed from the plan/apply/destroy summary line.
     /// None until a summary line has been seen in the task output.
     pub resource_counts: Option<ResourceCounts>,
-    /// Handle for aborting the spawned tokio task (killing the subprocess).
+    /// Handle for gracefully cancelling the spawned task (SIGINT → SIGKILL).
     /// None for tasks that are still in the module queue (not yet spawned).
-    pub abort_handle: Option<tokio::task::AbortHandle>,
+    pub cancel_handle: Option<CancelHandle>,
 }
 
 impl Task {

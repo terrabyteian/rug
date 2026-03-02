@@ -33,15 +33,22 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let is_selected = Some(display_pos) == selected_display_pos;
             let is_multi = app.task_multi_select.contains(&task.id);
 
+            const CANCEL_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+
             let status_style = match &task.status {
-                TaskStatus::Pending   => Style::default().fg(Color::DarkGray),
-                TaskStatus::Running   => Style::default().fg(Color::Yellow),
-                TaskStatus::Success   => Style::default().fg(Color::Green),
-                TaskStatus::Failed    => Style::default().fg(Color::Red),
-                TaskStatus::Cancelled => Style::default().fg(Color::DarkGray),
+                TaskStatus::Pending    => Style::default().fg(Color::DarkGray),
+                TaskStatus::Running    => Style::default().fg(Color::Yellow),
+                TaskStatus::Cancelling => Style::default().fg(Color::Magenta),
+                TaskStatus::Success    => Style::default().fg(Color::Green),
+                TaskStatus::Failed     => Style::default().fg(Color::Red),
+                TaskStatus::Cancelled  => Style::default().fg(Color::DarkGray),
             };
 
-            let icon = task.status.icon();
+            let icon = if task.status == TaskStatus::Cancelling {
+                CANCEL_FRAMES[(app.spinner_tick as usize / 2) % CANCEL_FRAMES.len()]
+            } else {
+                task.status.icon()
+            };
             let elapsed = task.elapsed_str();
             let elapsed_part = if elapsed.is_empty() {
                 String::new()
