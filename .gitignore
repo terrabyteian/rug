@@ -1,4 +1,6 @@
 /target
 /.claude
+/.state/
 fixtures/.state/
 **/.terraform/
+**/*.tfstate.backup

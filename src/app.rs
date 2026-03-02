@@ -28,6 +28,15 @@ pub enum Focus {
     Output,
 }
 
+/// Which resize divider is being dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragHandle {
+    /// Vertical border between the modules pane and the right panel.
+    Vertical,
+    /// Horizontal border between the output pane and the tasks pane.
+    Horizontal,
+}
+
 /// Per-module info shown in a confirmation overlay.
 #[derive(Debug, Clone)]
 pub struct ConfirmTarget {
@@ -78,6 +87,9 @@ pub struct App {
     pub focus: Focus,
     /// Modules currently multi-selected (indices into `modules`).
     pub multi_select: Vec<usize>,
+    /// Visible-list position of the last Space press; used as the anchor for
+    /// Ctrl+Space range selection.
+    pub multi_select_anchor: Option<usize>,
     /// Filter string for the module list.
     pub filter: String,
     pub filter_active: bool,
@@ -91,6 +103,12 @@ pub struct App {
     pub pending_quit: bool,
     /// When true the output pane fills the whole terminal (mouse capture off).
     pub output_fullscreen: bool,
+    /// Width of the modules (left) pane in columns. None → default 25%.
+    pub h_split_col: Option<u16>,
+    /// Height of the output (top-right) pane in rows. None → default 65%.
+    pub v_split_row: Option<u16>,
+    /// Which resize divider is currently being dragged, if any.
+    pub dragging: Option<DragHandle>,
     pub next_task_id: usize,
     pub event_tx: TaskEventSender,
     pub event_rx: TaskEventReceiver,
@@ -118,6 +136,7 @@ impl App {
             output_scroll: 0,
             focus: Focus::Modules,
             multi_select: Vec::new(),
+            multi_select_anchor: None,
             filter: String::new(),
             filter_active: false,
             max_depth: None,
@@ -125,6 +144,9 @@ impl App {
             pending_confirm: None,
             pending_quit: false,
             output_fullscreen: false,
+            h_split_col: None,
+            v_split_row: None,
+            dragging: None,
             next_task_id: 0,
             event_tx: tx,
             event_rx: rx,
@@ -133,6 +155,22 @@ impl App {
             running_modules: HashSet::new(),
             module_queues: HashMap::new(),
         }
+    }
+
+    // ── Layout splits ────────────────────────────────────────────────────────
+
+    /// Width of the left (modules) pane, clamped to stay usable.
+    pub fn effective_h_split(&self, total_width: u16) -> u16 {
+        self.h_split_col
+            .unwrap_or(total_width / 4)
+            .clamp(5, total_width.saturating_sub(10))
+    }
+
+    /// Height of the top-right (output) pane, clamped to stay usable.
+    pub fn effective_v_split(&self, total_height: u16) -> u16 {
+        self.v_split_row
+            .unwrap_or(total_height * 65 / 100)
+            .clamp(4, total_height.saturating_sub(4))
     }
 
     // ── Module navigation ────────────────────────────────────────────────────
@@ -235,6 +273,27 @@ impl App {
         } else {
             self.multi_select.push(real_idx);
         }
+        self.multi_select_anchor = Some(self.selected_module);
+    }
+
+    /// Add all visible modules between the last Space anchor and the cursor to
+    /// the selection (Ctrl+Space range-select). Falls back to a plain toggle if
+    /// there is no anchor yet.
+    pub fn range_select(&mut self) {
+        let Some(anchor) = self.multi_select_anchor else {
+            self.toggle_multi_select();
+            return;
+        };
+        let visible = self.visible_module_indices();
+        let current = self.selected_module;
+        let lo = anchor.min(current);
+        let hi = (anchor.max(current)).min(visible.len().saturating_sub(1));
+        for &real_idx in &visible[lo..=hi] {
+            if !self.multi_select.contains(&real_idx) {
+                self.multi_select.push(real_idx);
+            }
+        }
+        self.multi_select_anchor = Some(current);
     }
 
     pub fn go_to_first(&mut self) {
@@ -403,6 +462,7 @@ impl App {
             started_at: None,
             finished_at: None,
             plan_output_path: plan_output_path.clone(),
+            resource_counts: None,
         });
 
         if !self.running_modules.contains(&module_path) {
@@ -548,6 +608,11 @@ impl App {
                 }
                 TaskEvent::Line { task_id, line } => {
                     if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                        if matches!(task.command.as_str(), "plan" | "apply" | "destroy") {
+                            if let Some(counts) = crate::task::parse_counts_from_line(&line) {
+                                task.resource_counts = Some(counts);
+                            }
+                        }
                         task.output_lines.push(line);
                     }
                 }

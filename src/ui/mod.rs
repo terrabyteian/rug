@@ -12,7 +12,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::time::Duration;
 
-use crate::app::{App, ConfirmKind, Focus, PendingConfirm};
+use crate::app::{App, ConfirmKind, DragHandle, Focus, PendingConfirm};
 
 /// Run the full TUI event loop until the user quits.
 pub fn run_tui(app: &mut App) -> Result<()> {
@@ -59,10 +59,43 @@ fn event_loop<B: ratatui::backend::Backend>(
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Ok(size) = terminal.size() {
-                            if let Some(focus) = pane_for_click(mouse.column, mouse.row, size) {
-                                app.focus = focus;
+                            let col = mouse.column;
+                            let row = mouse.row;
+                            let h_split = app.effective_h_split(size.width);
+                            let v_split = app.effective_v_split(size.height);
+                            // Hit-test the vertical divider (within 1 col).
+                            if col + 1 == h_split || col == h_split {
+                                app.dragging = Some(DragHandle::Vertical);
+                            // Hit-test the horizontal divider (right panel, within 1 row).
+                            } else if col >= h_split && (row + 1 == v_split || row == v_split) {
+                                app.dragging = Some(DragHandle::Horizontal);
+                            } else {
+                                app.dragging = None;
+                                if let Some(focus) = pane_for_click(col, row, size, app) {
+                                    app.focus = focus;
+                                }
                             }
                         }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Ok(size) = terminal.size() {
+                            match app.dragging {
+                                Some(DragHandle::Vertical) => {
+                                    app.h_split_col = Some(
+                                        mouse.column.clamp(5, size.width.saturating_sub(10)),
+                                    );
+                                }
+                                Some(DragHandle::Horizontal) => {
+                                    app.v_split_row = Some(
+                                        mouse.row.clamp(4, size.height.saturating_sub(4)),
+                                    );
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        app.dragging = None;
                     }
                     MouseEventKind::ScrollUp => match app.focus {
                         Focus::Modules => app.move_module_selection(-1),
@@ -182,7 +215,11 @@ fn event_loop<B: ratatui::backend::Backend>(
                     // Module actions.
                     KeyCode::Char(' ') => {
                         if app.focus == Focus::Modules {
-                            app.toggle_multi_select();
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.range_select();
+                            } else {
+                                app.toggle_multi_select();
+                            }
                         }
                     }
                     KeyCode::Char('c') => app.multi_select.clear(),
@@ -233,15 +270,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 
     // Outer split: left (modules) | right (output + tasks)
+    let left_width = app.effective_h_split(area.width);
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
+        .constraints([Constraint::Length(left_width), Constraint::Min(0)])
         .split(area);
 
     // Right split: output (top) | tasks (bottom)
+    let top_height = app.effective_v_split(area.height);
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Length(top_height), Constraint::Min(0)])
         .split(h_chunks[1]);
 
     tree::render(f, h_chunks[0], app);
@@ -311,20 +350,16 @@ q / Ctrl-C Quit";
 }
 
 /// Map a mouse click position to the pane it landed in.
-///
-/// Mirrors the layout constraints in `draw`:
-///   horizontal: Modules 25% | right 75%
-///   vertical (right side): Output 65% | Tasks 35%
-fn pane_for_click(col: u16, row: u16, size: ratatui::layout::Size) -> Option<Focus> {
+fn pane_for_click(col: u16, row: u16, size: ratatui::layout::Size, app: &App) -> Option<Focus> {
     if size.width == 0 || size.height == 0 {
         return None;
     }
-    let modules_right_edge = size.width * 25 / 100;
-    if col < modules_right_edge {
+    let h_split = app.effective_h_split(size.width);
+    if col < h_split {
         Some(Focus::Modules)
     } else {
-        let output_bottom_edge = size.height * 65 / 100;
-        if row < output_bottom_edge {
+        let v_split = app.effective_v_split(size.height);
+        if row < v_split {
             Some(Focus::Output)
         } else {
             Some(Focus::Tasks)
