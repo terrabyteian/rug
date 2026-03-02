@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::module::Module;
 use crate::plan_cache::PlanCache;
 use crate::runner::spawn_task;
+use crate::state::StateContent;
 use crate::task::{Task, TaskEvent, TaskEventReceiver, TaskEventSender, TaskStatus};
 use crate::discovery;
 
@@ -71,6 +72,114 @@ pub struct PendingConfirm {
     pub targets: Vec<ConfirmTarget>,
 }
 
+/// Detail view for a single resource instance — the drill-down from the list.
+pub struct ResourceDetail {
+    /// Address displayed in the sub-title.
+    pub address: String,
+    /// Pre-formatted lines of the instance JSON body.
+    pub lines: Vec<String>,
+    /// Number of lines scrolled from the top.
+    pub scroll: usize,
+}
+
+/// Which state-explorer operation is being confirmed / run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorerOpKind {
+    Taint,
+    StateRm,
+}
+
+impl ExplorerOpKind {
+    /// Terraform sub-command to pass to runner.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Taint   => "taint",
+            Self::StateRm => "state",
+        }
+    }
+
+    /// Extra args before the resource address.
+    pub fn pre_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Taint   => &[],
+            Self::StateRm => &["rm"],
+        }
+    }
+
+    pub fn confirm_title(self) -> &'static str {
+        match self {
+            Self::Taint   => " Confirm Taint ",
+            Self::StateRm => " Confirm Remove from State ",
+        }
+    }
+
+    pub fn confirm_verb(self) -> &'static str {
+        match self {
+            Self::Taint   => "Taint",
+            Self::StateRm => "Remove from state",
+        }
+    }
+
+    pub fn progress_title(self) -> &'static str {
+        match self {
+            Self::Taint   => " Taint Progress ",
+            Self::StateRm => " State Remove Progress ",
+        }
+    }
+
+    pub fn result_title(self, all_ok: bool) -> &'static str {
+        match (self, all_ok) {
+            (Self::Taint,   true)  => " Taint Complete ",
+            (Self::Taint,   false) => " Taint — Some Failed ",
+            (Self::StateRm, true)  => " State Remove Complete ",
+            (Self::StateRm, false) => " State Remove — Some Failed ",
+        }
+    }
+}
+
+/// An explorer operation in progress (sequential, one address at a time).
+pub struct PendingOp {
+    pub kind: ExplorerOpKind,
+    /// Remaining addresses (front = next).
+    pub queue: Vec<String>,
+    /// Currently-running: (task_id, address).
+    pub running: Option<(usize, String)>,
+    /// Completed entries: (address, success).
+    pub done: Vec<(String, bool)>,
+}
+
+/// Result of a completed explorer operation, shown until dismissed.
+pub struct OpResult {
+    pub kind: ExplorerOpKind,
+    pub entries: Vec<(String, bool)>,
+}
+
+/// State shown in the state-explorer for a single module.
+pub struct StateExplorer {
+    pub module_idx: usize,
+    pub module_name: String,
+    pub content: StateContent,
+    /// Index into the *filtered* resource list that is currently highlighted.
+    pub selected: usize,
+    /// Current filter string (case-insensitive substring match against addresses).
+    pub filter: String,
+    /// Whether the filter input is actively receiving keystrokes.
+    pub filter_active: bool,
+    /// When `Some`, the view shows resource detail instead of the resource list.
+    pub detail_view: Option<ResourceDetail>,
+    /// Unfiltered resource indices that are multi-selected.
+    pub multi_select: Vec<usize>,
+    /// When `Some`, a confirmation dialog is shown for the given operation.
+    pub op_confirm: Option<ExplorerOpKind>,
+    /// Addresses staged for the pending confirmation.
+    pub op_targets: Vec<String>,
+    /// Operation currently in progress.
+    pub pending_op: Option<PendingOp>,
+    /// Result of the last operation (dismissed on any keypress).
+    pub op_result: Option<OpResult>,
+}
+
+
 /// Shared application state, used by both TUI and headless modes.
 pub struct App {
     pub config: Config,
@@ -115,6 +224,8 @@ pub struct App {
     pub semaphore: Arc<Semaphore>,
     /// In-session plan file cache; files live in a managed temp dir.
     pub plan_cache: PlanCache,
+    /// State explorer popup, open when `Some`.
+    pub state_explorer: Option<StateExplorer>,
     /// Modules that currently have a running task.
     running_modules: HashSet<PathBuf>,
     /// At most one pending task per module, waiting for the running task to
@@ -152,6 +263,7 @@ impl App {
             event_rx: rx,
             semaphore: Arc::new(Semaphore::new(parallelism)),
             plan_cache: PlanCache::new(),
+            state_explorer: None,
             running_modules: HashSet::new(),
             module_queues: HashMap::new(),
         }
@@ -609,6 +721,347 @@ impl App {
         self.pending_confirm = None;
     }
 
+    // ── State explorer ───────────────────────────────────────────────────────
+
+    /// Open the state explorer for the currently selected (or focused) module.
+    pub fn open_state_explorer(&mut self) {
+        let visible = self.visible_module_indices();
+        let Some(&idx) = visible.get(self.selected_module) else { return };
+        let module = &self.modules[idx];
+        let content = crate::state::read_state(&module.path);
+        self.state_explorer = Some(StateExplorer {
+            module_idx: idx,
+            module_name: module.display_name.clone(),
+            content,
+            selected: 0,
+            filter: String::new(),
+            filter_active: false,
+            detail_view: None,
+            multi_select: Vec::new(),
+            op_confirm: None,
+            op_targets: Vec::new(),
+            pending_op: None,
+            op_result: None,
+        });
+    }
+
+    pub fn close_state_explorer(&mut self) {
+        self.state_explorer = None;
+    }
+
+    /// Move the selected resource in the state explorer by `delta` rows,
+    /// operating on the currently filtered list.
+    pub fn state_explorer_move(&mut self, delta: i32) {
+        let Some(explorer) = &mut self.state_explorer else { return };
+        if let StateContent::Resources(ref resources) = explorer.content {
+            let count = explorer_filtered_count(resources, &explorer.filter);
+            if count == 0 { return; }
+            explorer.selected = (explorer.selected as i32 + delta)
+                .clamp(0, count as i32 - 1) as usize;
+        }
+    }
+
+    pub fn state_explorer_go_first(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.selected = 0;
+        }
+    }
+
+    pub fn state_explorer_go_last(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            if let StateContent::Resources(ref resources) = explorer.content {
+                let count = explorer_filtered_count(resources, &explorer.filter);
+                if count > 0 {
+                    explorer.selected = count - 1;
+                }
+            }
+        }
+    }
+
+    pub fn state_explorer_activate_filter(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.filter.clear();
+            explorer.filter_active = true;
+            explorer.selected = 0;
+        }
+    }
+
+    /// Deactivate filter input mode. Keeps the filter string applied.
+    pub fn state_explorer_deactivate_filter(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.filter_active = false;
+        }
+    }
+
+    /// Clear the filter string and deactivate filter mode.
+    pub fn state_explorer_clear_filter(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.filter.clear();
+            explorer.filter_active = false;
+            explorer.selected = 0;
+        }
+    }
+
+    pub fn state_explorer_filter_push(&mut self, c: char) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.filter.push(c);
+            self.clamp_state_explorer_selection();
+        }
+    }
+
+    pub fn state_explorer_filter_pop(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.filter.pop();
+            self.clamp_state_explorer_selection();
+        }
+    }
+
+    fn clamp_state_explorer_selection(&mut self) {
+        let Some(explorer) = &mut self.state_explorer else { return };
+        if let StateContent::Resources(ref resources) = explorer.content {
+            let count = explorer_filtered_count(resources, &explorer.filter);
+            if count == 0 {
+                explorer.selected = 0;
+            } else if explorer.selected >= count {
+                explorer.selected = count - 1;
+            }
+        }
+    }
+
+    // ── Resource detail view ─────────────────────────────────────────────────
+
+    /// Open the detail view for the currently selected filtered resource.
+    pub fn open_resource_detail(&mut self) {
+        // Gather data under an immutable borrow first.
+        let result: Option<(String, Vec<String>)> = (|| {
+            let explorer = self.state_explorer.as_ref()?;
+            let StateContent::Resources(ref resources) = explorer.content else { return None };
+
+            let fl = explorer.filter.to_lowercase();
+            let filtered: Vec<&crate::state::StateResource> = if explorer.filter.is_empty() {
+                resources.iter().collect()
+            } else {
+                resources.iter().filter(|r| r.address.to_lowercase().contains(&fl)).collect()
+            };
+
+            let resource = filtered.get(explorer.selected)?;
+            let address = resource.address.clone();
+            let json = serde_json::to_string_pretty(&resource.instance)
+                .unwrap_or_else(|_| "{}".to_string());
+            let lines = json.lines().map(|l| l.to_string()).collect();
+            Some((address, lines))
+        })();
+
+        if let (Some(explorer), Some((address, lines))) = (&mut self.state_explorer, result) {
+            explorer.detail_view = Some(ResourceDetail { address, lines, scroll: 0 });
+        }
+    }
+
+    /// Close the detail view and return to the resource list.
+    pub fn close_resource_detail(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.detail_view = None;
+        }
+    }
+
+    pub fn resource_detail_scroll(&mut self, delta: i32) {
+        let Some(explorer) = &mut self.state_explorer else { return };
+        let Some(detail) = &mut explorer.detail_view else { return };
+        let max = detail.lines.len().saturating_sub(1);
+        if delta < 0 {
+            detail.scroll = detail.scroll.saturating_sub((-delta) as usize);
+        } else {
+            detail.scroll = (detail.scroll + delta as usize).min(max);
+        }
+    }
+
+    pub fn resource_detail_go_first(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            if let Some(detail) = &mut explorer.detail_view {
+                detail.scroll = 0;
+            }
+        }
+    }
+
+    pub fn resource_detail_go_last(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            if let Some(detail) = &mut explorer.detail_view {
+                detail.scroll = detail.lines.len().saturating_sub(1);
+            }
+        }
+    }
+
+    // ── State explorer multi-select & taint ──────────────────────────────────
+
+    /// Toggle the currently highlighted resource in the multi-select set.
+    pub fn state_explorer_toggle_select(&mut self) {
+        let Some(explorer) = &mut self.state_explorer else { return };
+        let StateContent::Resources(ref resources) = explorer.content else { return };
+
+        let fl = explorer.filter.to_lowercase();
+        let real_idx = if explorer.filter.is_empty() {
+            Some(explorer.selected)
+        } else {
+            resources
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.address.to_lowercase().contains(&fl))
+                .nth(explorer.selected)
+                .map(|(i, _)| i)
+        };
+        let Some(real_idx) = real_idx else { return };
+
+        if let Some(pos) = explorer.multi_select.iter().position(|&i| i == real_idx) {
+            explorer.multi_select.remove(pos);
+        } else {
+            explorer.multi_select.push(real_idx);
+        }
+    }
+
+    pub fn state_explorer_clear_select(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.multi_select.clear();
+        }
+    }
+
+    /// Stage a confirmation for the given operation on the selected (or multi-selected) resources.
+    pub fn request_op_confirm(&mut self, kind: ExplorerOpKind) {
+        let Some(explorer) = &mut self.state_explorer else { return };
+        let StateContent::Resources(ref resources) = explorer.content else { return };
+        if resources.is_empty() { return; }
+
+        let targets: Vec<String> = if explorer.multi_select.is_empty() {
+            let fl = explorer.filter.to_lowercase();
+            let filtered: Vec<&crate::state::StateResource> = if explorer.filter.is_empty() {
+                resources.iter().collect()
+            } else {
+                resources.iter().filter(|r| r.address.to_lowercase().contains(&fl)).collect()
+            };
+            match filtered.get(explorer.selected) {
+                Some(r) => vec![r.address.clone()],
+                None => return,
+            }
+        } else {
+            explorer.multi_select.iter()
+                .filter_map(|&i| resources.get(i))
+                .map(|r| r.address.clone())
+                .collect()
+        };
+
+        if targets.is_empty() { return; }
+        explorer.op_targets = targets;
+        explorer.op_confirm = Some(kind);
+    }
+
+    pub fn cancel_op_confirm(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.op_confirm = None;
+            explorer.op_targets.clear();
+        }
+    }
+
+    /// Begin executing the confirmed operation: start the first task, set up PendingOp.
+    pub fn start_op(&mut self) {
+        let (module_idx, kind, mut targets) = {
+            let Some(explorer) = self.state_explorer.as_mut() else { return };
+            let Some(kind) = explorer.op_confirm.take() else { return };
+            let targets = std::mem::take(&mut explorer.op_targets);
+            (explorer.module_idx, kind, targets)
+        };
+
+        if targets.is_empty() { return; }
+
+        let first = targets.remove(0);
+        let remaining = targets;
+
+        let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
+        args.push(first.clone());
+
+        let task_id = self.next_task_id;
+        self.push_task(module_idx, kind.command(), args, None);
+
+        if let Some(explorer) = self.state_explorer.as_mut() {
+            explorer.pending_op = Some(PendingOp {
+                kind,
+                queue: remaining,
+                running: Some((task_id, first)),
+                done: Vec::new(),
+            });
+            explorer.multi_select.clear();
+        }
+    }
+
+    /// Called from drain_events when a task finishes: chains the next op or
+    /// moves to the result view.
+    fn check_op_completion(&mut self, task_id: usize, success: bool) {
+        let (module_idx, kind) = {
+            let Some(explorer) = self.state_explorer.as_ref() else { return };
+            let Some(pt) = explorer.pending_op.as_ref() else { return };
+            let Some((rid, _)) = pt.running.as_ref() else { return };
+            if *rid != task_id { return; }
+            (explorer.module_idx, pt.kind)
+        };
+
+        let next_addr = {
+            let explorer = self.state_explorer.as_mut().unwrap();
+            let pt = explorer.pending_op.as_mut().unwrap();
+            let (_, addr) = pt.running.take().unwrap();
+            pt.done.push((addr, success));
+            if pt.queue.is_empty() { None } else { Some(pt.queue.remove(0)) }
+        };
+
+        if let Some(next) = next_addr {
+            let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
+            args.push(next.clone());
+            let new_task_id = self.next_task_id;
+            self.push_task(module_idx, kind.command(), args, None);
+            let explorer = self.state_explorer.as_mut().unwrap();
+            let pt = explorer.pending_op.as_mut().unwrap();
+            pt.running = Some((new_task_id, next));
+        } else {
+            {
+                let explorer = self.state_explorer.as_mut().unwrap();
+                let done = explorer.pending_op.take().unwrap().done;
+                explorer.op_result = Some(OpResult { kind, entries: done });
+            }
+            // Refresh the resource list so tainted/removed resources reflect
+            // their new status when the result popup is dismissed.
+            self.refresh_state_explorer();
+        }
+    }
+
+    pub fn dismiss_op_result(&mut self) {
+        if let Some(explorer) = &mut self.state_explorer {
+            explorer.op_result = None;
+        }
+    }
+
+    /// Re-read the state file for the current explorer module and update the
+    /// resource list in-place. Clamps selection and clears multi-select.
+    pub fn refresh_state_explorer(&mut self) {
+        let module_path = {
+            let Some(explorer) = self.state_explorer.as_ref() else { return };
+            self.modules[explorer.module_idx].path.clone()
+        };
+
+        let content = crate::state::read_state(&module_path);
+
+        if let Some(explorer) = self.state_explorer.as_mut() {
+            explorer.content = content;
+            explorer.multi_select.clear();
+            let count = if let StateContent::Resources(ref r) = explorer.content {
+                explorer_filtered_count(r, &explorer.filter)
+            } else {
+                0
+            };
+            if count == 0 {
+                explorer.selected = 0;
+            } else if explorer.selected >= count {
+                explorer.selected = count - 1;
+            }
+        }
+    }
+
     // ── Event processing ─────────────────────────────────────────────────────
 
     /// Drain pending task events (non-blocking).
@@ -673,6 +1126,9 @@ impl App {
                             self.running_modules.remove(&path);
                         }
                     }
+
+                    // Chain the next op task if one is waiting.
+                    self.check_op_completion(task_id, success);
                 }
             }
         }
@@ -723,4 +1179,14 @@ fn module_depth(module: &crate::module::Module) -> usize {
     std::path::Path::new(&module.display_name)
         .components()
         .count()
+}
+
+/// Count resources in `resources` that match `filter` (empty = all).
+pub fn explorer_filtered_count(resources: &[crate::state::StateResource], filter: &str) -> usize {
+    if filter.is_empty() {
+        resources.len()
+    } else {
+        let fl = filter.to_lowercase();
+        resources.iter().filter(|r| r.address.to_lowercase().contains(&fl)).count()
+    }
 }

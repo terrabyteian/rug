@@ -4,6 +4,7 @@ mod discovery;
 mod module;
 mod plan_cache;
 mod runner;
+mod state;
 mod task;
 mod ui;
 
