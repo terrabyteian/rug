@@ -217,9 +217,14 @@ fn event_loop<B: ratatui::backend::Backend>(
                     let filter_active = app.state_explorer.as_ref()
                         .map(|e| e.filter_active).unwrap_or(false);
 
+                    let plan_queued = app.state_explorer.as_ref()
+                        .map(|e| e.plan_queued_notice).unwrap_or(false);
+
                     if has_op_result {
                         // Any key dismisses the result overlay.
                         app.dismiss_op_result();
+                    } else if plan_queued {
+                        if let Some(e) = app.state_explorer.as_mut() { e.plan_queued_notice = false; }
                     } else if op_confirm.is_some() {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') => { app.start_op(); }
@@ -258,6 +263,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                             KeyCode::Char('c') => { app.state_explorer_clear_select(); }
                             KeyCode::Char('t') => { app.request_op_confirm(ExplorerOpKind::Taint); }
                             KeyCode::Char('D') => { app.request_op_confirm(ExplorerOpKind::StateRm); }
+                            KeyCode::Char('p') => { app.enqueue_targeted_plan(); }
+                            KeyCode::Char('d') => { app.request_op_confirm(ExplorerOpKind::TargetedDestroy); }
                             KeyCode::Char('r') => { app.refresh_state_explorer(); }
                             _ => {}
                         }
@@ -364,6 +371,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             render_op_progress(f, area, pt);
         } else if let Some(result) = &explorer.op_result {
             render_op_result(f, area, result);
+        } else if explorer.plan_queued_notice {
+            render_plan_queued_notice(f, area);
         }
         return;
     }
@@ -809,7 +818,11 @@ fn render_state_explorer(
             Span::raw("  "),
             Span::styled("[t] Taint", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
-            Span::styled("[D] Remove from state", Style::default().fg(Color::DarkGray)),
+            Span::styled("[D] Rm state", Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled("[p] Plan", Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled("[d] Destroy", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
             Span::styled("[Enter] Inspect", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
@@ -1008,6 +1021,48 @@ fn json_string_end(s: &str, start: usize) -> Option<usize> {
     None
 }
 
+fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::{
+        layout::{Alignment, Rect},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph},
+    };
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Targeted plan queued.",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  Tab to the task list to view output.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  [any key] Dismiss", Style::default().fg(Color::DarkGray))),
+    ];
+
+    let height = (lines.len() + 2) as u16;
+    let width = 46u16.min(area.width);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Plan Queued ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            )
+            .alignment(Alignment::Left),
+        popup,
+    );
+}
+
 fn render_op_confirm(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -1038,6 +1093,13 @@ fn render_op_confirm(
         )));
     }
     lines.push(Line::from(""));
+    if kind == ExplorerOpKind::TargetedDestroy {
+        lines.push(Line::from(Span::styled(
+            "  ⚠  This will DESTROY real infrastructure.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled("[y] Confirm", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),

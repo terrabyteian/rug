@@ -87,52 +87,61 @@ pub struct ResourceDetail {
 pub enum ExplorerOpKind {
     Taint,
     StateRm,
+    /// Targeted destroy: single command with all -target flags, not sequential.
+    TargetedDestroy,
 }
 
 impl ExplorerOpKind {
     /// Terraform sub-command to pass to runner.
     pub fn command(self) -> &'static str {
         match self {
-            Self::Taint   => "taint",
-            Self::StateRm => "state",
+            Self::Taint          => "taint",
+            Self::StateRm        => "state",
+            Self::TargetedDestroy => "destroy",
         }
     }
 
-    /// Extra args before the resource address.
+    /// Extra args before the resource address (sequential ops only).
     pub fn pre_args(self) -> &'static [&'static str] {
         match self {
-            Self::Taint   => &[],
-            Self::StateRm => &["rm"],
+            Self::Taint          => &[],
+            Self::StateRm        => &["rm"],
+            Self::TargetedDestroy => &[],
         }
     }
 
     pub fn confirm_title(self) -> &'static str {
         match self {
-            Self::Taint   => " Confirm Taint ",
-            Self::StateRm => " Confirm Remove from State ",
+            Self::Taint          => " Confirm Taint ",
+            Self::StateRm        => " Confirm Remove from State ",
+            Self::TargetedDestroy => " ⚠  Confirm Targeted Destroy ",
         }
     }
 
     pub fn confirm_verb(self) -> &'static str {
         match self {
-            Self::Taint   => "Taint",
-            Self::StateRm => "Remove from state",
+            Self::Taint          => "Taint",
+            Self::StateRm        => "Remove from state",
+            Self::TargetedDestroy => "DESTROY (targeted)",
         }
     }
 
     pub fn progress_title(self) -> &'static str {
         match self {
-            Self::Taint   => " Taint Progress ",
-            Self::StateRm => " State Remove Progress ",
+            Self::Taint          => " Taint Progress ",
+            Self::StateRm        => " State Remove Progress ",
+            Self::TargetedDestroy => " Targeted Destroy ",
         }
     }
 
     pub fn result_title(self, all_ok: bool) -> &'static str {
         match (self, all_ok) {
-            (Self::Taint,   true)  => " Taint Complete ",
-            (Self::Taint,   false) => " Taint — Some Failed ",
-            (Self::StateRm, true)  => " State Remove Complete ",
-            (Self::StateRm, false) => " State Remove — Some Failed ",
+            (Self::Taint,           true)  => " Taint Complete ",
+            (Self::Taint,           false) => " Taint — Some Failed ",
+            (Self::StateRm,         true)  => " State Remove Complete ",
+            (Self::StateRm,         false) => " State Remove — Some Failed ",
+            (Self::TargetedDestroy, true)  => " Targeted Destroy Complete ",
+            (Self::TargetedDestroy, false) => " Targeted Destroy Failed ",
         }
     }
 }
@@ -177,6 +186,8 @@ pub struct StateExplorer {
     pub pending_op: Option<PendingOp>,
     /// Result of the last operation (dismissed on any keypress).
     pub op_result: Option<OpResult>,
+    /// Set briefly after a targeted plan is queued; dismissed on any keypress.
+    pub plan_queued_notice: bool,
 }
 
 
@@ -742,6 +753,7 @@ impl App {
             op_targets: Vec::new(),
             pending_op: None,
             op_result: None,
+            plan_queued_notice: false,
         });
     }
 
@@ -924,6 +936,49 @@ impl App {
         }
     }
 
+    /// Enqueue a targeted plan for the selected (or multi-selected) resources.
+    /// Runs as a normal task (appears in the task list). No confirmation needed.
+    pub fn enqueue_targeted_plan(&mut self) {
+        let (module_idx, targets) = {
+            let Some(explorer) = self.state_explorer.as_ref() else { return };
+            let StateContent::Resources(ref resources) = explorer.content else { return };
+
+            let fl = explorer.filter.to_lowercase();
+            let targets: Vec<String> = if explorer.multi_select.is_empty() {
+                let filtered: Vec<&crate::state::StateResource> = if explorer.filter.is_empty() {
+                    resources.iter().collect()
+                } else {
+                    resources.iter().filter(|r| r.address.to_lowercase().contains(&fl)).collect()
+                };
+                match filtered.get(explorer.selected) {
+                    Some(r) => vec![r.address.clone()],
+                    None => return,
+                }
+            } else {
+                explorer.multi_select.iter()
+                    .filter_map(|&i| resources.get(i))
+                    .map(|r| r.address.clone())
+                    .collect()
+            };
+
+            (explorer.module_idx, targets)
+        };
+
+        if targets.is_empty() { return; }
+
+        let plan_path = self.plan_cache.plan_path_for(&self.modules[module_idx].path);
+        let mut args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
+        for addr in &targets {
+            args.push(format!("-target={}", addr));
+        }
+        let first_new_idx = self.tasks.len();
+        self.push_task(module_idx, "plan", args, Some(plan_path));
+        self.maybe_auto_select_task(first_new_idx);
+        if let Some(explorer) = self.state_explorer.as_mut() {
+            explorer.plan_queued_notice = true;
+        }
+    }
+
     /// Stage a confirmation for the given operation on the selected (or multi-selected) resources.
     pub fn request_op_confirm(&mut self, kind: ExplorerOpKind) {
         let Some(explorer) = &mut self.state_explorer else { return };
@@ -971,23 +1026,49 @@ impl App {
 
         if targets.is_empty() { return; }
 
-        let first = targets.remove(0);
-        let remaining = targets;
-
-        let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
-        args.push(first.clone());
-
-        let task_id = self.next_task_id;
-        self.push_task(module_idx, kind.command(), args, None);
-
-        if let Some(explorer) = self.state_explorer.as_mut() {
-            explorer.pending_op = Some(PendingOp {
-                kind,
-                queue: remaining,
-                running: Some((task_id, first)),
-                done: Vec::new(),
-            });
-            explorer.multi_select.clear();
+        match kind {
+            ExplorerOpKind::Taint | ExplorerOpKind::StateRm => {
+                // Sequential: run one address at a time, chaining via check_op_completion.
+                let first = targets.remove(0);
+                let remaining = targets;
+                let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
+                args.push(first.clone());
+                let task_id = self.next_task_id;
+                self.push_task(module_idx, kind.command(), args, None);
+                if let Some(explorer) = self.state_explorer.as_mut() {
+                    explorer.pending_op = Some(PendingOp {
+                        kind,
+                        queue: remaining,
+                        running: Some((task_id, first)),
+                        done: Vec::new(),
+                    });
+                    explorer.multi_select.clear();
+                }
+            }
+            ExplorerOpKind::TargetedDestroy => {
+                // Single batch: all -target flags in one command.
+                let n = targets.len();
+                let mut args = vec!["-auto-approve".to_string()];
+                for addr in &targets {
+                    args.push(format!("-target={}", addr));
+                }
+                let label = if n == 1 {
+                    targets.remove(0)
+                } else {
+                    format!("{} targeted resources", n)
+                };
+                let task_id = self.next_task_id;
+                self.push_task(module_idx, "destroy", args, None);
+                if let Some(explorer) = self.state_explorer.as_mut() {
+                    explorer.pending_op = Some(PendingOp {
+                        kind,
+                        queue: vec![],
+                        running: Some((task_id, label)),
+                        done: Vec::new(),
+                    });
+                    explorer.multi_select.clear();
+                }
+            }
         }
     }
 
