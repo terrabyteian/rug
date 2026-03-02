@@ -98,14 +98,14 @@ fn event_loop<B: ratatui::backend::Backend>(
                         app.dragging = None;
                     }
                     MouseEventKind::ScrollUp => match app.focus {
-                        Focus::Modules => app.move_module_selection(-1),
-                        Focus::Tasks   => app.move_task_selection(-1),
-                        Focus::Output  => app.scroll_output(3),
+                        Focus::Modules => { app.move_module_selection(-1); }
+                        Focus::Tasks   => { app.move_task_selection(-1); }
+                        Focus::Output  => { app.scroll_output(3); }
                     },
                     MouseEventKind::ScrollDown => match app.focus {
-                        Focus::Modules => app.move_module_selection(1),
-                        Focus::Tasks   => app.move_task_selection(1),
-                        Focus::Output  => app.scroll_output(-3),
+                        Focus::Modules => { app.move_module_selection(1); }
+                        Focus::Tasks   => { app.move_task_selection(1); }
+                        Focus::Output  => { app.scroll_output(-3); }
                     },
                     _ => {}
                 }
@@ -125,8 +125,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                             app.output_fullscreen = false;
                             execute!(io::stdout(), EnableMouseCapture)?;
                         }
-                        KeyCode::Char('j') | KeyCode::Down  => app.scroll_output(-1),
-                        KeyCode::Char('k') | KeyCode::Up    => app.scroll_output(1),
+                        KeyCode::Char('j') | KeyCode::Down  => { app.scroll_output(-1); }
+                        KeyCode::Char('k') | KeyCode::Up    => { app.scroll_output(1); }
                         KeyCode::Char('g') => app.go_to_first(),
                         KeyCode::Char('G') => app.go_to_last(),
                         _ => {}
@@ -203,14 +203,16 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('G') => app.go_to_last(),
 
                     // Navigation.
-                    KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                        Focus::Modules => app.move_module_selection(1),
-                        Focus::Tasks | Focus::Output => app.move_task_selection(1),
-                    },
-                    KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                        Focus::Modules => app.move_module_selection(-1),
-                        Focus::Tasks | Focus::Output => app.move_task_selection(-1),
-                    },
+                    KeyCode::Char('j') | KeyCode::Down => { match app.focus {
+                        Focus::Modules => { app.move_module_selection(1); }
+                        Focus::Tasks   => { app.move_task_selection(1); }
+                        Focus::Output  => { app.scroll_output(-1); }
+                    } }
+                    KeyCode::Char('k') | KeyCode::Up => { match app.focus {
+                        Focus::Modules => { app.move_module_selection(-1); }
+                        Focus::Tasks   => { app.move_task_selection(-1); }
+                        Focus::Output  => { app.scroll_output(1); }
+                    } }
 
                     // Module actions.
                     KeyCode::Char(' ') => {
@@ -312,11 +314,13 @@ fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     };
 
     let help_text = "\
-j/k ↑/↓   Navigate modules / tasks
+j/k ↑/↓   Navigate lists or scroll output
 g / G      Jump to first / last
-Space      Multi-select module
+Space      Toggle module multi-select
+Ctrl+Space Range-select modules
 c          Clear selection
 Enter      Fullscreen output (Esc to exit)
+Esc        Clear filter
 i          Init selected modules
 u          Init -upgrade selected modules
 p          Plan selected modules
@@ -330,7 +334,7 @@ h / ?      Toggle this help
 q / Ctrl-C Quit";
 
     let width = 48u16;
-    let height = 19u16;
+    let height = 21u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width.min(area.width), height.min(area.height));

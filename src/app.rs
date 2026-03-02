@@ -210,23 +210,33 @@ impl App {
         // already unlimited — nothing to do
     }
 
-    pub fn move_module_selection(&mut self, delta: i32) {
+    /// Returns true if the selection actually moved.
+    pub fn move_module_selection(&mut self, delta: i32) -> bool {
         let count = self.visible_module_indices().len();
-        if count == 0 { return; }
-        self.selected_module = (self.selected_module as i32 + delta)
-            .rem_euclid(count as i32) as usize;
+        if count == 0 { return false; }
+        let new = (self.selected_module as i32 + delta)
+            .clamp(0, count as i32 - 1) as usize;
+        let changed = new != self.selected_module;
+        self.selected_module = new;
+        changed
     }
 
-    pub fn move_task_selection(&mut self, delta: i32) {
-        if self.tasks.is_empty() { return; }
+    /// Returns true if the selection actually moved.
+    pub fn move_task_selection(&mut self, delta: i32) -> bool {
+        if self.tasks.is_empty() { return false; }
         let sorted = self.sorted_task_display();
         let current_pos = self.selected_task_id
             .and_then(|id| sorted.iter().position(|&vi| self.tasks[vi].id == id))
             .unwrap_or(0) as i32;
-        let new_pos = (current_pos + delta).rem_euclid(sorted.len() as i32) as usize;
+        let new_pos = (current_pos + delta)
+            .clamp(0, sorted.len() as i32 - 1) as usize;
         if let Some(id) = sorted.get(new_pos).map(|&vi| self.tasks[vi].id) {
-            self.set_selected_task(id);
+            if Some(id) != self.selected_task_id {
+                self.set_selected_task(id);
+                return true;
+            }
         }
+        false
     }
 
     fn set_selected_task(&mut self, id: usize) {
@@ -235,13 +245,19 @@ impl App {
     }
 
     /// Scroll the output pane. Positive = scroll up (see earlier lines).
-    /// Clamped to 0 at the bottom; the upper bound is enforced in the renderer.
-    pub fn scroll_output(&mut self, delta: i32) {
+    /// Clamped to 0 at the bottom and to the total line count at the top.
+    /// Returns true if the scroll position actually changed.
+    pub fn scroll_output(&mut self, delta: i32) -> bool {
+        let max_scroll = self.current_output().len() as u16;
+        let before = self.output_scroll;
         if delta < 0 {
             self.output_scroll = self.output_scroll.saturating_sub((-delta) as u16);
         } else {
-            self.output_scroll = self.output_scroll.saturating_add(delta as u16);
+            self.output_scroll = self.output_scroll
+                .saturating_add(delta as u16)
+                .min(max_scroll);
         }
+        self.output_scroll != before
     }
 
     /// Returns indices into `self.tasks` in display order: most recently active first.
@@ -309,8 +325,7 @@ impl App {
                 }
             }
             Focus::Output => {
-                // u16::MAX saturates to 0 in the renderer, showing the top.
-                self.output_scroll = u16::MAX;
+                self.output_scroll = self.current_output().len() as u16;
             }
         }
     }
