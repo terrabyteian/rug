@@ -345,16 +345,18 @@ fn event_loop<B: ratatui::backend::Backend>(
                     },
                     KeyCode::Char('c') => match app.focus {
                         Focus::Tasks => app.task_multi_select.clear(),
-                        _ => app.multi_select.clear(),
+                        _ => {
+                            app.multi_select.clear();
+                            app.max_depth = None;
+                        }
                     },
                     KeyCode::Enter => {
                         if app.focus == Focus::Modules {
                             app.open_state_explorer();
-                        } else if app.focus == Focus::Output {
+                        } else if app.focus == Focus::Output || app.focus == Focus::Tasks {
                             app.output_fullscreen = true;
                             execute!(io::stdout(), DisableMouseCapture)?;
                         }
-                        // Tasks pane: selection already managed via selected_task
                     }
 
                     // Terraform commands.
