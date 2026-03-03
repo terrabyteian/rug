@@ -2,6 +2,8 @@
 
 Run terraform/tofu commands across a directory tree of modules. Interactive TUI by default; headless CLI for scripting.
 
+![TUI demo](docs/demo-tui.gif)
+
 ## Install
 
 ```sh
@@ -64,7 +66,13 @@ rug --dir infra/ exec validate --all
 rug --dir infra/ list
 ```
 
+![Headless plan demo](docs/demo-headless.gif)
+
 ## TUI key bindings
+
+Use `/` to filter the module list by name, then `Space` to multi-select before running a command.
+
+![Filter and select demo](docs/demo-filter.gif)
 
 | Key | Action |
 |---|---|
