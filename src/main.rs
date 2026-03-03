@@ -230,18 +230,24 @@ async fn run_headless(
 
     let task_names: Vec<String> = modules.iter().map(|m| m.display_name.clone()).collect();
 
-    for (i, module) in modules.iter().enumerate() {
-        runner::spawn_task(
-            i,
-            module.path.clone(),
-            module.display_name.clone(),
-            config.binary.clone(),
-            command.to_string(),
-            extra_args.to_vec(),
-            tx.clone(),
-            semaphore.clone(),
-        );
-    }
+    // Keep handles alive for the duration of the run — dropping them early would
+    // close the oneshot senders and immediately fire the cancel branch in the runner.
+    let _handles: Vec<_> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, module)| {
+            runner::spawn_task(
+                i,
+                module.path.clone(),
+                module.display_name.clone(),
+                config.binary.clone(),
+                command.to_string(),
+                extra_args.to_vec(),
+                tx.clone(),
+                semaphore.clone(),
+            )
+        })
+        .collect();
 
     let mut statuses: Vec<TaskStatus> =
         (0..modules.len()).map(|_| TaskStatus::Pending).collect();
