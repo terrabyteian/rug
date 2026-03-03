@@ -1,0 +1,1 @@
+When making changes that affect user-visible behaviour (commands, flags, key bindings, config fields, install process, or supported platforms), update README.md to reflect the change. Don't document internal implementation details in the README; keep it focused on what a user needs to install, configure, and operate the tool.
