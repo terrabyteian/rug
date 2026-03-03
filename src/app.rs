@@ -170,6 +170,16 @@ pub struct OpResult {
     pub entries: Vec<(String, bool)>,
 }
 
+/// Heights of each scrollable pane, updated every draw pass.
+/// Used to compute page-up/page-down scroll amounts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PaneHeights {
+    pub modules: u16,
+    pub output: u16,
+    pub tasks: u16,
+    pub explorer: u16,
+}
+
 /// State shown in the state-explorer for a single module.
 pub struct StateExplorer {
     pub module_idx: usize,
@@ -243,6 +253,8 @@ pub struct App {
     pub v_split_row: Option<u16>,
     /// Which resize divider is currently being dragged, if any.
     pub dragging: Option<DragHandle>,
+    /// Heights of scrollable panes from the last render pass (for page up/down).
+    pub pane_heights: PaneHeights,
     pub next_task_id: usize,
     pub event_tx: TaskEventSender,
     pub event_rx: TaskEventReceiver,
@@ -286,6 +298,7 @@ impl App {
             h_split_col: None,
             v_split_row: None,
             dragging: None,
+            pane_heights: PaneHeights::default(),
             next_task_id: 0,
             event_tx: tx,
             event_rx: rx,
@@ -665,37 +678,89 @@ impl App {
         }
     }
 
-    fn maybe_auto_select_task(&mut self, first_new_idx: usize) {
-        if self.selected_task_id.is_none() {
-            if let Some(task) = self.tasks.get(first_new_idx) {
-                self.set_selected_task(task.id);
-            }
+    fn maybe_auto_select_task(&mut self, _first_new_idx: usize) {
+        // Always jump to the top of the sorted task list so the user sees the
+        // most recently submitted tasks immediately after enqueueing.
+        let sorted = self.sorted_task_display();
+        if let Some(&vi) = sorted.first() {
+            let id = self.tasks[vi].id;
+            self.set_selected_task(id);
         }
     }
 
     // ── Confirmation flow ────────────────────────────────────────────────────
 
     /// Stage `apply` for confirmation, annotating each target with plan info.
+    ///
+    /// When the Tasks pane is focused and all selected tasks are plan commands,
+    /// the apply targets are derived from those tasks rather than the module
+    /// selection. Otherwise falls back to the normal module selection.
     pub fn request_apply_confirm(&mut self) {
-        let targets = self.target_indices();
-        if targets.is_empty() { return; }
+        let confirm_targets = if self.focus == Focus::Tasks {
+            self.apply_targets_from_plan_tasks()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            self.target_indices()
+                .iter()
+                .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
+                .map(|(i, m)| ConfirmTarget {
+                    module_idx: i,
+                    module_name: m.display_name.clone(),
+                    plan_age: self.plan_cache.get(&m.path).map(|e| e.age_str()),
+                    lock_id: None,
+                    lock_who: None,
+                })
+                .collect()
+        });
 
-        let confirm_targets: Vec<ConfirmTarget> = targets
-            .iter()
-            .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
-            .map(|(i, m)| ConfirmTarget {
-                module_idx: i,
-                module_name: m.display_name.clone(),
-                plan_age: self.plan_cache.get(&m.path).map(|e| e.age_str()),
-                lock_id: None,
-                lock_who: None,
-            })
-            .collect();
-
+        if confirm_targets.is_empty() { return; }
         self.pending_confirm = Some(PendingConfirm {
             kind: ConfirmKind::Apply,
             targets: confirm_targets,
         });
+    }
+
+    /// Derive apply `ConfirmTarget`s from the currently selected plan task(s)
+    /// in the Tasks pane. Returns `None` if the selection contains non-plan tasks.
+    fn apply_targets_from_plan_tasks(&self) -> Option<Vec<ConfirmTarget>> {
+        let task_ids: Vec<usize> = if !self.task_multi_select.is_empty() {
+            self.task_multi_select.clone()
+        } else {
+            self.selected_task_id.into_iter().collect()
+        };
+
+        if task_ids.is_empty() { return None; }
+
+        let tasks: Vec<&Task> = task_ids.iter()
+            .filter_map(|&id| self.tasks.iter().find(|t| t.id == id))
+            .collect();
+
+        // All selected tasks must be plan commands; otherwise fall back.
+        if tasks.iter().any(|t| t.command != "plan") {
+            return None;
+        }
+
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for task in tasks {
+            if let Some((idx, module)) = self.modules.iter().enumerate()
+                .find(|(_, m)| m.path == task.module_path)
+            {
+                if seen.insert(idx) {
+                    targets.push(ConfirmTarget {
+                        module_idx: idx,
+                        module_name: module.display_name.clone(),
+                        plan_age: self.plan_cache.get(&module.path).map(|e| e.age_str()),
+                        lock_id: None,
+                        lock_who: None,
+                    });
+                }
+            }
+        }
+
+        if targets.is_empty() { None } else { Some(targets) }
     }
 
     /// Stage `destroy` for confirmation.
@@ -935,7 +1000,7 @@ impl App {
         let visible = self.visible_module_indices();
         let Some(&idx) = visible.get(self.selected_module) else { return };
         let module = &self.modules[idx];
-        let content = crate::state::read_state(&module.path);
+        let content = crate::state::read_state(&module.path, &self.config.binary);
         self.state_explorer = Some(StateExplorer {
             module_idx: idx,
             module_name: module.display_name.clone(),
@@ -1321,7 +1386,7 @@ impl App {
             self.modules[explorer.module_idx].path.clone()
         };
 
-        let content = crate::state::read_state(&module_path);
+        let content = crate::state::read_state(&module_path, &self.config.binary);
 
         if let Some(explorer) = self.state_explorer.as_mut() {
             explorer.content = content;

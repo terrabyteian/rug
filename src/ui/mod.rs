@@ -147,6 +147,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Char('j') | KeyCode::Down  => { app.scroll_output(-1); }
                         KeyCode::Char('k') | KeyCode::Up    => { app.scroll_output(1); }
+                        KeyCode::PageDown => { app.scroll_output(-(app.pane_heights.output.max(1) as i32)); }
+                        KeyCode::PageUp   => { app.scroll_output(app.pane_heights.output.max(1) as i32); }
                         KeyCode::Char('g') => app.go_to_first(),
                         KeyCode::Char('G') => app.go_to_last(),
                         _ => {}
@@ -251,6 +253,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                             KeyCode::Char('q') => { app.close_state_explorer(); }
                             KeyCode::Char('j') | KeyCode::Down => { app.resource_detail_scroll(1); }
                             KeyCode::Char('k') | KeyCode::Up   => { app.resource_detail_scroll(-1); }
+                            KeyCode::PageDown => { app.resource_detail_scroll(app.pane_heights.explorer.max(1) as i32); }
+                            KeyCode::PageUp   => { app.resource_detail_scroll(-(app.pane_heights.explorer.max(1) as i32)); }
                             KeyCode::Char('g') => { app.resource_detail_go_first(); }
                             KeyCode::Char('G') => { app.resource_detail_go_last(); }
                             _ => {}
@@ -269,6 +273,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                             KeyCode::Enter => { app.open_resource_detail(); }
                             KeyCode::Char('j') | KeyCode::Down => { app.state_explorer_move(1); }
                             KeyCode::Char('k') | KeyCode::Up   => { app.state_explorer_move(-1); }
+                            KeyCode::PageDown => { app.state_explorer_move(app.pane_heights.explorer.max(1) as i32); }
+                            KeyCode::PageUp   => { app.state_explorer_move(-(app.pane_heights.explorer.max(1) as i32)); }
                             KeyCode::Char('g') => { app.state_explorer_go_first(); }
                             KeyCode::Char('G') => { app.state_explorer_go_last(); }
                             KeyCode::Char('/') => { app.state_explorer_activate_filter(); }
@@ -314,6 +320,16 @@ fn event_loop<B: ratatui::backend::Backend>(
                         Focus::Tasks   => { app.move_task_selection(-1); }
                         Focus::Output  => { app.scroll_output(1); }
                     } }
+                    KeyCode::PageDown => match app.focus {
+                        Focus::Modules => { app.move_module_selection(app.pane_heights.modules.max(1) as i32); }
+                        Focus::Tasks   => { app.move_task_selection(app.pane_heights.tasks.max(1) as i32); }
+                        Focus::Output  => { app.scroll_output(-(app.pane_heights.output.max(1) as i32)); }
+                    }
+                    KeyCode::PageUp => match app.focus {
+                        Focus::Modules => { app.move_module_selection(-(app.pane_heights.modules.max(1) as i32)); }
+                        Focus::Tasks   => { app.move_task_selection(-(app.pane_heights.tasks.max(1) as i32)); }
+                        Focus::Output  => { app.scroll_output(app.pane_heights.output.max(1) as i32); }
+                    }
 
                     // Module actions.
                     KeyCode::Char(' ') => match app.focus {
@@ -373,28 +389,33 @@ fn event_loop<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
     use ratatui::layout::{Constraint, Direction, Layout};
 
     let area = f.area();
 
     if app.output_fullscreen {
+        app.pane_heights.output = area.height.saturating_sub(2);
         output::render(f, area, app);
         return;
     }
 
     // State explorer (list or detail) takes over the full window.
-    if let Some(explorer) = &app.state_explorer {
-        render_state_explorer(f, area, explorer);
-        // Op overlays render on top of the state explorer.
-        if let Some(op_kind) = explorer.op_confirm {
-            render_op_confirm(f, area, op_kind, &explorer.op_targets);
-        } else if let Some(pt) = &explorer.pending_op {
-            render_op_progress(f, area, pt);
-        } else if let Some(result) = &explorer.op_result {
-            render_op_result(f, area, result);
-        } else if explorer.plan_queued_notice {
-            render_plan_queued_notice(f, area);
+    if app.state_explorer.is_some() {
+        // Reserve: 2 border + 1 blank top + 1 blank before hint + 1 hint + 1 counter + 1 filter bar.
+        app.pane_heights.explorer = area.height.saturating_sub(7);
+        if let Some(explorer) = &app.state_explorer {
+            render_state_explorer(f, area, explorer);
+            // Op overlays render on top of the state explorer.
+            if let Some(op_kind) = explorer.op_confirm {
+                render_op_confirm(f, area, op_kind, &explorer.op_targets);
+            } else if let Some(pt) = &explorer.pending_op {
+                render_op_progress(f, area, pt);
+            } else if let Some(result) = &explorer.op_result {
+                render_op_result(f, area, result);
+            } else if explorer.plan_queued_notice {
+                render_plan_queued_notice(f, area);
+            }
         }
         return;
     }
@@ -412,6 +433,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(top_height), Constraint::Min(0)])
         .split(h_chunks[1]);
+
+    // Save inner heights (minus borders) for page up/down.
+    app.pane_heights.modules = h_chunks[0].height.saturating_sub(2);
+    app.pane_heights.output  = v_chunks[0].height.saturating_sub(2);
+    app.pane_heights.tasks   = v_chunks[1].height.saturating_sub(2);
 
     tree::render(f, h_chunks[0], app);
     output::render(f, v_chunks[0], app);
@@ -453,6 +479,7 @@ fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 
     let help_text = "\
 j/k ↑/↓   Navigate lists or scroll output
+PgUp/PgDn  Page up / page down
 g / G      Jump to first / last
 Space      Toggle multi-select (Modules or Tasks pane)
 Ctrl+Space Range-select modules

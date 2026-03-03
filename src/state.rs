@@ -38,16 +38,22 @@ pub enum StateContent {
 ///
 /// Initialization check: `.terraform/` must exist, OR a local `terraform.tfstate`
 /// file must be present (handles modules whose `.terraform/` was cleaned up).
-pub fn read_state(module_path: &Path) -> StateContent {
+///
+/// For remote backends (S3, GCS, Azure, Terraform Cloud, etc.) where no local
+/// state file is available, runs `<binary> state pull` to fetch the state.
+pub fn read_state(module_path: &Path, binary: &str) -> StateContent {
     let initialized = module_path.join(".terraform").exists();
     let local_tfstate = module_path.join("terraform.tfstate");
 
     if initialized {
-        let state_path = resolve_state_path(module_path);
-        return match state_path {
-            Some(path) => parse_state_content(&path),
-            None => StateContent::NoState,
-        };
+        if let Some(path) = resolve_state_path(module_path) {
+            return parse_state_content(&path);
+        }
+        // No local state file found — if this is a remote backend, pull it.
+        if is_remote_backend(module_path) {
+            return pull_remote_state(module_path, binary);
+        }
+        return StateContent::NoState;
     }
 
     // Not initialized via init, but has a local state file (legacy / CI cleanup).
@@ -56,6 +62,35 @@ pub fn read_state(module_path: &Path) -> StateContent {
     }
 
     StateContent::NotInitialized
+}
+
+/// Returns true if the module's initialized backend is not a local backend.
+fn is_remote_backend(module_path: &Path) -> bool {
+    let backend_meta = module_path.join(".terraform").join("terraform.tfstate");
+    if let Ok(content) = std::fs::read_to_string(&backend_meta) {
+        if let Ok(meta) = serde_json::from_str::<BackendMeta>(&content) {
+            if let Some(backend) = meta.backend {
+                return backend.backend_type != "local";
+            }
+        }
+    }
+    false
+}
+
+/// Fetch state from a remote backend by running `<binary> state pull`.
+fn pull_remote_state(module_path: &Path, binary: &str) -> StateContent {
+    let output = std::process::Command::new(binary)
+        .args(["state", "pull"])
+        .current_dir(module_path)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let json = String::from_utf8_lossy(&out.stdout);
+            parse_state_from_str(&json)
+        }
+        _ => StateContent::NoState,
+    }
 }
 
 /// Resolve which state file to read for an initialized module.
@@ -89,14 +124,19 @@ pub(crate) fn resolve_state_path(module_path: &Path) -> Option<PathBuf> {
 }
 
 /// Parse a state file and return one `StateResource` per instance.
-///
-/// count/for_each resources with N instances produce N addresses, matching
-/// `terraform state list` output exactly.
 fn parse_state_content(path: &Path) -> StateContent {
     let Ok(content) = std::fs::read_to_string(path) else {
         return StateContent::NoState;
     };
-    let Ok(state) = serde_json::from_str::<TfState>(&content) else {
+    parse_state_from_str(&content)
+}
+
+/// Parse terraform state JSON (from a file or `state pull` stdout).
+///
+/// count/for_each resources with N instances produce N addresses, matching
+/// `terraform state list` output exactly.
+fn parse_state_from_str(content: &str) -> StateContent {
+    let Ok(state) = serde_json::from_str::<TfState>(content) else {
         return StateContent::NoState;
     };
 
