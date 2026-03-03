@@ -575,6 +575,36 @@ fn render_confirm(
     let n = confirm.targets.len();
     let noun = if n == 1 { "module" } else { "modules" };
 
+    // Dynamic width: measure the longest name + annotation column.
+    let name_width = confirm.targets.iter()
+        .map(|t| t.module_name.len())
+        .max()
+        .unwrap_or(0);
+    let extra_width: usize = match &confirm.kind {
+        ConfirmKind::Apply => confirm.targets.iter()
+            .map(|t| match &t.plan_age {
+                Some(age) => format!("  plan from {}", age).len(),
+                None => "  no prior plan".len(),
+            })
+            .max()
+            .unwrap_or(0),
+        ConfirmKind::ForceUnlock => confirm.targets.iter()
+            .map(|t| {
+                if let Some(id) = &t.lock_id {
+                    let short_id = if id.len() > 8 { format!("{}…", &id[..8]) } else { id.clone() };
+                    let who = t.lock_who.as_deref().unwrap_or("?");
+                    format!("  lock {}  by {}", short_id, who).len()
+                } else { 0 }
+            })
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    };
+    // 6 = "    • "; min 36 covers footer and ForceUnlock warning line.
+    let content_w = (6 + name_width + extra_width)
+        .max(format!("  Run {} on {} {}:", label, n, noun).len())
+        .max(36);
+
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             format!("  Run {label} on {n} {noun}:"),
@@ -584,16 +614,16 @@ fn render_confirm(
     ];
 
     for target in &confirm.targets {
-        let name_span = Span::raw(format!("    • {:<28}", target.module_name));
+        let name_span = Span::raw(format!("    • {:<width$}", target.module_name, width = name_width));
 
         let plan_span = match &confirm.kind {
             ConfirmKind::Apply => match &target.plan_age {
                 Some(age) => Span::styled(
-                    format!("plan from {age}"),
+                    format!("  plan from {age}"),
                     Style::default().fg(Color::Green),
                 ),
                 None => Span::styled(
-                    "no prior plan".to_string(),
+                    "  no prior plan".to_string(),
                     Style::default().fg(Color::Yellow),
                 ),
             },
@@ -607,7 +637,7 @@ fn render_confirm(
                     };
                     let who = target.lock_who.as_deref().unwrap_or("?");
                     Span::styled(
-                        format!("lock {short_id}  by {who}"),
+                        format!("  lock {short_id}  by {who}"),
                         Style::default().fg(Color::Yellow),
                     )
                 } else {
@@ -638,7 +668,7 @@ fn render_confirm(
     ]));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
-    let width = 58u16.min(area.width);
+    let width = (content_w + 2).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -672,6 +702,12 @@ fn render_cancel_task_confirm(
     let n = tasks.len();
     let noun = if n == 1 { "task" } else { "tasks" };
 
+    // Dynamic width: fit the longest name + command.
+    let name_width = tasks.iter().map(|t| t.0.len()).max().unwrap_or(0);
+    let cmd_width  = tasks.iter().map(|t| t.1.len()).max().unwrap_or(0);
+    // 8 = "    • " (6) + "  " gap (2); 41 = footer "  [y] Cancel task(s)   [any] Keep running".
+    let content_w = (8 + name_width + cmd_width).max(41);
+
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             format!("  Cancel {n} {noun}:"),
@@ -682,7 +718,7 @@ fn render_cancel_task_confirm(
 
     for &(module_name, command) in tasks {
         lines.push(Line::from(vec![
-            Span::raw(format!("    • {:<20} ", module_name)),
+            Span::raw(format!("    • {:<width$}  ", module_name, width = name_width)),
             Span::styled(command.to_string(), Style::default().fg(Color::Blue)),
         ]));
     }
@@ -696,7 +732,7 @@ fn render_cancel_task_confirm(
     ]));
 
     let height = (lines.len() + 2) as u16;
-    let width = 52u16.min(area.width);
+    let width = (content_w + 2).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -725,6 +761,12 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
 
     let active = app.active_tasks();
 
+    // Dynamic width: fit the longest name + command.
+    let name_width = active.iter().map(|t| t.module_name.len()).max().unwrap_or(0);
+    let cmd_width  = active.iter().map(|t| t.command.len()).max().unwrap_or(0);
+    // 5 = "  X " icon prefix; 31 = footer "  [q] Force quit   [Esc] Cancel".
+    let content_w = (5 + name_width + 1 + cmd_width).max(31);
+
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             "  Waiting for tasks to finish…",
@@ -737,7 +779,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
         lines.push(Line::from(vec![
             Span::raw(format!("  {} ", task.status.icon())),
             Span::styled(
-                format!("{:<28}", task.module_name),
+                format!("{:<width$}", task.module_name, width = name_width),
                 Style::default().fg(Color::Cyan),
             ),
             Span::raw(task.command.clone()),
@@ -759,7 +801,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
     ]));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
-    let width = 58u16.min(area.width);
+    let width = (content_w + 2).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -1220,6 +1262,14 @@ fn render_op_confirm(
 
     let n = targets.len();
     let noun = if n == 1 { "resource" } else { "resources" };
+
+    // Dynamic width: fit the longest resource address.
+    let addr_width = targets.iter().map(|a| a.len()).max().unwrap_or(0);
+    // 6 = "    • "; 46 = TargetedDestroy warning; 28 = footer.
+    let content_w = (6 + addr_width)
+        .max(format!("  {} {} {}:", kind.confirm_verb(), n, noun).len())
+        .max(if kind == ExplorerOpKind::TargetedDestroy { 46 } else { 28 });
+
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -1250,7 +1300,7 @@ fn render_op_confirm(
     ]));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
-    let width = 64u16.min(area.width);
+    let width = (content_w + 2).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -1277,6 +1327,14 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
         widgets::{Block, Borders, Clear, Paragraph},
     };
 
+    // Dynamic width: fit the longest address across done/running/queued.
+    let addr_width = pt.done.iter().map(|(a, _)| a.len())
+        .chain(pt.running.iter().map(|(_, a)| a.len()))
+        .chain(pt.queue.iter().map(|a| a.len()))
+        .max().unwrap_or(0);
+    // 4 = "  ✓ " prefix.
+    let content_w = (4 + addr_width).max(20);
+
     let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
     for (addr, success) in &pt.done {
         let (icon, color) = if *success { ("✓", Color::Green) } else { ("✗", Color::Red) };
@@ -1302,7 +1360,7 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
     }
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
-    let width = 64u16.min(area.width);
+    let width = (content_w + 2).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);
@@ -1332,6 +1390,10 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
     let all_ok = result.entries.iter().all(|(_, ok)| *ok);
     let border_color = if all_ok { Color::Green } else { Color::Red };
 
+    // Dynamic width: fit the longest address; 20 = "  [any key] Dismiss".
+    let addr_width = result.entries.iter().map(|(a, _)| a.len()).max().unwrap_or(0);
+    let content_w = (4 + addr_width).max(20);
+
     let mut lines: Vec<Line> = vec![Line::from("")];
     for (addr, success) in &result.entries {
         let (icon, color) = if *success { ("✓", Color::Green) } else { ("✗", Color::Red) };
@@ -1348,7 +1410,7 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
     )));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
-    let width = 64u16.min(area.width);
+    let width = (content_w + 2).min(area.width as usize) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width, height);

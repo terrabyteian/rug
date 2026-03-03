@@ -19,6 +19,7 @@ use config::Config;
 #[derive(Parser, Debug)]
 #[command(
     name = "rug",
+    version,
     about = "Terraform/tofu CLI multiplexer across a module tree",
     long_about = None,
 )]
