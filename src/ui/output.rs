@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -35,7 +35,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         format!(" {} ", app.output_title())
     };
 
-    let para = Paragraph::new(lines)
+    let mut para = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(title)
@@ -43,6 +43,10 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 .border_style(border_style),
         )
         .scroll((scroll_row, 0));
+
+    if app.output_wrap {
+        para = para.wrap(Wrap { trim: false });
+    }
 
     f.render_widget(para, area);
 }

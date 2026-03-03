@@ -151,6 +151,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                         KeyCode::PageUp   => { app.scroll_output(app.pane_heights.output.max(1) as i32); }
                         KeyCode::Char('g') => app.go_to_first(),
                         KeyCode::Char('G') => app.go_to_last(),
+                        KeyCode::Char('w') => { app.output_wrap = !app.output_wrap; }
                         _ => {}
                     }
                     continue;
@@ -375,6 +376,9 @@ fn event_loop<B: ratatui::backend::Backend>(
                     KeyCode::Char('[') => app.decrease_depth(),
                     KeyCode::Char(']') => app.increase_depth(),
 
+                    // Toggle output line wrap.
+                    KeyCode::Char('w') => { app.output_wrap = !app.output_wrap; }
+
                     // Filter.
                     KeyCode::Char('/') => {
                         app.filter_active = true;
@@ -486,7 +490,8 @@ g / G      Jump to first / last
 Space      Toggle multi-select (Modules or Tasks pane)
 Ctrl+Space Range-select modules
 c          Clear selection (current pane)
-Enter      State explorer (Modules) / Fullscreen (Output)
+Enter      State explorer (Modules) / Fullscreen (Output or Tasks)
+w          Toggle line wrap (output pane)
 Esc        Close overlay / clear filter
 i          Init selected modules
 u          Init -upgrade selected modules

@@ -247,6 +247,8 @@ pub struct App {
     pub pending_quit: bool,
     /// When true the output pane fills the whole terminal (mouse capture off).
     pub output_fullscreen: bool,
+    /// When true, long lines in the output pane are soft-wrapped (fullscreen only).
+    pub output_wrap: bool,
     /// Width of the modules (left) pane in columns. None → default 25%.
     pub h_split_col: Option<u16>,
     /// Height of the output (top-right) pane in rows. None → default 65%.
@@ -295,6 +297,7 @@ impl App {
             pending_cancel_task: Vec::new(),
             pending_quit: false,
             output_fullscreen: false,
+            output_wrap: false,
             h_split_col: None,
             v_split_row: None,
             dragging: None,
