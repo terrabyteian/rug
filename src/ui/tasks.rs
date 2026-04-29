@@ -57,6 +57,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let check = if is_multi { "✓ " } else { "  " };
+            let ready_plan = app.plan_cache.get(&task.module_path).filter(|plan| {
+                task.command == "plan"
+                    && task.status == TaskStatus::Success
+                    && task.plan_output_path.as_ref() == Some(&plan.path)
+            });
 
             let mut spans = vec![
                 Span::styled(check.to_string(), Style::default().fg(Color::Yellow)),
@@ -65,6 +70,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{:<8}", task.command), Style::default().fg(Color::Blue)),
                 Span::styled(elapsed_part, Style::default().fg(Color::DarkGray)),
             ];
+
+            if let Some(plan) = ready_plan {
+                spans.push(Span::styled(
+                    format!("  P:{}", plan.age_str()),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ));
+            }
 
             if let Some(counts) = &task.resource_counts {
                 spans.extend(count_spans(counts));

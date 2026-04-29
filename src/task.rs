@@ -208,6 +208,9 @@ pub struct Task {
     /// For plan tasks: the path where the plan file is being written.
     /// Registered in PlanCache on successful completion.
     pub plan_output_path: Option<PathBuf>,
+    /// For apply tasks created from a cached plan: delete this plan after the
+    /// apply task exits or is cancelled before it starts.
+    pub cleanup_plan_path: Option<PathBuf>,
     /// Resource operation counts parsed from the plan/apply/destroy summary line.
     /// None until a summary line has been seen in the task output.
     pub resource_counts: Option<ResourceCounts>,

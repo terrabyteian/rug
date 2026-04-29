@@ -25,6 +25,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let module = &app.modules[real_idx];
             let is_selected = display_pos == app.selected_module;
             let is_multi = app.multi_select.contains(&real_idx);
+            let plan_age = app.plan_cache.get(&module.path).map(|plan| plan.age_str());
 
             let prefix = if is_multi { "● " } else { "  " };
             let name = &module.display_name;
@@ -40,7 +41,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            let line = Line::from(vec![Span::styled(format!("{prefix}{name}"), style)]);
+            let mut spans = vec![Span::styled(format!("{prefix}{name}"), style)];
+            if let Some(age) = plan_age {
+                let plan_style = if is_selected {
+                    style
+                } else {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                };
+                spans.push(Span::styled(format!("  P:{age}"), plan_style));
+            }
+
+            let line = Line::from(spans);
             ListItem::new(line)
         })
         .collect();

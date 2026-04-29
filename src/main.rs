@@ -108,7 +108,8 @@ async fn main() -> Result<()> {
                 eprintln!("No terraform root modules found under {}", root.display());
                 std::process::exit(1);
             }
-            let mut app = App::new(config, root.clone(), root_modules);
+            let mut app = App::new(config, root.clone(), root_modules)
+                .context("creating secure plan cache")?;
             ui::run_tui(&mut app)?;
         }
 

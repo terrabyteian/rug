@@ -71,6 +71,7 @@ rug --dir infra/ list
 ## TUI key bindings
 
 Use `/` to filter the module list by name, then `Space` to multi-select before running a command.
+Modules with a successful cached plan ready to apply are marked in the module pane, and the current ready plan task is marked in the task pane.
 
 ![Filter and select demo](docs/demo-filter.gif)
 

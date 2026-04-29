@@ -273,10 +273,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, root: PathBuf, modules: Vec<Module>) -> Self {
+    pub fn new(config: Config, root: PathBuf, modules: Vec<Module>) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let parallelism = config.parallelism;
-        Self {
+        Ok(Self {
             config,
             root,
             modules,
@@ -306,11 +306,11 @@ impl App {
             event_tx: tx,
             event_rx: rx,
             semaphore: Arc::new(Semaphore::new(parallelism)),
-            plan_cache: PlanCache::new(),
+            plan_cache: PlanCache::new()?,
             state_explorer: None,
             running_modules: HashSet::new(),
             module_queues: HashMap::new(),
-        }
+        })
     }
 
     // ── Layout splits ────────────────────────────────────────────────────────
@@ -564,7 +564,7 @@ impl App {
         for idx in targets {
             let plan_path = self.plan_cache.plan_path_for(&self.modules[idx].path);
             let args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
-            self.push_task(idx, "plan", args, Some(plan_path));
+            self.push_task(idx, "plan", args, Some(plan_path), None);
         }
 
         self.maybe_auto_select_task(first_new_idx);
@@ -577,7 +577,7 @@ impl App {
         let first_new_idx = self.tasks.len();
 
         for idx in targets {
-            self.push_task(idx, command, extra_args.clone(), None);
+            self.push_task(idx, command, extra_args.clone(), None, None);
         }
 
         self.maybe_auto_select_task(first_new_idx);
@@ -587,8 +587,8 @@ impl App {
     ///
     /// Per module: if a plan file exists in the cache, apply from that file;
     /// otherwise fall back to `-auto-approve`. The cache entry is removed so
-    /// the UI stops advertising a stale plan, but the file itself stays on
-    /// disk for terraform to read — the temp dir Drop handles final cleanup.
+    /// the UI stops advertising a stale plan, and the file is deleted after the
+    /// apply process exits.
     fn enqueue_apply_for(&mut self, targets: &[usize]) {
         if targets.is_empty() { return; }
         let first_new_idx = self.tasks.len();
@@ -596,12 +596,13 @@ impl App {
         for &idx in targets {
             let module_path = self.modules[idx].path.clone();
             // `take` removes the cache entry but does NOT delete the file.
-            let args = if let Some(plan_path) = self.plan_cache.take(&module_path) {
-                vec![plan_path.to_string_lossy().into_owned()]
-            } else {
-                vec!["-auto-approve".to_string()]
-            };
-            self.push_task(idx, "apply", args, None);
+            let (args, cleanup_plan_path) =
+                if let Some(plan_path) = self.plan_cache.take(&module_path) {
+                    (vec![plan_path.to_string_lossy().into_owned()], Some(plan_path))
+                } else {
+                    (vec!["-auto-approve".to_string()], None)
+                };
+            self.push_task(idx, "apply", args, None, cleanup_plan_path);
         }
 
         self.maybe_auto_select_task(first_new_idx);
@@ -612,7 +613,7 @@ impl App {
         if targets.is_empty() { return; }
         let first_new_idx = self.tasks.len();
         for &idx in targets {
-            self.push_task(idx, "destroy", vec!["-auto-approve".to_string()], None);
+            self.push_task(idx, "destroy", vec!["-auto-approve".to_string()], None, None);
         }
         self.maybe_auto_select_task(first_new_idx);
     }
@@ -626,6 +627,7 @@ impl App {
         command: &str,
         args: Vec<String>,
         plan_output_path: Option<PathBuf>,
+        cleanup_plan_path: Option<PathBuf>,
     ) {
         let module = &self.modules[module_idx];
         let task_id = self.next_task_id;
@@ -643,6 +645,7 @@ impl App {
             started_at: None,
             finished_at: None,
             plan_output_path: plan_output_path.clone(),
+            cleanup_plan_path,
             resource_counts: None,
             cancel_handle: None,
         });
@@ -676,6 +679,9 @@ impl App {
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == old.task_id) {
                     t.status = TaskStatus::Cancelled;
                     t.finished_at = Some(std::time::Instant::now());
+                    if let Some(path) = t.cleanup_plan_path.take() {
+                        PlanCache::remove_file(&path);
+                    }
                 }
             }
         }
@@ -843,7 +849,7 @@ impl App {
         if targets.is_empty() { return; }
         let first_new_idx = self.tasks.len();
         for &idx in targets {
-            self.push_task(idx, "init", vec!["-upgrade".to_string()], None);
+            self.push_task(idx, "init", vec!["-upgrade".to_string()], None, None);
         }
         self.maybe_auto_select_task(first_new_idx);
     }
@@ -905,7 +911,7 @@ impl App {
         if targets.is_empty() { return; }
         let first_new_idx = self.tasks.len();
         for (idx, lock_id) in targets {
-            self.push_task(*idx, "force-unlock", vec!["-force".to_string(), lock_id.clone()], None);
+            self.push_task(*idx, "force-unlock", vec!["-force".to_string(), lock_id.clone()], None, None);
         }
         self.maybe_auto_select_task(first_new_idx);
     }
@@ -971,6 +977,9 @@ impl App {
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
                     t.status = TaskStatus::Cancelled;
                     t.finished_at = Some(std::time::Instant::now());
+                    if let Some(path) = t.cleanup_plan_path.take() {
+                        PlanCache::remove_file(&path);
+                    }
                 }
                 return;
             }
@@ -1236,7 +1245,7 @@ impl App {
             args.push(format!("-target={}", addr));
         }
         let first_new_idx = self.tasks.len();
-        self.push_task(module_idx, "plan", args, Some(plan_path));
+        self.push_task(module_idx, "plan", args, Some(plan_path), None);
         self.maybe_auto_select_task(first_new_idx);
         if let Some(explorer) = self.state_explorer.as_mut() {
             explorer.plan_queued_notice = true;
@@ -1298,7 +1307,7 @@ impl App {
                 let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
                 args.push(first.clone());
                 let task_id = self.next_task_id;
-                self.push_task(module_idx, kind.command(), args, None);
+                self.push_task(module_idx, kind.command(), args, None, None);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {
                         kind,
@@ -1322,7 +1331,7 @@ impl App {
                     format!("{} targeted resources", n)
                 };
                 let task_id = self.next_task_id;
-                self.push_task(module_idx, "destroy", args, None);
+                self.push_task(module_idx, "destroy", args, None, None);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {
                         kind,
@@ -1359,7 +1368,7 @@ impl App {
             let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
             args.push(next.clone());
             let new_task_id = self.next_task_id;
-            self.push_task(module_idx, kind.command(), args, None);
+            self.push_task(module_idx, kind.command(), args, None, None);
             let explorer = self.state_explorer.as_mut().unwrap();
             let pt = explorer.pending_op.as_mut().unwrap();
             pt.running = Some((new_task_id, next));
@@ -1459,7 +1468,9 @@ impl App {
                         None => (None, None),
                     };
 
+                    let mut cleanup_plan_path = None;
                     if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                        cleanup_plan_path = task.cleanup_plan_path.take();
                         task.cancel_handle = None;
                         task.status = if is_cancelling {
                             TaskStatus::Cancelled
@@ -1474,6 +1485,10 @@ impl App {
                     // Register the plan file now that the mutable borrow is released.
                     if let Some((mp, plan_path)) = plan_info {
                         self.plan_cache.register(mp, plan_path);
+                    }
+
+                    if let Some(path) = cleanup_plan_path {
+                        PlanCache::remove_file(&path);
                     }
 
                     // Dequeue the next task for this module, or mark it idle.

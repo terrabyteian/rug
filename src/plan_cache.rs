@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tempfile::TempDir;
 
 pub struct PlanEntry {
     pub path: PathBuf,
@@ -20,21 +21,23 @@ impl PlanEntry {
     }
 }
 
-/// Manages plan files in a temporary directory for the lifetime of the process.
+/// Manages plan files in a secure temporary directory for the process lifetime.
 ///
 /// All plan files are written under a session-specific temp dir and cleaned
 /// up automatically on drop, so they never litter module directories.
 pub struct PlanCache {
     /// Temp directory owned by this cache instance.
-    pub dir: PathBuf,
+    dir: TempDir,
     entries: HashMap<PathBuf, PlanEntry>,
 }
 
 impl PlanCache {
-    pub fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("rug-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
-        Self { dir, entries: HashMap::new() }
+    pub fn new() -> std::io::Result<Self> {
+        let dir = tempfile::Builder::new().prefix("rug-").tempdir()?;
+        Ok(Self {
+            dir,
+            entries: HashMap::new(),
+        })
     }
 
     /// Deterministic plan file path for a given module.
@@ -44,11 +47,17 @@ impl PlanCache {
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
             .collect();
-        self.dir.join(format!("{sanitized}.tfplan"))
+        self.dir.path().join(format!("{sanitized}.tfplan"))
     }
 
     pub fn register(&mut self, module_path: PathBuf, plan_path: PathBuf) {
-        self.entries.insert(module_path, PlanEntry { path: plan_path, created_at: Instant::now() });
+        self.entries.insert(
+            module_path,
+            PlanEntry {
+                path: plan_path,
+                created_at: Instant::now(),
+            },
+        );
     }
 
     pub fn get(&self, module_path: &Path) -> Option<&PlanEntry> {
@@ -57,16 +66,12 @@ impl PlanCache {
 
     /// Remove a plan entry from the cache and return its file path.
     ///
-    /// Does NOT delete the file — the caller (or Drop on the whole cache) is
-    /// responsible for that. This lets an in-flight apply still read the file
-    /// while the cache no longer advertises it as current.
+    /// Does NOT delete the file; callers delete it once any apply using it exits.
     pub fn take(&mut self, module_path: &Path) -> Option<PathBuf> {
         self.entries.remove(module_path).map(|e| e.path)
     }
-}
 
-impl Drop for PlanCache {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
+    pub fn remove_file(path: &Path) {
+        std::fs::remove_file(path).ok();
     }
 }
