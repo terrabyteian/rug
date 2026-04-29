@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | sh
 #
 # Specific version:
-#   curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | RUG_VERSION=v0.3.0 sh
+#   curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | RUG_VERSION=v0.6.0 sh
 set -e
 
 REPO="terrabyteian/rug"

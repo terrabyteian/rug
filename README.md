@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh 
 Pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | RUG_VERSION=v0.3.0 sh
+curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | RUG_VERSION=v0.6.0 sh
 ```
 
 **Build from source** (requires Rust):
