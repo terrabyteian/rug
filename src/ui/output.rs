@@ -17,11 +17,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Style::default()
     };
 
-    let lines: Vec<Line> = app
-        .current_output()
-        .iter()
-        .map(|l| parse_ansi(l))
-        .collect();
+    let lines: Vec<Line> = app.current_output().iter().map(|l| parse_ansi(l)).collect();
 
     let visible_height = area.height.saturating_sub(2) as usize;
     // auto_bottom keeps the tail visible; output_scroll pulls the view upward.

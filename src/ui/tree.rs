@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Focus};
+use crate::ui::wrap::wrap_line;
 
 /// Render the module tree pane.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
@@ -17,6 +18,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Style::default()
     };
 
+    let inner_width = area.width.saturating_sub(2);
+    let max_item_lines = area.height.saturating_sub(2).max(1) as usize;
     let visible_indices = app.visible_module_indices();
     let items: Vec<ListItem> = visible_indices
         .iter()
@@ -46,13 +49,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 let plan_style = if is_selected {
                     style
                 } else {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
                 };
                 spans.push(Span::styled(format!("  P:{age}"), plan_style));
             }
 
             let line = Line::from(spans);
-            ListItem::new(line)
+            ListItem::new(wrap_line(line, inner_width, 2, max_item_lines))
         })
         .collect();
 

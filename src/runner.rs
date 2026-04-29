@@ -24,7 +24,7 @@ pub fn spawn_task(
     tx: TaskEventSender,
     semaphore: Arc<Semaphore>,
 ) -> CancelHandle {
-    let (sigint_tx,  mut sigint_rx)  = tokio::sync::oneshot::channel::<()>();
+    let (sigint_tx, mut sigint_rx) = tokio::sync::oneshot::channel::<()>();
     let (sigkill_tx, mut sigkill_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -61,7 +61,10 @@ pub fn spawn_task(
                     task_id,
                     line: format!("error: failed to spawn: {e}"),
                 });
-                let _ = tx.send(TaskEvent::Finished { task_id, success: false });
+                let _ = tx.send(TaskEvent::Finished {
+                    task_id,
+                    success: false,
+                });
                 return;
             }
         };

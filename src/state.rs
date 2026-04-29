@@ -164,9 +164,7 @@ fn expand_resource(r: TfResource) -> Vec<StateResource> {
     // Single unindexed instance → plain resource, no suffix.
     if r.instances.len() == 1 {
         let inst = &r.instances[0];
-        let has_index = inst.get("index_key")
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
+        let has_index = inst.get("index_key").map(|v| !v.is_null()).unwrap_or(false);
         if !has_index {
             return vec![StateResource {
                 address: base,
@@ -210,7 +208,9 @@ fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => { out.pop(); }
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
             std::path::Component::CurDir => {}
             c => out.push(c),
         }

@@ -26,7 +26,11 @@ impl Module {
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
-        Self { path, display_name, kind }
+        Self {
+            path,
+            display_name,
+            kind,
+        }
     }
 
     pub fn is_root(&self) -> bool {

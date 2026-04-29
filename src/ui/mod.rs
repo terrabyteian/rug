@@ -1,10 +1,14 @@
 pub mod output;
 pub mod tasks;
 pub mod tree;
+mod wrap;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -12,7 +16,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::time::Duration;
 
-use crate::app::{App, ConfirmKind, DragHandle, ExplorerOpKind, Focus, OpResult, PendingConfirm, PendingOp};
+use crate::app::{
+    App, ConfirmKind, DragHandle, ExplorerOpKind, Focus, OpResult, PendingConfirm, PendingOp,
+};
 
 /// Run the full TUI event loop until the user quits.
 pub fn run_tui(app: &mut App) -> Result<()> {
@@ -53,342 +59,510 @@ fn event_loop<B: ratatui::backend::Backend>(
         // Poll for input events with a short timeout so we keep draining task events.
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-            Event::Mouse(mouse) => {
-                // Hard overlays absorb all mouse events.
-                if app.pending_quit || app.pending_confirm.is_some() || !app.pending_cancel_task.is_empty() || app.filter_active { continue; }
+                Event::Mouse(mouse) => {
+                    // Hard overlays absorb all mouse events.
+                    if app.pending_quit
+                        || app.pending_confirm.is_some()
+                        || !app.pending_cancel_task.is_empty()
+                        || app.pending_clear_tasks
+                        || app.filter_active
+                    {
+                        continue;
+                    }
 
-                // State explorer: only pass scroll events through.
-                if app.state_explorer.is_some() {
-                    let in_detail = app.state_explorer.as_ref()
-                        .map(|e| e.detail_view.is_some())
-                        .unwrap_or(false);
+                    // State explorer: only pass scroll events through.
+                    if app.state_explorer.is_some() {
+                        let in_detail = app
+                            .state_explorer
+                            .as_ref()
+                            .map(|e| e.detail_view.is_some())
+                            .unwrap_or(false);
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                if in_detail {
+                                    app.resource_detail_scroll(-3);
+                                } else {
+                                    app.state_explorer_move(-1);
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if in_detail {
+                                    app.resource_detail_scroll(3);
+                                } else {
+                                    app.state_explorer_move(1);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            if in_detail { app.resource_detail_scroll(-3); }
-                            else { app.state_explorer_move(-1); }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Ok(size) = terminal.size() {
+                                let col = mouse.column;
+                                let row = mouse.row;
+                                let h_split = app.effective_h_split(size.width);
+                                let v_split = app.effective_v_split(size.height);
+                                // Hit-test the vertical divider (within 1 col).
+                                if col + 1 == h_split || col == h_split {
+                                    app.dragging = Some(DragHandle::Vertical);
+                                // Hit-test the horizontal divider (right panel, within 1 row).
+                                } else if col >= h_split && (row + 1 == v_split || row == v_split) {
+                                    app.dragging = Some(DragHandle::Horizontal);
+                                } else {
+                                    app.dragging = None;
+                                    if let Some(focus) = pane_for_click(col, row, size, app) {
+                                        app.focus = focus;
+                                    }
+                                }
+                            }
                         }
-                        MouseEventKind::ScrollDown => {
-                            if in_detail { app.resource_detail_scroll(3); }
-                            else { app.state_explorer_move(1); }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Ok(size) = terminal.size() {
+                                match app.dragging {
+                                    Some(DragHandle::Vertical) => {
+                                        app.h_split_col = Some(
+                                            mouse.column.clamp(5, size.width.saturating_sub(10)),
+                                        );
+                                    }
+                                    Some(DragHandle::Horizontal) => {
+                                        app.v_split_row =
+                                            Some(mouse.row.clamp(4, size.height.saturating_sub(4)));
+                                    }
+                                    None => {}
+                                }
+                            }
                         }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            app.dragging = None;
+                        }
+                        MouseEventKind::ScrollUp => match app.focus {
+                            Focus::Modules => {
+                                app.move_module_selection(-1);
+                            }
+                            Focus::Tasks => {
+                                app.move_task_selection(-1);
+                            }
+                            Focus::Output => {
+                                app.scroll_output(3);
+                            }
+                        },
+                        MouseEventKind::ScrollDown => match app.focus {
+                            Focus::Modules => {
+                                app.move_module_selection(1);
+                            }
+                            Focus::Tasks => {
+                                app.move_task_selection(1);
+                            }
+                            Focus::Output => {
+                                app.scroll_output(-3);
+                            }
+                        },
                         _ => {}
                     }
-                    continue;
                 }
+                Event::Key(key) => {
+                    // Allow Ctrl-C to quit from anywhere.
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        break;
+                    }
 
-                match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if let Ok(size) = terminal.size() {
-                            let col = mouse.column;
-                            let row = mouse.row;
-                            let h_split = app.effective_h_split(size.width);
-                            let v_split = app.effective_v_split(size.height);
-                            // Hit-test the vertical divider (within 1 col).
-                            if col + 1 == h_split || col == h_split {
-                                app.dragging = Some(DragHandle::Vertical);
-                            // Hit-test the horizontal divider (right panel, within 1 row).
-                            } else if col >= h_split && (row + 1 == v_split || row == v_split) {
-                                app.dragging = Some(DragHandle::Horizontal);
-                            } else {
-                                app.dragging = None;
-                                if let Some(focus) = pane_for_click(col, row, size, app) {
-                                    app.focus = focus;
-                                }
+                    // Fullscreen output mode: Esc exits, scroll keys pass through, all else swallowed.
+                    if app.output_fullscreen {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.output_fullscreen = false;
+                                execute!(io::stdout(), EnableMouseCapture)?;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                app.scroll_output(-1);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                app.scroll_output(1);
+                            }
+                            KeyCode::PageDown => {
+                                app.scroll_output(-(app.pane_heights.output.max(1) as i32));
+                            }
+                            KeyCode::PageUp => {
+                                app.scroll_output(app.pane_heights.output.max(1) as i32);
+                            }
+                            KeyCode::Char('g') => app.go_to_first(),
+                            KeyCode::Char('G') => app.go_to_last(),
+                            KeyCode::Char('w') => {
+                                app.output_wrap = !app.output_wrap;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Graceful-quit overlay: q force-quits, Esc cancels, everything else is swallowed.
+                    if app.pending_quit {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc => app.pending_quit = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Confirmation dialog intercepts all keys.
+                    if app.pending_confirm.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                app.confirm_execute();
+                            }
+                            _ => {
+                                app.cancel_confirm();
                             }
                         }
+                        continue;
                     }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if let Ok(size) = terminal.size() {
-                            match app.dragging {
-                                Some(DragHandle::Vertical) => {
-                                    app.h_split_col = Some(
-                                        mouse.column.clamp(5, size.width.saturating_sub(10)),
-                                    );
-                                }
-                                Some(DragHandle::Horizontal) => {
-                                    app.v_split_row = Some(
-                                        mouse.row.clamp(4, size.height.saturating_sub(4)),
-                                    );
-                                }
-                                None => {}
+
+                    // Cancel-task confirmation intercepts all keys.
+                    if !app.pending_cancel_task.is_empty() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                app.cancel_staged_tasks();
+                            }
+                            _ => {
+                                app.pending_cancel_task.clear();
                             }
                         }
+                        continue;
                     }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        app.dragging = None;
-                    }
-                    MouseEventKind::ScrollUp => match app.focus {
-                        Focus::Modules => { app.move_module_selection(-1); }
-                        Focus::Tasks   => { app.move_task_selection(-1); }
-                        Focus::Output  => { app.scroll_output(3); }
-                    },
-                    MouseEventKind::ScrollDown => match app.focus {
-                        Focus::Modules => { app.move_module_selection(1); }
-                        Focus::Tasks   => { app.move_task_selection(1); }
-                        Focus::Output  => { app.scroll_output(-3); }
-                    },
-                    _ => {}
-                }
-            }
-            Event::Key(key) => {
-                // Allow Ctrl-C to quit from anywhere.
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
-                {
-                    break;
-                }
 
-                // Fullscreen output mode: Esc exits, scroll keys pass through, all else swallowed.
-                if app.output_fullscreen {
+                    // Clear-task-history confirmation intercepts all keys.
+                    if app.pending_clear_tasks {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                app.clear_completed_tasks();
+                            }
+                            _ => {
+                                app.pending_clear_tasks = false;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Filter input mode.
+                    if app.filter_active {
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.filter_active = false;
+                                app.filter.clear();
+                            }
+                            KeyCode::Enter => {
+                                app.filter_active = false;
+                            }
+                            KeyCode::Backspace => {
+                                app.filter.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.filter.push(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Help overlay.
+                    if app.show_help {
+                        app.show_help = false;
+                        continue;
+                    }
+
+                    // State explorer overlay.
+                    if app.state_explorer.is_some() {
+                        let has_op_result = app
+                            .state_explorer
+                            .as_ref()
+                            .map(|e| e.op_result.is_some())
+                            .unwrap_or(false);
+                        let op_confirm = app.state_explorer.as_ref().and_then(|e| e.op_confirm);
+                        let has_pending_op = app
+                            .state_explorer
+                            .as_ref()
+                            .map(|e| e.pending_op.is_some())
+                            .unwrap_or(false);
+                        let in_detail = app
+                            .state_explorer
+                            .as_ref()
+                            .map(|e| e.detail_view.is_some())
+                            .unwrap_or(false);
+                        let filter_active = app
+                            .state_explorer
+                            .as_ref()
+                            .map(|e| e.filter_active)
+                            .unwrap_or(false);
+
+                        let plan_queued = app
+                            .state_explorer
+                            .as_ref()
+                            .map(|e| e.plan_queued_notice)
+                            .unwrap_or(false);
+
+                        if has_op_result {
+                            // Any key dismisses the result overlay.
+                            app.dismiss_op_result();
+                        } else if plan_queued {
+                            if let Some(e) = app.state_explorer.as_mut() {
+                                e.plan_queued_notice = false;
+                            }
+                        } else if op_confirm.is_some() {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    app.start_op();
+                                }
+                                _ => {
+                                    app.cancel_op_confirm();
+                                }
+                            }
+                        } else if has_pending_op {
+                            // Absorb all keys while the op is running.
+                        } else if in_detail {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.close_resource_detail();
+                                }
+                                KeyCode::Char('q') => {
+                                    app.close_state_explorer();
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    app.resource_detail_scroll(1);
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.resource_detail_scroll(-1);
+                                }
+                                KeyCode::PageDown => {
+                                    app.resource_detail_scroll(
+                                        app.pane_heights.explorer.max(1) as i32
+                                    );
+                                }
+                                KeyCode::PageUp => {
+                                    app.resource_detail_scroll(
+                                        -(app.pane_heights.explorer.max(1) as i32),
+                                    );
+                                }
+                                KeyCode::Char('g') => {
+                                    app.resource_detail_go_first();
+                                }
+                                KeyCode::Char('G') => {
+                                    app.resource_detail_go_last();
+                                }
+                                _ => {}
+                            }
+                        } else if filter_active {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.state_explorer_clear_filter();
+                                }
+                                KeyCode::Enter => {
+                                    app.state_explorer_deactivate_filter();
+                                }
+                                KeyCode::Backspace => {
+                                    app.state_explorer_filter_pop();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.state_explorer_filter_push(c);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    app.close_state_explorer();
+                                }
+                                KeyCode::Enter => {
+                                    app.open_resource_detail();
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    app.state_explorer_move(1);
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    app.state_explorer_move(-1);
+                                }
+                                KeyCode::PageDown => {
+                                    app.state_explorer_move(app.pane_heights.explorer.max(1) as i32);
+                                }
+                                KeyCode::PageUp => {
+                                    app.state_explorer_move(
+                                        -(app.pane_heights.explorer.max(1) as i32),
+                                    );
+                                }
+                                KeyCode::Char('g') => {
+                                    app.state_explorer_go_first();
+                                }
+                                KeyCode::Char('G') => {
+                                    app.state_explorer_go_last();
+                                }
+                                KeyCode::Char('/') => {
+                                    app.state_explorer_activate_filter();
+                                }
+                                KeyCode::Char(' ') => {
+                                    app.state_explorer_toggle_select();
+                                }
+                                KeyCode::Char('c') => {
+                                    app.state_explorer_clear_select();
+                                }
+                                KeyCode::Char('t') => {
+                                    app.request_op_confirm(ExplorerOpKind::Taint);
+                                }
+                                KeyCode::Char('D') => {
+                                    app.request_op_confirm(ExplorerOpKind::StateRm);
+                                }
+                                KeyCode::Char('p') => {
+                                    app.enqueue_targeted_plan();
+                                }
+                                KeyCode::Char('d') => {
+                                    app.request_op_confirm(ExplorerOpKind::TargetedDestroy);
+                                }
+                                KeyCode::Char('r') => {
+                                    app.refresh_state_explorer();
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+
                     match key.code {
-                        KeyCode::Esc => {
-                            app.output_fullscreen = false;
-                            execute!(io::stdout(), EnableMouseCapture)?;
+                        KeyCode::Char('q') => {
+                            if app.active_tasks().is_empty() {
+                                break;
+                            }
+                            app.pending_quit = true;
                         }
-                        KeyCode::Char('j') | KeyCode::Down  => { app.scroll_output(-1); }
-                        KeyCode::Char('k') | KeyCode::Up    => { app.scroll_output(1); }
-                        KeyCode::PageDown => { app.scroll_output(-(app.pane_heights.output.max(1) as i32)); }
-                        KeyCode::PageUp   => { app.scroll_output(app.pane_heights.output.max(1) as i32); }
+                        KeyCode::Char('h') | KeyCode::Char('?') => app.show_help = !app.show_help,
+                        KeyCode::Char('r') => app.refresh_modules(),
+                        KeyCode::Tab => app.cycle_focus(),
+
+                        // Clear filter.
+                        KeyCode::Esc => app.filter.clear(),
+
+                        // Vim first/last navigation.
                         KeyCode::Char('g') => app.go_to_first(),
                         KeyCode::Char('G') => app.go_to_last(),
-                        KeyCode::Char('w') => { app.output_wrap = !app.output_wrap; }
-                        _ => {}
-                    }
-                    continue;
-                }
 
-                // Graceful-quit overlay: q force-quits, Esc cancels, everything else is swallowed.
-                if app.pending_quit {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Esc => app.pending_quit = false,
-                        _ => {}
-                    }
-                    continue;
-                }
+                        // Navigation.
+                        KeyCode::Char('j') | KeyCode::Down => match app.focus {
+                            Focus::Modules => {
+                                app.move_module_selection(1);
+                            }
+                            Focus::Tasks => {
+                                app.move_task_selection(1);
+                            }
+                            Focus::Output => {
+                                app.scroll_output(-1);
+                            }
+                        },
+                        KeyCode::Char('k') | KeyCode::Up => match app.focus {
+                            Focus::Modules => {
+                                app.move_module_selection(-1);
+                            }
+                            Focus::Tasks => {
+                                app.move_task_selection(-1);
+                            }
+                            Focus::Output => {
+                                app.scroll_output(1);
+                            }
+                        },
+                        KeyCode::PageDown => match app.focus {
+                            Focus::Modules => {
+                                app.move_module_selection(app.pane_heights.modules.max(1) as i32);
+                            }
+                            Focus::Tasks => {
+                                app.move_task_selection(app.pane_heights.tasks.max(1) as i32);
+                            }
+                            Focus::Output => {
+                                app.scroll_output(-(app.pane_heights.output.max(1) as i32));
+                            }
+                        },
+                        KeyCode::PageUp => match app.focus {
+                            Focus::Modules => {
+                                app.move_module_selection(
+                                    -(app.pane_heights.modules.max(1) as i32),
+                                );
+                            }
+                            Focus::Tasks => {
+                                app.move_task_selection(-(app.pane_heights.tasks.max(1) as i32));
+                            }
+                            Focus::Output => {
+                                app.scroll_output(app.pane_heights.output.max(1) as i32);
+                            }
+                        },
 
-                // Confirmation dialog intercepts all keys.
-                if app.pending_confirm.is_some() {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            app.confirm_execute();
-                        }
-                        _ => {
-                            app.cancel_confirm();
-                        }
-                    }
-                    continue;
-                }
-
-                // Cancel-task confirmation intercepts all keys.
-                if !app.pending_cancel_task.is_empty() {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            app.cancel_staged_tasks();
-                        }
-                        _ => {
-                            app.pending_cancel_task.clear();
-                        }
-                    }
-                    continue;
-                }
-
-                // Filter input mode.
-                if app.filter_active {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.filter_active = false;
-                            app.filter.clear();
-                        }
+                        // Module actions.
+                        KeyCode::Char(' ') => match app.focus {
+                            Focus::Modules => {
+                                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    app.range_select();
+                                } else {
+                                    app.toggle_multi_select();
+                                }
+                            }
+                            Focus::Tasks => {
+                                app.toggle_task_select();
+                            }
+                            Focus::Output => {}
+                        },
+                        KeyCode::Char('c') => match app.focus {
+                            Focus::Tasks => app.task_multi_select.clear(),
+                            _ => {
+                                app.multi_select.clear();
+                                app.max_depth = None;
+                            }
+                        },
                         KeyCode::Enter => {
-                            app.filter_active = false;
-                        }
-                        KeyCode::Backspace => {
-                            app.filter.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.filter.push(c);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // Help overlay.
-                if app.show_help {
-                    app.show_help = false;
-                    continue;
-                }
-
-                // State explorer overlay.
-                if app.state_explorer.is_some() {
-                    let has_op_result = app.state_explorer.as_ref()
-                        .map(|e| e.op_result.is_some()).unwrap_or(false);
-                    let op_confirm = app.state_explorer.as_ref()
-                        .and_then(|e| e.op_confirm);
-                    let has_pending_op = app.state_explorer.as_ref()
-                        .map(|e| e.pending_op.is_some()).unwrap_or(false);
-                    let in_detail = app.state_explorer.as_ref()
-                        .map(|e| e.detail_view.is_some()).unwrap_or(false);
-                    let filter_active = app.state_explorer.as_ref()
-                        .map(|e| e.filter_active).unwrap_or(false);
-
-                    let plan_queued = app.state_explorer.as_ref()
-                        .map(|e| e.plan_queued_notice).unwrap_or(false);
-
-                    if has_op_result {
-                        // Any key dismisses the result overlay.
-                        app.dismiss_op_result();
-                    } else if plan_queued {
-                        if let Some(e) = app.state_explorer.as_mut() { e.plan_queued_notice = false; }
-                    } else if op_confirm.is_some() {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => { app.start_op(); }
-                            _ => { app.cancel_op_confirm(); }
-                        }
-                    } else if has_pending_op {
-                        // Absorb all keys while the op is running.
-                    } else if in_detail {
-                        match key.code {
-                            KeyCode::Esc => { app.close_resource_detail(); }
-                            KeyCode::Char('q') => { app.close_state_explorer(); }
-                            KeyCode::Char('j') | KeyCode::Down => { app.resource_detail_scroll(1); }
-                            KeyCode::Char('k') | KeyCode::Up   => { app.resource_detail_scroll(-1); }
-                            KeyCode::PageDown => { app.resource_detail_scroll(app.pane_heights.explorer.max(1) as i32); }
-                            KeyCode::PageUp   => { app.resource_detail_scroll(-(app.pane_heights.explorer.max(1) as i32)); }
-                            KeyCode::Char('g') => { app.resource_detail_go_first(); }
-                            KeyCode::Char('G') => { app.resource_detail_go_last(); }
-                            _ => {}
-                        }
-                    } else if filter_active {
-                        match key.code {
-                            KeyCode::Esc => { app.state_explorer_clear_filter(); }
-                            KeyCode::Enter => { app.state_explorer_deactivate_filter(); }
-                            KeyCode::Backspace => { app.state_explorer_filter_pop(); }
-                            KeyCode::Char(c) => { app.state_explorer_filter_push(c); }
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') => { app.close_state_explorer(); }
-                            KeyCode::Enter => { app.open_resource_detail(); }
-                            KeyCode::Char('j') | KeyCode::Down => { app.state_explorer_move(1); }
-                            KeyCode::Char('k') | KeyCode::Up   => { app.state_explorer_move(-1); }
-                            KeyCode::PageDown => { app.state_explorer_move(app.pane_heights.explorer.max(1) as i32); }
-                            KeyCode::PageUp   => { app.state_explorer_move(-(app.pane_heights.explorer.max(1) as i32)); }
-                            KeyCode::Char('g') => { app.state_explorer_go_first(); }
-                            KeyCode::Char('G') => { app.state_explorer_go_last(); }
-                            KeyCode::Char('/') => { app.state_explorer_activate_filter(); }
-                            KeyCode::Char(' ') => { app.state_explorer_toggle_select(); }
-                            KeyCode::Char('c') => { app.state_explorer_clear_select(); }
-                            KeyCode::Char('t') => { app.request_op_confirm(ExplorerOpKind::Taint); }
-                            KeyCode::Char('D') => { app.request_op_confirm(ExplorerOpKind::StateRm); }
-                            KeyCode::Char('p') => { app.enqueue_targeted_plan(); }
-                            KeyCode::Char('d') => { app.request_op_confirm(ExplorerOpKind::TargetedDestroy); }
-                            KeyCode::Char('r') => { app.refresh_state_explorer(); }
-                            _ => {}
-                        }
-                    }
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Char('q') => {
-                        if app.active_tasks().is_empty() {
-                            break;
-                        }
-                        app.pending_quit = true;
-                    }
-                    KeyCode::Char('h') | KeyCode::Char('?') => app.show_help = !app.show_help,
-                    KeyCode::Char('r') => app.refresh_modules(),
-                    KeyCode::Tab => app.cycle_focus(),
-
-                    // Clear filter.
-                    KeyCode::Esc => app.filter.clear(),
-
-                    // Vim first/last navigation.
-                    KeyCode::Char('g') => app.go_to_first(),
-                    KeyCode::Char('G') => app.go_to_last(),
-
-                    // Navigation.
-                    KeyCode::Char('j') | KeyCode::Down => { match app.focus {
-                        Focus::Modules => { app.move_module_selection(1); }
-                        Focus::Tasks   => { app.move_task_selection(1); }
-                        Focus::Output  => { app.scroll_output(-1); }
-                    } }
-                    KeyCode::Char('k') | KeyCode::Up => { match app.focus {
-                        Focus::Modules => { app.move_module_selection(-1); }
-                        Focus::Tasks   => { app.move_task_selection(-1); }
-                        Focus::Output  => { app.scroll_output(1); }
-                    } }
-                    KeyCode::PageDown => match app.focus {
-                        Focus::Modules => { app.move_module_selection(app.pane_heights.modules.max(1) as i32); }
-                        Focus::Tasks   => { app.move_task_selection(app.pane_heights.tasks.max(1) as i32); }
-                        Focus::Output  => { app.scroll_output(-(app.pane_heights.output.max(1) as i32)); }
-                    }
-                    KeyCode::PageUp => match app.focus {
-                        Focus::Modules => { app.move_module_selection(-(app.pane_heights.modules.max(1) as i32)); }
-                        Focus::Tasks   => { app.move_task_selection(-(app.pane_heights.tasks.max(1) as i32)); }
-                        Focus::Output  => { app.scroll_output(app.pane_heights.output.max(1) as i32); }
-                    }
-
-                    // Module actions.
-                    KeyCode::Char(' ') => match app.focus {
-                        Focus::Modules => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                app.range_select();
-                            } else {
-                                app.toggle_multi_select();
+                            if app.focus == Focus::Modules {
+                                app.open_state_explorer();
+                            } else if app.focus == Focus::Output || app.focus == Focus::Tasks {
+                                app.output_fullscreen = true;
+                                execute!(io::stdout(), DisableMouseCapture)?;
                             }
                         }
-                        Focus::Tasks => { app.toggle_task_select(); }
-                        Focus::Output => {}
-                    },
-                    KeyCode::Char('c') => match app.focus {
-                        Focus::Tasks => app.task_multi_select.clear(),
-                        _ => {
-                            app.multi_select.clear();
-                            app.max_depth = None;
+
+                        // Terraform commands.
+                        KeyCode::Char('i') => app.enqueue_command("init", vec![]),
+                        KeyCode::Char('u') => app.request_init_upgrade_confirm(),
+                        KeyCode::Char('p') => app.enqueue_plan(),
+                        // Destructive commands require confirmation.
+                        KeyCode::Char('a') => app.request_apply_confirm(),
+                        KeyCode::Char('d') => app.request_destroy_confirm(),
+                        KeyCode::Char('U') => app.request_force_unlock_confirm(),
+
+                        // Cancel the selected task (with confirmation).
+                        KeyCode::Char('C') => app.request_cancel_task_confirm(),
+
+                        // Clear completed task history (Tasks pane only).
+                        KeyCode::Char('x') => {
+                            if app.focus == Focus::Tasks {
+                                app.request_clear_tasks_confirm();
+                            }
                         }
-                    },
-                    KeyCode::Enter => {
-                        if app.focus == Focus::Modules {
-                            app.open_state_explorer();
-                        } else if app.focus == Focus::Output || app.focus == Focus::Tasks {
-                            app.output_fullscreen = true;
-                            execute!(io::stdout(), DisableMouseCapture)?;
+
+                        // Depth limiter.
+                        KeyCode::Char('[') => app.decrease_depth(),
+                        KeyCode::Char(']') => app.increase_depth(),
+
+                        // Toggle output line wrap.
+                        KeyCode::Char('w') => {
+                            app.output_wrap = !app.output_wrap;
                         }
+
+                        // Filter.
+                        KeyCode::Char('/') => {
+                            app.filter_active = true;
+                            app.filter.clear();
+                        }
+
+                        _ => {}
                     }
-
-                    // Terraform commands.
-                    KeyCode::Char('i') => app.enqueue_command("init", vec![]),
-                    KeyCode::Char('u') => app.request_init_upgrade_confirm(),
-                    KeyCode::Char('p') => app.enqueue_plan(),
-                    // Destructive commands require confirmation.
-                    KeyCode::Char('a') => app.request_apply_confirm(),
-                    KeyCode::Char('d') => app.request_destroy_confirm(),
-                    KeyCode::Char('U') => app.request_force_unlock_confirm(),
-
-                    // Cancel the selected task (with confirmation).
-                    KeyCode::Char('C') => app.request_cancel_task_confirm(),
-
-                    // Depth limiter.
-                    KeyCode::Char('[') => app.decrease_depth(),
-                    KeyCode::Char(']') => app.increase_depth(),
-
-                    // Toggle output line wrap.
-                    KeyCode::Char('w') => { app.output_wrap = !app.output_wrap; }
-
-                    // Filter.
-                    KeyCode::Char('/') => {
-                        app.filter_active = true;
-                        app.filter.clear();
-                    }
-
-                    _ => {}
-                }
-            } // end Event::Key
-            _ => {}
+                } // end Event::Key
+                _ => {}
             } // end match event::read()
         }
     }
@@ -442,8 +616,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
 
     // Save inner heights (minus borders) for page up/down.
     app.pane_heights.modules = h_chunks[0].height.saturating_sub(2);
-    app.pane_heights.output  = v_chunks[0].height.saturating_sub(2);
-    app.pane_heights.tasks   = v_chunks[1].height.saturating_sub(2);
+    app.pane_heights.output = v_chunks[0].height.saturating_sub(2);
+    app.pane_heights.tasks = v_chunks[1].height.saturating_sub(2);
 
     tree::render(f, h_chunks[0], app);
     output::render(f, v_chunks[0], app);
@@ -466,12 +640,26 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     }
 
     if !app.pending_cancel_task.is_empty() {
-        let tasks: Vec<(&str, &str)> = app.pending_cancel_task.iter()
+        let tasks: Vec<(&str, &str)> = app
+            .pending_cancel_task
+            .iter()
             .filter_map(|&id| app.tasks.iter().find(|t| t.id == id))
             .map(|t| (t.module_name.as_str(), t.command.as_str()))
             .collect();
         if !tasks.is_empty() {
             render_cancel_task_confirm(f, area, &tasks);
+        }
+    }
+
+    if app.pending_clear_tasks {
+        let completed = app.completed_task_count();
+        if completed > 0 {
+            render_clear_tasks_confirm(
+                f,
+                area,
+                completed,
+                app.tasks.len().saturating_sub(completed),
+            );
         }
     }
 }
@@ -490,6 +678,7 @@ g / G      Jump to first / last
 Space      Toggle multi-select (Modules or Tasks pane)
 Ctrl+Space Range-select modules
 c          Clear selection (current pane)
+x          Clear completed tasks (Tasks pane)
 Enter      State explorer (Modules) / Fullscreen (Output or Tasks)
 w          Toggle line wrap (output pane)
 Esc        Close overlay / clear filter
@@ -508,7 +697,7 @@ h / ?      Toggle this help
 q / Ctrl-C Quit";
 
     let width = 52u16;
-    let height = 24u16;
+    let height = 25u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width.min(area.width), height.min(area.height));
@@ -552,25 +741,25 @@ fn render_filter_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, filter
         widgets::{Block, Borders, Clear, Paragraph},
     };
 
-    let bar = Rect::new(area.x, area.y + area.height.saturating_sub(3), area.width, 3);
+    let bar = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(3),
+        area.width,
+        3,
+    );
     f.render_widget(Clear, bar);
     f.render_widget(
-        Paragraph::new(format!("/{filter}_"))
-            .block(
-                Block::default()
-                    .title(" Filter ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
+        Paragraph::new(format!("/{filter}_")).block(
+            Block::default()
+                .title(" Filter ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
         bar,
     );
 }
 
-fn render_confirm(
-    f: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    confirm: &PendingConfirm,
-) {
+fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: &PendingConfirm) {
     use ratatui::{
         layout::{Alignment, Rect},
         style::{Color, Modifier, Style},
@@ -583,25 +772,37 @@ fn render_confirm(
     let noun = if n == 1 { "module" } else { "modules" };
 
     // Dynamic width: measure the longest name + annotation column.
-    let name_width = confirm.targets.iter()
+    let name_width = confirm
+        .targets
+        .iter()
         .map(|t| t.module_name.len())
         .max()
         .unwrap_or(0);
     let extra_width: usize = match &confirm.kind {
-        ConfirmKind::Apply => confirm.targets.iter()
+        ConfirmKind::Apply => confirm
+            .targets
+            .iter()
             .map(|t| match &t.plan_age {
                 Some(age) => format!("  plan from {}", age).len(),
                 None => "  no prior plan".len(),
             })
             .max()
             .unwrap_or(0),
-        ConfirmKind::ForceUnlock => confirm.targets.iter()
+        ConfirmKind::ForceUnlock => confirm
+            .targets
+            .iter()
             .map(|t| {
                 if let Some(id) = &t.lock_id {
-                    let short_id = if id.len() > 8 { format!("{}…", &id[..8]) } else { id.clone() };
+                    let short_id = if id.len() > 8 {
+                        format!("{}…", &id[..8])
+                    } else {
+                        id.clone()
+                    };
                     let who = t.lock_who.as_deref().unwrap_or("?");
                     format!("  lock {}  by {}", short_id, who).len()
-                } else { 0 }
+                } else {
+                    0
+                }
             })
             .max()
             .unwrap_or(0),
@@ -621,7 +822,11 @@ fn render_confirm(
     ];
 
     for target in &confirm.targets {
-        let name_span = Span::raw(format!("    • {:<width$}", target.module_name, width = name_width));
+        let name_span = Span::raw(format!(
+            "    • {:<width$}",
+            target.module_name,
+            width = name_width
+        ));
 
         let plan_span = match &confirm.kind {
             ConfirmKind::Apply => match &target.plan_age {
@@ -668,7 +873,9 @@ fn render_confirm(
         Span::raw("  "),
         Span::styled(
             "[y] Confirm",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled("[any] Cancel", Style::default().fg(Color::DarkGray)),
@@ -711,7 +918,7 @@ fn render_cancel_task_confirm(
 
     // Dynamic width: fit the longest name + command.
     let name_width = tasks.iter().map(|t| t.0.len()).max().unwrap_or(0);
-    let cmd_width  = tasks.iter().map(|t| t.1.len()).max().unwrap_or(0);
+    let cmd_width = tasks.iter().map(|t| t.1.len()).max().unwrap_or(0);
     // 8 = "    • " (6) + "  " gap (2); 41 = footer "  [y] Cancel task(s)   [any] Keep running".
     let content_w = (8 + name_width + cmd_width).max(41);
 
@@ -725,7 +932,11 @@ fn render_cancel_task_confirm(
 
     for &(module_name, command) in tasks {
         lines.push(Line::from(vec![
-            Span::raw(format!("    • {:<width$}  ", module_name, width = name_width)),
+            Span::raw(format!(
+                "    • {:<width$}  ",
+                module_name,
+                width = name_width
+            )),
             Span::styled(command.to_string(), Style::default().fg(Color::Blue)),
         ]));
     }
@@ -733,7 +944,12 @@ fn render_cancel_task_confirm(
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("[y] Cancel task(s)", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[y] Cancel task(s)",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::styled("[any] Keep running", Style::default().fg(Color::DarkGray)),
     ]));
@@ -758,6 +974,83 @@ fn render_cancel_task_confirm(
     );
 }
 
+fn render_clear_tasks_confirm(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    completed: usize,
+    active: usize,
+) {
+    use ratatui::{
+        layout::{Alignment, Rect},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph},
+    };
+
+    let completed_noun = if completed == 1 { "task" } else { "tasks" };
+    let active_noun = if active == 1 { "task" } else { "tasks" };
+    let active_line = if active > 0 {
+        format!("  Keeps {active} active {active_noun}.")
+    } else {
+        "  Task list will be empty afterward.".to_string()
+    };
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Clear {completed} completed {completed_noun}?"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            active_line,
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "[y] Clear",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("[any] Keep", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let content_w = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.len())
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
+        .max(28);
+    let height = (lines.len() + 2).min(area.height as usize) as u16;
+    let width = (content_w + 2).min(area.width as usize) as u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Clear Completed Tasks ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .alignment(Alignment::Left),
+        popup,
+    );
+}
+
 fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     use ratatui::{
         layout::{Alignment, Rect},
@@ -769,8 +1062,12 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
     let active = app.active_tasks();
 
     // Dynamic width: fit the longest name + command.
-    let name_width = active.iter().map(|t| t.module_name.len()).max().unwrap_or(0);
-    let cmd_width  = active.iter().map(|t| t.command.len()).max().unwrap_or(0);
+    let name_width = active
+        .iter()
+        .map(|t| t.module_name.len())
+        .max()
+        .unwrap_or(0);
+    let cmd_width = active.iter().map(|t| t.command.len()).max().unwrap_or(0);
     // 5 = "  X " icon prefix; 31 = footer "  [q] Force quit   [Esc] Cancel".
     let content_w = (5 + name_width + 1 + cmd_width).max(31);
 
@@ -803,7 +1100,9 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
         Span::raw("   "),
         Span::styled(
             "[Esc] Cancel",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
 
@@ -838,13 +1137,13 @@ fn render_state_explorer(
         return;
     }
 
+    use crate::state::{StateContent, StateResource};
     use ratatui::{
         layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Paragraph},
     };
-    use crate::state::{StateContent, StateResource};
 
     // Reserve rows: 2 border + 1 blank top + 1 blank before hint + 1 hint + 1 counter (worst case).
     let max_resource_rows = area.height.saturating_sub(7).max(3) as usize;
@@ -855,7 +1154,9 @@ fn render_state_explorer(
         StateContent::NotInitialized => {
             lines.push(Line::from(Span::styled(
                 "  Not initialized",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
                 "  Run `i` to initialize this module.",
@@ -865,7 +1166,9 @@ fn render_state_explorer(
         StateContent::NoState => {
             lines.push(Line::from(Span::styled(
                 "  No state",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
                 "  Module is initialized but has no resources in state.",
@@ -895,7 +1198,8 @@ fn render_state_explorer(
                 )));
             } else {
                 // Scroll window: keep selected visible at bottom of window.
-                let scroll_start = explorer.selected
+                let scroll_start = explorer
+                    .selected
                     .saturating_sub(max_resource_rows.saturating_sub(1))
                     .min(visible_count.saturating_sub(max_resource_rows));
 
@@ -931,7 +1235,9 @@ fn render_state_explorer(
                         let mut spans = vec![
                             Span::styled(
                                 " ● ".to_string(),
-                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw(resource.address.clone()),
                         ];
@@ -987,7 +1293,12 @@ fn render_state_explorer(
     // Filter bar (always present for resources; shows hint or active input).
     let filter_line = if explorer.filter_active {
         Line::from(vec![
-            Span::styled("  /", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  /",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(explorer.filter.clone(), Style::default().fg(Color::White)),
             Span::styled("█", Style::default().fg(Color::Cyan)),
         ])
@@ -996,7 +1307,9 @@ fn render_state_explorer(
             Span::styled("  /", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 explorer.filter.clone(),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ),
             Span::styled("  (Esc to clear)", Style::default().fg(Color::DarkGray)),
         ])
@@ -1032,7 +1345,12 @@ fn render_state_explorer(
         let n = r.len();
         let sel = explorer.multi_select.len();
         if sel > 0 {
-            format!(" — {} resource{} ({} selected)", n, if n == 1 { "" } else { "s" }, sel)
+            format!(
+                " — {} resource{} ({} selected)",
+                n,
+                if n == 1 { "" } else { "s" },
+                sel
+            )
         } else {
             format!(" — {} resource{}", n, if n == 1 { "" } else { "s" })
         }
@@ -1040,7 +1358,11 @@ fn render_state_explorer(
         String::new()
     };
 
-    let border_color = if explorer.filter_active { Color::Cyan } else { Color::Blue };
+    let border_color = if explorer.filter_active {
+        Color::Cyan
+    } else {
+        Color::Blue
+    };
 
     f.render_widget(
         Paragraph::new(lines)
@@ -1084,7 +1406,9 @@ fn render_resource_detail(
         Span::raw("  "),
         Span::styled(
             detail.address.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     // Separator spanning the full inner width.
@@ -1139,7 +1463,10 @@ fn render_resource_detail(
 
 /// Syntax-highlight a single line from `serde_json::to_string_pretty` output.
 fn style_json_line(line: &str) -> ratatui::text::Line<'static> {
-    use ratatui::{style::{Color, Style}, text::{Line, Span}};
+    use ratatui::{
+        style::{Color, Style},
+        text::{Line, Span},
+    };
 
     let trimmed = line.trim_start();
     let indent_len = line.len() - trimmed.len();
@@ -1185,10 +1512,13 @@ fn style_json_line(line: &str) -> ratatui::text::Line<'static> {
 
 /// Return a styled `Span` for a JSON value token.
 fn json_value_span(v: &str) -> ratatui::text::Span<'static> {
-    use ratatui::{style::{Color, Style}, text::Span};
+    use ratatui::{
+        style::{Color, Style},
+        text::Span,
+    };
     match v {
         "true" | "false" => Span::styled(v.to_string(), Style::default().fg(Color::Magenta)),
-        "null"           => Span::styled(v.to_string(), Style::default().fg(Color::DarkGray)),
+        "null" => Span::styled(v.to_string(), Style::default().fg(Color::DarkGray)),
         "{" | "[" | "}" | "]" => Span::styled(v.to_string(), Style::default().fg(Color::DarkGray)),
         _ if v.starts_with('"') => Span::styled(v.to_string(), Style::default().fg(Color::Green)),
         _ => Span::styled(v.to_string(), Style::default().fg(Color::Cyan)),
@@ -1200,13 +1530,21 @@ fn json_value_span(v: &str) -> ratatui::text::Span<'static> {
 /// Returns `None` if the string is not well-formed.
 fn json_string_end(s: &str, start: usize) -> Option<usize> {
     let bytes = s.as_bytes();
-    if bytes.get(start) != Some(&b'"') { return None; }
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
     let mut i = start + 1;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => { i += 2; }      // escaped character — skip both bytes
-            b'"'  => { return Some(i + 1); }
-            _     => { i += 1; }
+            b'\\' => {
+                i += 2;
+            } // escaped character — skip both bytes
+            b'"' => {
+                return Some(i + 1);
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
     None
@@ -1231,7 +1569,10 @@ fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
-        Line::from(Span::styled("  [any key] Dismiss", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "  [any key] Dismiss",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let height = (lines.len() + 2) as u16;
@@ -1275,7 +1616,11 @@ fn render_op_confirm(
     // 6 = "    • "; 46 = TargetedDestroy warning; 28 = footer.
     let content_w = (6 + addr_width)
         .max(format!("  {} {} {}:", kind.confirm_verb(), n, noun).len())
-        .max(if kind == ExplorerOpKind::TargetedDestroy { 46 } else { 28 });
+        .max(if kind == ExplorerOpKind::TargetedDestroy {
+            46
+        } else {
+            28
+        });
 
     let mut lines: Vec<Line> = vec![
         Line::from(""),
@@ -1301,7 +1646,10 @@ fn render_op_confirm(
     }
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("[y] Confirm", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[y] Confirm",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::styled("[any] Cancel", Style::default().fg(Color::DarkGray)),
     ]));
@@ -1335,19 +1683,30 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
     };
 
     // Dynamic width: fit the longest address across done/running/queued.
-    let addr_width = pt.done.iter().map(|(a, _)| a.len())
+    let addr_width = pt
+        .done
+        .iter()
+        .map(|(a, _)| a.len())
         .chain(pt.running.iter().map(|(_, a)| a.len()))
         .chain(pt.queue.iter().map(|a| a.len()))
-        .max().unwrap_or(0);
+        .max()
+        .unwrap_or(0);
     // 4 = "  ✓ " prefix.
     let content_w = (4 + addr_width).max(20);
 
     let mut lines: Vec<Line> = vec![Line::from(""), Line::from("")];
     for (addr, success) in &pt.done {
-        let (icon, color) = if *success { ("✓", Color::Green) } else { ("✗", Color::Red) };
+        let (icon, color) = if *success {
+            ("✓", Color::Green)
+        } else {
+            ("✗", Color::Red)
+        };
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ", icon),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(addr.clone()),
         ]));
     }
@@ -1398,15 +1757,27 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
     let border_color = if all_ok { Color::Green } else { Color::Red };
 
     // Dynamic width: fit the longest address; 20 = "  [any key] Dismiss".
-    let addr_width = result.entries.iter().map(|(a, _)| a.len()).max().unwrap_or(0);
+    let addr_width = result
+        .entries
+        .iter()
+        .map(|(a, _)| a.len())
+        .max()
+        .unwrap_or(0);
     let content_w = (4 + addr_width).max(20);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     for (addr, success) in &result.entries {
-        let (icon, color) = if *success { ("✓", Color::Green) } else { ("✗", Color::Red) };
+        let (icon, color) = if *success {
+            ("✓", Color::Green)
+        } else {
+            ("✗", Color::Red)
+        };
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ", icon),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(addr.clone()),
         ]));
     }
@@ -1439,7 +1810,10 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
 /// Render an address line with the filter match portion highlighted in bold yellow.
 /// `text` includes the leading "  " padding; `filter_lower` is already lowercased.
 fn highlight_filter_match(text: String, filter_lower: &str) -> ratatui::text::Line<'static> {
-    use ratatui::{style::{Color, Modifier, Style}, text::{Line, Span}};
+    use ratatui::{
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+    };
 
     let text_lower = text.to_lowercase();
     if let Some(pos) = text_lower.find(filter_lower) {
@@ -1451,7 +1825,9 @@ fn highlight_filter_match(text: String, filter_lower: &str) -> ratatui::text::Li
                 Span::raw(text[..pos].to_string()),
                 Span::styled(
                     text[pos..end].to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(text[end..].to_string()),
             ]);

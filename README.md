@@ -72,6 +72,7 @@ rug --dir infra/ list
 
 Use `/` to filter the module list by name, then `Space` to multi-select before running a command.
 Modules with a successful cached plan ready to apply are marked in the module pane, and the current ready plan task is marked in the task pane.
+Long module and task entries wrap to the current pane width, including after pane or terminal resize.
 
 ![Filter and select demo](docs/demo-filter.gif)
 
@@ -83,6 +84,7 @@ Modules with a successful cached plan ready to apply are marked in the module pa
 | `Space` | Toggle multi-select (Modules or Tasks pane) |
 | `Ctrl+Space` | Range-select modules |
 | `c` | Clear selection (current pane) |
+| `x` | Clear completed tasks (Tasks pane) |
 | `Enter` | State explorer (Modules pane) / Fullscreen (Output pane) |
 | `Esc` | Close overlay / clear filter |
 | `i` | Init selected modules |

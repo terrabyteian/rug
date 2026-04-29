@@ -45,7 +45,13 @@ impl PlanCache {
         let sanitized: String = module_path
             .to_string_lossy()
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.dir.path().join(format!("{sanitized}.tfplan"))
     }

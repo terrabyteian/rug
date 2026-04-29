@@ -1,12 +1,16 @@
-use std::path::{Path, PathBuf};
-use serde::Deserialize;
 use crate::state::resolve_state_path;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LockInfo {
-    #[serde(rename = "ID")]        pub id: String,
-    #[serde(rename = "Who")]       pub who: String,
-    #[serde(rename = "Operation")] #[allow(dead_code)] pub operation: String,
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "Who")]
+    pub who: String,
+    #[serde(rename = "Operation")]
+    #[allow(dead_code)]
+    pub operation: String,
 }
 
 /// Read the lock file for a module using a local-backend `.lock.info` file.
@@ -29,7 +33,9 @@ pub fn read_lock_info(module_path: &Path) -> Option<LockInfo> {
 /// multiple in the same output buffer.
 pub fn parse_lock_from_output(lines: &[String]) -> Option<LockInfo> {
     // Scan from the end to find the last "Lock Info:" marker.
-    let lock_pos = lines.iter().rposition(|l| strip_border(l).contains("Lock Info:"))?;
+    let lock_pos = lines
+        .iter()
+        .rposition(|l| strip_border(l).contains("Lock Info:"))?;
 
     let mut id = None;
     let mut who = String::new();
@@ -50,7 +56,11 @@ pub fn parse_lock_from_output(lines: &[String]) -> Option<LockInfo> {
         }
     }
 
-    Some(LockInfo { id: id?, who, operation })
+    Some(LockInfo {
+        id: id?,
+        who,
+        operation,
+    })
 }
 
 /// Strip ANSI escape codes and the box-drawing border (`│`, `╷`, `╵`) that
@@ -69,7 +79,9 @@ fn strip_ansi(s: &str) -> String {
         if ch == '\x1b' && chars.peek() == Some(&'[') {
             chars.next();
             for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() { break; }
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
             }
         } else {
             out.push(ch);

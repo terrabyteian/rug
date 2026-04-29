@@ -97,10 +97,7 @@ async fn main() -> Result<()> {
         None => {
             // TUI mode.
             if all_modules.is_empty() {
-                eprintln!(
-                    "No terraform root modules found under {}",
-                    root.display()
-                );
+                eprintln!("No terraform root modules found under {}", root.display());
                 std::process::exit(1);
             }
             let root_modules: Vec<_> = all_modules.into_iter().filter(|m| m.is_root()).collect();
@@ -153,7 +150,11 @@ async fn main() -> Result<()> {
             .await?;
         }
         Some(Commands::Exec(e)) => {
-            let ra = RunArgs { all: e.all, filter: e.filter, yes: true };
+            let ra = RunArgs {
+                all: e.all,
+                filter: e.filter,
+                yes: true,
+            };
             run_headless_cmd(&config, &all_modules, &e.subcommand, &e.extra, &ra, false).await?;
         }
     }
@@ -250,8 +251,7 @@ async fn run_headless(
         })
         .collect();
 
-    let mut statuses: Vec<TaskStatus> =
-        (0..modules.len()).map(|_| TaskStatus::Pending).collect();
+    let mut statuses: Vec<TaskStatus> = (0..modules.len()).map(|_| TaskStatus::Pending).collect();
     let mut done_count = 0;
 
     // Drop original tx so the channel closes when all spawned tasks finish.
@@ -265,8 +265,11 @@ async fn run_headless(
                 println!("[{name}] {line}");
             }
             TaskEvent::Finished { task_id, success } => {
-                statuses[task_id] =
-                    if success { TaskStatus::Success } else { TaskStatus::Failed };
+                statuses[task_id] = if success {
+                    TaskStatus::Success
+                } else {
+                    TaskStatus::Failed
+                };
                 done_count += 1;
                 if done_count == modules.len() {
                     break;

@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::app::{App, Focus};
 use crate::task::{ResourceCounts, TaskStatus};
+use crate::ui::wrap::wrap_line;
 
 /// Render the task list pane, sorted by most recently active first.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
@@ -19,11 +20,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let sorted = app.sorted_task_display();
+    let inner_width = area.width.saturating_sub(2);
+    let max_item_lines = area.height.saturating_sub(2).max(1) as usize;
 
     // Find which display position is currently selected (for ListState).
-    let selected_display_pos = app.selected_task_id.and_then(|id| {
-        sorted.iter().position(|&vi| app.tasks[vi].id == id)
-    });
+    let selected_display_pos = app
+        .selected_task_id
+        .and_then(|id| sorted.iter().position(|&vi| app.tasks[vi].id == id));
 
     let items: Vec<ListItem> = sorted
         .iter()
@@ -36,12 +39,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             const CANCEL_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
 
             let status_style = match &task.status {
-                TaskStatus::Pending    => Style::default().fg(Color::DarkGray),
-                TaskStatus::Running    => Style::default().fg(Color::Yellow),
+                TaskStatus::Pending => Style::default().fg(Color::DarkGray),
+                TaskStatus::Running => Style::default().fg(Color::Yellow),
                 TaskStatus::Cancelling => Style::default().fg(Color::Magenta),
-                TaskStatus::Success    => Style::default().fg(Color::Green),
-                TaskStatus::Failed     => Style::default().fg(Color::Red),
-                TaskStatus::Cancelled  => Style::default().fg(Color::DarkGray),
+                TaskStatus::Success => Style::default().fg(Color::Green),
+                TaskStatus::Failed => Style::default().fg(Color::Red),
+                TaskStatus::Cancelled => Style::default().fg(Color::DarkGray),
             };
 
             let icon = if task.status == TaskStatus::Cancelling {
@@ -67,14 +70,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(check.to_string(), Style::default().fg(Color::Yellow)),
                 Span::styled(format!("{icon} "), status_style),
                 Span::raw(format!("{:<20} ", task.module_name)),
-                Span::styled(format!("{:<8}", task.command), Style::default().fg(Color::Blue)),
+                Span::styled(
+                    format!("{:<8}", task.command),
+                    Style::default().fg(Color::Blue),
+                ),
                 Span::styled(elapsed_part, Style::default().fg(Color::DarkGray)),
             ];
 
             if let Some(plan) = ready_plan {
                 spans.push(Span::styled(
                     format!("  P:{}", plan.age_str()),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
 
@@ -85,12 +93,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let line = Line::from(spans);
 
             let row_style = if is_selected {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
 
-            ListItem::new(line).style(row_style)
+            ListItem::new(wrap_line(line, inner_width, 4, max_item_lines)).style(row_style)
         })
         .collect();
 
@@ -136,11 +146,11 @@ fn count_spans(counts: &ResourceCounts) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
     let entries: &[(u32, &str, &str, Color)] = &[
-        (counts.add,     "+", "add",     Color::Green),
-        (counts.change,  "~", "change",  Color::Yellow),
+        (counts.add, "+", "add", Color::Green),
+        (counts.change, "~", "change", Color::Yellow),
         (counts.destroy, "-", "destroy", Color::Red),
-        (counts.import,  "i", "import",  Color::Cyan),
-        (counts.forget,  "f", "forget",  Color::DarkGray),
+        (counts.import, "i", "import", Color::Cyan),
+        (counts.forget, "f", "forget", Color::DarkGray),
     ];
 
     for &(n, sym, label, color) in entries {

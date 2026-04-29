@@ -18,12 +18,12 @@ pub enum TaskStatus {
 impl TaskStatus {
     pub fn icon(&self) -> &'static str {
         match self {
-            Self::Pending    => "○",
-            Self::Running    => "⟳",
-            Self::Cancelling => "◐",   // overridden with animated frames in tasks.rs
-            Self::Success    => "✓",
-            Self::Failed     => "✗",
-            Self::Cancelled  => "⊘",
+            Self::Pending => "○",
+            Self::Running => "⟳",
+            Self::Cancelling => "◐", // overridden with animated frames in tasks.rs
+            Self::Success => "✓",
+            Self::Failed => "✗",
+            Self::Cancelled => "⊘",
         }
     }
 
@@ -61,8 +61,11 @@ pub struct ResourceCounts {
 
 impl ResourceCounts {
     pub fn all_zero(&self) -> bool {
-        self.add == 0 && self.change == 0 && self.destroy == 0
-            && self.import == 0 && self.forget == 0
+        self.add == 0
+            && self.change == 0
+            && self.destroy == 0
+            && self.import == 0
+            && self.forget == 0
     }
 }
 
@@ -130,7 +133,9 @@ fn parse_segment(text: &str, sep: &str) -> ResourceCounts {
                 continue;
             }
         };
-        let Ok(n) = n_str.parse::<u32>() else { continue };
+        let Ok(n) = n_str.parse::<u32>() else {
+            continue;
+        };
         match verb {
             "add" | "added" => counts.add = n,
             "change" | "changed" => counts.change = n,
@@ -152,7 +157,7 @@ fn strip_ansi(s: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\x1b' && chars.peek() == Some(&'[') {
             chars.next(); // consume '['
-            // consume until we hit the final byte (an ASCII letter)
+                          // consume until we hit the final byte (an ASCII letter)
             for c in chars.by_ref() {
                 if c.is_ascii_alphabetic() {
                     break;
@@ -171,26 +176,33 @@ fn strip_ansi(s: &str) -> String {
 /// If the process hasn't exited by the time `force_kill()` is called, SIGKILL
 /// is sent immediately. Both methods are idempotent.
 pub struct CancelHandle {
-    sigint:  Option<tokio::sync::oneshot::Sender<()>>,
+    sigint: Option<tokio::sync::oneshot::Sender<()>>,
     sigkill: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl CancelHandle {
     pub fn new(
-        sigint:  tokio::sync::oneshot::Sender<()>,
+        sigint: tokio::sync::oneshot::Sender<()>,
         sigkill: tokio::sync::oneshot::Sender<()>,
     ) -> Self {
-        Self { sigint: Some(sigint), sigkill: Some(sigkill) }
+        Self {
+            sigint: Some(sigint),
+            sigkill: Some(sigkill),
+        }
     }
 
     /// Send SIGINT — graceful shutdown. No-op if already sent.
     pub fn cancel(&mut self) {
-        if let Some(tx) = self.sigint.take() { let _ = tx.send(()); }
+        if let Some(tx) = self.sigint.take() {
+            let _ = tx.send(());
+        }
     }
 
     /// Send SIGKILL — immediate termination. No-op if already sent.
     pub fn force_kill(&mut self) {
-        if let Some(tx) = self.sigkill.take() { let _ = tx.send(()); }
+        if let Some(tx) = self.sigkill.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
