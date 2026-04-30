@@ -60,11 +60,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             };
 
             let check = if is_multi { "✓ " } else { "  " };
-            let ready_plan = app.plan_cache.get(&task.module_path).filter(|plan| {
-                task.command == "plan"
-                    && task.status == TaskStatus::Success
-                    && task.plan_output_path.as_ref() == Some(&plan.path)
-            });
+            let ready_plan = app.ready_plan_for_task(task);
 
             let mut spans = vec![
                 Span::styled(check.to_string(), Style::default().fg(Color::Yellow)),

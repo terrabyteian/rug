@@ -738,8 +738,9 @@ impl App {
     /// Stage `apply` for confirmation, annotating each target with plan info.
     ///
     /// When the Tasks pane is focused and all selected tasks are plan commands,
-    /// the apply targets are derived from those tasks rather than the module
-    /// selection. Otherwise falls back to the normal module selection.
+    /// the apply targets are derived from current ready plan tasks rather than
+    /// the module selection. Stale plan-task selections stage nothing.
+    /// Otherwise falls back to the normal module selection.
     pub fn request_apply_confirm(&mut self) {
         let confirm_targets = if self.focus == Focus::Tasks {
             self.apply_targets_from_plan_tasks()
@@ -771,6 +772,8 @@ impl App {
 
     /// Derive apply `ConfirmTarget`s from the currently selected plan task(s)
     /// in the Tasks pane. Returns `None` if the selection contains non-plan tasks.
+    /// Stale plan tasks are ignored; if none are current, returns an empty vec
+    /// so callers do not fall back to the module selection.
     fn apply_targets_from_plan_tasks(&self) -> Option<Vec<ConfirmTarget>> {
         let task_ids: Vec<usize> = if !self.task_multi_select.is_empty() {
             self.task_multi_select.clone()
@@ -787,6 +790,10 @@ impl App {
             .filter_map(|&id| self.tasks.iter().find(|t| t.id == id))
             .collect();
 
+        if tasks.is_empty() {
+            return None;
+        }
+
         // All selected tasks must be plan commands; otherwise fall back.
         if tasks.iter().any(|t| t.command != "plan") {
             return None;
@@ -795,6 +802,9 @@ impl App {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for task in tasks {
+            let Some(plan) = self.ready_plan_for_task(task) else {
+                continue;
+            };
             if let Some((idx, module)) = self
                 .modules
                 .iter()
@@ -805,7 +815,7 @@ impl App {
                     targets.push(ConfirmTarget {
                         module_idx: idx,
                         module_name: module.display_name.clone(),
-                        plan_age: self.plan_cache.get(&module.path).map(|e| e.age_str()),
+                        plan_age: Some(plan.age_str()),
                         lock_id: None,
                         lock_who: None,
                     });
@@ -813,10 +823,19 @@ impl App {
             }
         }
 
-        if targets.is_empty() {
-            None
+        Some(targets)
+    }
+
+    pub fn ready_plan_for_task(&self, task: &Task) -> Option<&crate::plan_cache::PlanEntry> {
+        let plan = self.plan_cache.get(&task.module_path)?;
+        if task.command == "plan"
+            && task.status == TaskStatus::Success
+            && task.plan_output_path.as_ref() == Some(&plan.path)
+            && plan.task_id == task.id
+        {
+            Some(plan)
         } else {
-            Some(targets)
+            None
         }
     }
 
@@ -1658,7 +1677,7 @@ impl App {
                             let plan = if success && !is_cancelling {
                                 t.plan_output_path
                                     .as_ref()
-                                    .map(|p| (t.module_path.clone(), p.clone()))
+                                    .map(|p| (t.module_path.clone(), p.clone(), t.id))
                             } else {
                                 None
                             };
@@ -1682,8 +1701,8 @@ impl App {
                     }
 
                     // Register the plan file now that the mutable borrow is released.
-                    if let Some((mp, plan_path)) = plan_info {
-                        self.plan_cache.register(mp, plan_path);
+                    if let Some((mp, plan_path, plan_task_id)) = plan_info {
+                        self.plan_cache.register(mp, plan_path, plan_task_id);
                     }
 
                     if let Some(path) = cleanup_plan_path {
@@ -1779,5 +1798,83 @@ pub fn explorer_filtered_count(resources: &[crate::state::StateResource], filter
             .iter()
             .filter(|r| r.address.to_lowercase().contains(&fl))
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::module::{Module, ModuleKind};
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn test_app() -> App {
+        let root = PathBuf::from("/tmp/rug-test");
+        let modules = vec![Module {
+            path: root.join("app"),
+            display_name: "app".to_string(),
+            kind: ModuleKind::Root,
+        }];
+        let config = Config {
+            binary: "terraform".to_string(),
+            parallelism: 1,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+        };
+
+        App::new(config, root, modules).unwrap()
+    }
+
+    fn push_plan_task(app: &mut App, id: usize, plan_path: PathBuf) {
+        let module = &app.modules[0];
+        app.tasks.push(Task {
+            id,
+            module_path: module.path.clone(),
+            module_name: module.display_name.clone(),
+            command: "plan".to_string(),
+            args: vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()],
+            status: TaskStatus::Success,
+            output_lines: Vec::new(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+            plan_output_path: Some(plan_path),
+            cleanup_plan_path: None,
+            resource_counts: None,
+            cancel_handle: None,
+        });
+    }
+
+    #[test]
+    fn ready_plan_for_task_requires_current_cache_owner() {
+        let mut app = test_app();
+        let module_path = app.modules[0].path.clone();
+        let plan_path = app.plan_cache.plan_path_for(&module_path);
+
+        push_plan_task(&mut app, 1, plan_path.clone());
+        push_plan_task(&mut app, 2, plan_path.clone());
+        app.plan_cache
+            .register(module_path, plan_path, app.tasks[1].id);
+
+        assert!(app.ready_plan_for_task(&app.tasks[0]).is_none());
+        assert!(app.ready_plan_for_task(&app.tasks[1]).is_some());
+    }
+
+    #[test]
+    fn stale_plan_task_apply_does_not_fallback_to_module_selection() {
+        let mut app = test_app();
+        let module_path = app.modules[0].path.clone();
+        let plan_path = app.plan_cache.plan_path_for(&module_path);
+
+        push_plan_task(&mut app, 1, plan_path.clone());
+        push_plan_task(&mut app, 2, plan_path.clone());
+        app.plan_cache
+            .register(module_path, plan_path, app.tasks[1].id);
+
+        app.focus = Focus::Tasks;
+        app.selected_module = 0;
+        app.selected_task_id = Some(app.tasks[0].id);
+        app.request_apply_confirm();
+
+        assert!(app.pending_confirm.is_none());
     }
 }

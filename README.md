@@ -72,6 +72,7 @@ rug --dir infra/ list
 
 Use `/` to filter the module list by name, then `Space` to multi-select before running a command.
 Modules with a successful cached plan ready to apply are marked in the module pane, and the current ready plan task is marked in the task pane.
+When the Tasks pane is focused, applying from selected plan tasks only uses current ready plan tasks; stale plan task selections are ignored.
 Long module and task entries wrap to the current pane width, including after pane or terminal resize.
 
 ![Filter and select demo](docs/demo-filter.gif)

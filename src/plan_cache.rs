@@ -5,6 +5,7 @@ use tempfile::TempDir;
 
 pub struct PlanEntry {
     pub path: PathBuf,
+    pub task_id: usize,
     pub created_at: Instant,
 }
 
@@ -56,11 +57,12 @@ impl PlanCache {
         self.dir.path().join(format!("{sanitized}.tfplan"))
     }
 
-    pub fn register(&mut self, module_path: PathBuf, plan_path: PathBuf) {
+    pub fn register(&mut self, module_path: PathBuf, plan_path: PathBuf, task_id: usize) {
         self.entries.insert(
             module_path,
             PlanEntry {
                 path: plan_path,
+                task_id,
                 created_at: Instant::now(),
             },
         );
