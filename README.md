@@ -98,6 +98,7 @@ Long module and task entries wrap to the current pane width, including after pan
 | `/` | Filter modules by name |
 | `[` / `]` | Decrease / increase depth |
 | `r` | Refresh module list |
+| `R` | Reset session (clear plans, finished tasks, selection) |
 | `Tab` | Cycle focus between panes |
 | `h` / `?` | Toggle help |
 | `q` / `Ctrl-C` | Quit |

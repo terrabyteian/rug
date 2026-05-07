@@ -72,6 +72,10 @@ impl PlanCache {
         self.entries.get(module_path)
     }
 
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Remove a plan entry from the cache and return its file path.
     ///
     /// Does NOT delete the file; callers delete it once any apply using it exits.
@@ -81,5 +85,14 @@ impl PlanCache {
 
     pub fn remove_file(path: &Path) {
         std::fs::remove_file(path).ok();
+    }
+
+    /// Drop every cached plan and delete its file. Safe to call while plans
+    /// are being applied: the apply path takes ownership via `take()` before
+    /// spawning, so in-flight applies hold their own file handle.
+    pub fn clear(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            Self::remove_file(&entry.path);
+        }
     }
 }

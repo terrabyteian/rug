@@ -243,6 +243,8 @@ pub struct App {
     pub pending_cancel_task: Vec<usize>,
     /// Set when the user requested clearing completed task history.
     pub pending_clear_tasks: bool,
+    /// Set when the user pressed `R` to reset the session.
+    pub pending_reset: bool,
     /// Set when the user pressed `q` while tasks were still running.
     /// The TUI stays alive until all tasks finish (or user force-quits).
     pub pending_quit: bool,
@@ -297,6 +299,7 @@ impl App {
             pending_confirm: None,
             pending_cancel_task: Vec::new(),
             pending_clear_tasks: false,
+            pending_reset: false,
             pending_quit: false,
             output_fullscreen: false,
             output_wrap: false,
@@ -1088,6 +1091,63 @@ impl App {
         }
     }
 
+    /// Stage a session reset for confirmation.
+    pub fn request_reset_confirm(&mut self) {
+        self.pending_reset = true;
+    }
+
+    /// Counts of items the next `reset_session` call will clear.
+    /// Returns (cached plans, queued tasks, finished tasks).
+    pub fn reset_summary(&self) -> (usize, usize, usize) {
+        let queued = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .count();
+        let finished = self.tasks.iter().filter(|t| t.status.is_terminal()).count();
+        (self.plan_cache.entry_count(), queued, finished)
+    }
+
+    /// Reset session state to a fresh-launch feel, preserving only tasks that
+    /// are currently executing. Cancels queued tasks, drops terminal-task
+    /// history, clears the plan cache, resets navigation/selection, and
+    /// dismisses any open overlays.
+    pub fn reset_session(&mut self) {
+        let queued_ids: Vec<usize> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .map(|t| t.id)
+            .collect();
+        for id in queued_ids {
+            self.cancel_task(id);
+        }
+
+        self.tasks.retain(|t| !t.status.is_terminal());
+
+        self.plan_cache.clear();
+
+        self.multi_select.clear();
+        self.multi_select_anchor = None;
+        self.filter.clear();
+        self.filter_active = false;
+        self.max_depth = None;
+        self.selected_module = 0;
+
+        self.task_multi_select.clear();
+        self.selected_task_id = None;
+        self.output_scroll = 0;
+
+        self.pending_confirm = None;
+        self.pending_cancel_task.clear();
+        self.pending_clear_tasks = false;
+        self.pending_reset = false;
+        self.pending_quit = false;
+        self.show_help = false;
+
+        self.focus = Focus::Modules;
+    }
+
     /// Cancel a single task by ID.
     ///
     /// - Queued (not yet spawned): removed from the module queue immediately.
@@ -1763,10 +1823,6 @@ impl App {
             return format!("Output [{}: {}]", task.module_name, task.command);
         }
         "Output".to_string()
-    }
-
-    pub fn all_tasks_done(&self) -> bool {
-        self.tasks.iter().all(|t| t.status.is_terminal())
     }
 
     pub fn any_task_failed(&self) -> bool {

@@ -49,11 +49,6 @@ fn event_loop<B: ratatui::backend::Backend>(
         // Drain pending task events.
         app.drain_events();
 
-        // Auto-exit once all tasks finish after a graceful-quit request.
-        if app.pending_quit && app.all_tasks_done() {
-            break;
-        }
-
         terminal.draw(|f| draw(f, app))?;
 
         // Poll for input events with a short timeout so we keep draining task events.
@@ -65,6 +60,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                         || app.pending_confirm.is_some()
                         || !app.pending_cancel_task.is_empty()
                         || app.pending_clear_tasks
+                        || app.pending_reset
                         || app.filter_active
                     {
                         continue;
@@ -163,11 +159,17 @@ fn event_loop<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Key(key) => {
-                    // Allow Ctrl-C to quit from anywhere.
+                    // Ctrl-C: quit immediately if no tasks are running, otherwise
+                    // surface the same confirmation overlay as `q`. A second Ctrl-C
+                    // while the overlay is up forces the quit through.
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
-                        break;
+                        if app.pending_quit || app.active_tasks().is_empty() {
+                            break;
+                        }
+                        app.pending_quit = true;
+                        continue;
                     }
 
                     // Fullscreen output mode: Esc exits, scroll keys pass through, all else swallowed.
@@ -243,6 +245,19 @@ fn event_loop<B: ratatui::backend::Backend>(
                             }
                             _ => {
                                 app.pending_clear_tasks = false;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Reset-session confirmation intercepts all keys.
+                    if app.pending_reset {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                app.reset_session();
+                            }
+                            _ => {
+                                app.pending_reset = false;
                             }
                         }
                         continue;
@@ -438,6 +453,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Char('h') | KeyCode::Char('?') => app.show_help = !app.show_help,
                         KeyCode::Char('r') => app.refresh_modules(),
+                        KeyCode::Char('R') => app.request_reset_confirm(),
                         KeyCode::Tab => app.cycle_focus(),
 
                         // Clear filter.
@@ -662,6 +678,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
             );
         }
     }
+
+    if app.pending_reset {
+        let (plans, queued, finished) = app.reset_summary();
+        render_reset_confirm(f, area, plans, queued, finished);
+    }
 }
 
 fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
@@ -692,12 +713,13 @@ C          Cancel selected task
 /          Filter modules by name
 [ / ]      Decrease / increase depth
 r          Refresh module list
+R          Reset session (clear plans, finished tasks, selection)
 Tab        Cycle focus between panes
 h / ?      Toggle this help
 q / Ctrl-C Quit";
 
-    let width = 52u16;
-    let height = 25u16;
+    let width = 60u16;
+    let height = 26u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
     let popup = Rect::new(x, y, width.min(area.width), height.min(area.height));
@@ -1051,6 +1073,97 @@ fn render_clear_tasks_confirm(
     );
 }
 
+fn render_reset_confirm(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    plans: usize,
+    queued: usize,
+    finished: usize,
+) {
+    use ratatui::{
+        layout::{Alignment, Rect},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph},
+    };
+
+    let plan_noun = if plans == 1 { "plan" } else { "plans" };
+    let queued_noun = if queued == 1 { "task" } else { "tasks" };
+    let finished_noun = if finished == 1 { "task" } else { "tasks" };
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Reset session?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  • Drop {plans} cached {plan_noun}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("  • Cancel {queued} queued {queued_noun}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("  • Drop {finished} finished {finished_noun}"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  • Clear filter, selection, depth limit",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Running tasks continue.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "[y] Reset",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("[any] Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let content_w = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.len())
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
+        .max(40);
+    let height = (lines.len() + 2).min(area.height as usize) as u16;
+    let width = (content_w + 2).min(area.width as usize) as u16;
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Reset Session ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .alignment(Alignment::Left),
+        popup,
+    );
+}
+
 fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     use ratatui::{
         layout::{Alignment, Rect},
@@ -1060,6 +1173,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
     };
 
     let active = app.active_tasks();
+    let all_done = active.is_empty();
 
     // Dynamic width: fit the longest name + command.
     let name_width = active
@@ -1068,12 +1182,18 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
         .max()
         .unwrap_or(0);
     let cmd_width = active.iter().map(|t| t.command.len()).max().unwrap_or(0);
-    // 5 = "  X " icon prefix; 31 = footer "  [q] Force quit   [Esc] Cancel".
+    // 5 = "  X " icon prefix; 31 = footer width.
     let content_w = (5 + name_width + 1 + cmd_width).max(31);
+
+    let header = if all_done {
+        "  All tasks finished — quit?"
+    } else {
+        "  Tasks still running — quit?"
+    };
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            "  Waiting for tasks to finish…",
+            header,
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -1090,12 +1210,18 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
         ]));
     }
 
+    let (quit_label, quit_color) = if all_done {
+        ("[q] Quit", Color::Green)
+    } else {
+        ("[q] Force quit", Color::Red)
+    };
+
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "[q] Force quit",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            quit_label,
+            Style::default().fg(quit_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled(
@@ -1105,6 +1231,12 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+
+    let title = if all_done {
+        " Quit? ".to_string()
+    } else {
+        format!(" Quitting — {} task(s) remaining ", active.len())
+    };
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
@@ -1117,7 +1249,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(format!(" Quitting — {} task(s) remaining ", active.len()))
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow)),
             )
