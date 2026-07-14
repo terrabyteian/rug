@@ -13,7 +13,7 @@ Type "cd /Users/ian/projects/rug && ./target/release/rug --dir fixtures/"
 Enter
 Sleep 1.5s
 
-# Open filter bar
+# Open the filter bar
 Type "/"
 Sleep 300ms
 
@@ -21,23 +21,28 @@ Sleep 300ms
 Type "apps"
 Sleep 800ms
 
-# Select apps/api (already highlighted at top of filtered list)
-Space
-Sleep 200ms
+# Commit the filter: Enter exits input mode but keeps it applied (typing
+# Space/j next must NOT land in the filter text)
+Enter
+Sleep 500ms
 
-# Move to apps/web and select it
+# Select apps/api (highlighted at top of the filtered list)
+Space
+Sleep 300ms
+
+# Move to apps/web and select it too
 Type "j"
 Sleep 200ms
 Space
 Sleep 500ms
 
-# Clear filter — full list returns, two modules remain highlighted
+# Clear the applied filter — full list returns, both modules stay selected
 Escape
 Sleep 800ms
 
-# Plan the two selected modules
+# Cross into the Run screen and plan both selected modules
 Type "p"
-Sleep 3s
+Sleep 4s
 
-# Quit
+# Quit — both plans finish almost instantly, so a single q exits directly
 Type "q"

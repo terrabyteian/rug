@@ -13,9 +13,7 @@ Type "cd /Users/ian/projects/rug && ./target/release/rug --dir fixtures/"
 Enter
 Sleep 1.5s
 
-# Browse the module list
-Type "j"
-Sleep 150ms
+# Browse the module list on the Select screen
 Type "j"
 Sleep 150ms
 Type "j"
@@ -29,25 +27,24 @@ Sleep 300ms
 Type "G"
 Sleep 600ms
 
-# Skip slow-plan-2 (takes 40s) — land on slow-plan (10s) and select it
+# Skip slow-plan-2 (takes ~40s) — land on slow-plan (~10s streaming plan)
 Type "k"
 Sleep 200ms
 Type "k"
-Sleep 200ms
-Space
-Sleep 500ms
+Sleep 400ms
 
-# Plan the selected module
+# Enter opens the Run screen for the highlighted module
+Enter
+Sleep 700ms
+
+# Plan it — the status board and live output appear automatically
 Type "p"
-Sleep 800ms
+Sleep 13s
 
-# Cycle to Tasks pane
-Tab
-Sleep 800ms
+# Esc hops back to Select while the session keeps running, to show the
+# two-screen relationship
+Escape
+Sleep 1.2s
 
-# Cycle to Output pane — watch live streaming plan output
-Tab
-Sleep 12s
-
-# Quit gracefully
+# Quit — the plan has already finished, so a single q exits directly
 Type "q"

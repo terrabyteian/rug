@@ -81,8 +81,6 @@ and `Tab` from Select to jump back into the running session.
 Modules with a successful cached plan ready to apply are marked `P:{age}`; a later
 apply consumes that cached plan file automatically.
 
-<!-- TODO: re-record docs/demo-filter.gif for the two-screen flow -->
-
 ![Filter and select demo](docs/demo-filter.gif)
 
 **Select screen**
