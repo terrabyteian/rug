@@ -1,8 +1,20 @@
+pub mod keybar;
+pub mod layout;
 pub mod output;
-pub mod tasks;
+pub mod run;
+pub mod select;
 pub mod theme;
-pub mod tree;
-mod wrap;
+pub mod widgets;
+
+/// Outcome of a screen-level key handler that the event loop must act on.
+pub enum ScreenAction {
+    /// Nothing further for the loop to do.
+    None,
+    /// The user asked to quit (respect running tasks like the `q` binding).
+    Quit,
+    /// Enter fullscreen output (loop turns off mouse capture).
+    EnterFullscreen,
+}
 
 use anyhow::Result;
 use crossterm::{
@@ -18,8 +30,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::app::{
-    App, ConfirmKind, DragHandle, ExplorerOpKind, Focus, Modal, OpResult, PendingConfirm,
-    PendingOp,
+    App, ConfirmKind, ExplorerOpKind, Modal, OpResult, PendingConfirm, PendingOp, Screen,
 };
 
 /// Run the full TUI event loop until the user quits.
@@ -91,69 +102,73 @@ fn event_loop<B: ratatui::backend::Backend>(
                         continue;
                     }
 
-                    match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            if let Ok(size) = terminal.size() {
-                                let col = mouse.column;
-                                let row = mouse.row;
-                                let h_split = app.effective_h_split(size.width);
-                                let v_split = app.effective_v_split(size.height);
-                                // Hit-test the vertical divider (within 1 col).
-                                if col + 1 == h_split || col == h_split {
-                                    app.dragging = Some(DragHandle::Vertical);
-                                // Hit-test the horizontal divider (right panel, within 1 row).
-                                } else if col >= h_split && (row + 1 == v_split || row == v_split) {
-                                    app.dragging = Some(DragHandle::Horizontal);
-                                } else {
-                                    app.dragging = None;
-                                    if let Some(focus) = pane_for_click(col, row, size, app) {
-                                        app.focus = focus;
-                                    }
-                                }
+                    // Fullscreen output (Run session): wheel scrolls, nothing else.
+                    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.run_scroll_output(1);
                             }
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            if let Ok(size) = terminal.size() {
-                                match app.dragging {
-                                    Some(DragHandle::Vertical) => {
-                                        app.h_split_col = Some(
-                                            mouse.column.clamp(5, size.width.saturating_sub(10)),
-                                        );
-                                    }
-                                    Some(DragHandle::Horizontal) => {
-                                        app.v_split_row =
-                                            Some(mouse.row.clamp(4, size.height.saturating_sub(4)));
-                                    }
-                                    None => {}
-                                }
+                            MouseEventKind::ScrollDown => {
+                                app.run_scroll_output(-1);
                             }
+                            _ => {}
                         }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            app.dragging = None;
-                        }
-                        MouseEventKind::ScrollUp => match app.focus {
-                            Focus::Modules => {
+                        continue;
+                    }
+
+                    // Screen-specific: wheel moves the cursor / scrolls output;
+                    // a left click sets the cursor on the row it lands on.
+                    match app.screen {
+                        Screen::Select => match mouse.kind {
+                            MouseEventKind::ScrollUp => {
                                 app.move_module_selection(-1);
                             }
-                            Focus::Tasks => {
-                                app.move_task_selection(-1);
-                            }
-                            Focus::Output => {
-                                app.scroll_output(3);
-                            }
-                        },
-                        MouseEventKind::ScrollDown => match app.focus {
-                            Focus::Modules => {
+                            MouseEventKind::ScrollDown => {
                                 app.move_module_selection(1);
                             }
-                            Focus::Tasks => {
-                                app.move_task_selection(1);
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let top = app.viewport.list_top;
+                                let h = app.viewport.list;
+                                if mouse.row >= top && mouse.row < top.saturating_add(h) {
+                                    let pos = app.viewport.list_offset as usize
+                                        + (mouse.row - top) as usize;
+                                    app.set_module_cursor(pos);
+                                }
                             }
-                            Focus::Output => {
-                                app.scroll_output(-3);
-                            }
+                            _ => {}
                         },
-                        _ => {}
+                        Screen::Run => {
+                            let board_top = app.viewport.board_top;
+                            let board_h = app.viewport.board;
+                            let output_top = app.viewport.output_top;
+                            let in_board = mouse.row >= board_top
+                                && mouse.row < board_top.saturating_add(board_h);
+                            let in_output = mouse.row >= output_top;
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    if in_output {
+                                        app.run_scroll_output(3);
+                                    } else {
+                                        app.run_move_cursor(-1);
+                                    }
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    if in_output {
+                                        app.run_scroll_output(-3);
+                                    } else {
+                                        app.run_move_cursor(1);
+                                    }
+                                }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    if in_board {
+                                        let pos = app.viewport.board_offset as usize
+                                            + (mouse.row - board_top) as usize;
+                                        app.run_set_cursor(pos);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 Event::Key(key) => {
@@ -171,29 +186,55 @@ fn event_loop<B: ratatui::backend::Backend>(
                         continue;
                     }
 
-                    // Fullscreen output mode: Esc exits, scroll keys pass through, all else swallowed.
-                    if app.output_fullscreen {
+                    // Min-size guard: below 40×10 the UI can't render, so swallow
+                    // everything except quit (Ctrl-C handled above).
+                    if terminal
+                        .size()
+                        .map(|s| s.width < layout::MIN_W || s.height < layout::MIN_H)
+                        .unwrap_or(false)
+                    {
+                        if key.code == KeyCode::Char('q') {
+                            if app.active_tasks().is_empty() {
+                                break;
+                            }
+                            app.modal = Some(Modal::Quit);
+                        }
+                        continue;
+                    }
+
+                    // Fullscreen output mode (Run session): Esc exits, scroll keys
+                    // pass through, all else swallowed.
+                    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
                         match key.code {
                             KeyCode::Esc => {
-                                app.output_fullscreen = false;
+                                if let Some(s) = app.session.as_mut() {
+                                    s.fullscreen = false;
+                                }
                                 execute!(io::stdout(), EnableMouseCapture)?;
                             }
                             KeyCode::Char('j') | KeyCode::Down => {
-                                app.scroll_output(-1);
+                                app.run_scroll_output(-1);
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
-                                app.scroll_output(1);
+                                app.run_scroll_output(1);
                             }
                             KeyCode::PageDown => {
-                                app.scroll_output(-(app.pane_heights.output.max(1) as i32));
+                                app.run_scroll_output(-(app.viewport.output.max(1) as i32));
                             }
                             KeyCode::PageUp => {
-                                app.scroll_output(app.pane_heights.output.max(1) as i32);
+                                app.run_scroll_output(app.viewport.output.max(1) as i32);
                             }
-                            KeyCode::Char('g') => app.go_to_first(),
-                            KeyCode::Char('G') => app.go_to_last(),
+                            KeyCode::Char('g') => {
+                                let len = app.run_output_lines().len() as i32;
+                                app.run_scroll_output(len);
+                            }
+                            KeyCode::Char('G') => {
+                                app.run_scroll_output(-(app.run_output_lines().len() as i32));
+                            }
                             KeyCode::Char('w') => {
-                                app.output_wrap = !app.output_wrap;
+                                if let Some(s) = app.session.as_mut() {
+                                    s.output_wrap = !s.output_wrap;
+                                }
                             }
                             _ => {}
                         }
@@ -249,27 +290,6 @@ fn event_loop<B: ratatui::backend::Backend>(
                         } else {
                             // Help: any key closes.
                             app.modal = None;
-                        }
-                        continue;
-                    }
-
-                    // Filter input mode.
-                    if app.filter_active {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.filter_active = false;
-                                app.filter.clear();
-                            }
-                            KeyCode::Enter => {
-                                app.filter_active = false;
-                            }
-                            KeyCode::Backspace => {
-                                app.filter.pop();
-                            }
-                            KeyCode::Char(c) => {
-                                app.filter.push(c);
-                            }
-                            _ => {}
                         }
                         continue;
                     }
@@ -338,12 +358,12 @@ fn event_loop<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::PageDown => {
                                     app.resource_detail_scroll(
-                                        app.pane_heights.explorer.max(1) as i32
+                                        app.viewport.explorer.max(1) as i32
                                     );
                                 }
                                 KeyCode::PageUp => {
                                     app.resource_detail_scroll(
-                                        -(app.pane_heights.explorer.max(1) as i32),
+                                        -(app.viewport.explorer.max(1) as i32),
                                     );
                                 }
                                 KeyCode::Char('g') => {
@@ -385,11 +405,11 @@ fn event_loop<B: ratatui::backend::Backend>(
                                     app.state_explorer_move(-1);
                                 }
                                 KeyCode::PageDown => {
-                                    app.state_explorer_move(app.pane_heights.explorer.max(1) as i32);
+                                    app.state_explorer_move(app.viewport.explorer.max(1) as i32);
                                 }
                                 KeyCode::PageUp => {
                                     app.state_explorer_move(
-                                        -(app.pane_heights.explorer.max(1) as i32),
+                                        -(app.viewport.explorer.max(1) as i32),
                                     );
                                 }
                                 KeyCode::Char('g') => {
@@ -428,138 +448,21 @@ fn event_loop<B: ratatui::backend::Backend>(
                         continue;
                     }
 
-                    match key.code {
-                        KeyCode::Char('q') => {
+                    let action = match app.screen {
+                        Screen::Select => select::handle_key(app, key),
+                        Screen::Run => run::handle_key(app, key),
+                    };
+                    match action {
+                        ScreenAction::Quit => {
                             if app.active_tasks().is_empty() {
                                 break;
                             }
                             app.modal = Some(Modal::Quit);
                         }
-                        KeyCode::Char('h') | KeyCode::Char('?') => app.modal = Some(Modal::Help),
-                        KeyCode::Char('r') => app.refresh_modules(),
-                        KeyCode::Char('R') => app.request_reset_confirm(),
-                        KeyCode::Tab => app.cycle_focus(),
-
-                        // Clear filter.
-                        KeyCode::Esc => app.filter.clear(),
-
-                        // Vim first/last navigation.
-                        KeyCode::Char('g') => app.go_to_first(),
-                        KeyCode::Char('G') => app.go_to_last(),
-
-                        // Navigation.
-                        KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                            Focus::Modules => {
-                                app.move_module_selection(1);
-                            }
-                            Focus::Tasks => {
-                                app.move_task_selection(1);
-                            }
-                            Focus::Output => {
-                                app.scroll_output(-1);
-                            }
-                        },
-                        KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                            Focus::Modules => {
-                                app.move_module_selection(-1);
-                            }
-                            Focus::Tasks => {
-                                app.move_task_selection(-1);
-                            }
-                            Focus::Output => {
-                                app.scroll_output(1);
-                            }
-                        },
-                        KeyCode::PageDown => match app.focus {
-                            Focus::Modules => {
-                                app.move_module_selection(app.pane_heights.modules.max(1) as i32);
-                            }
-                            Focus::Tasks => {
-                                app.move_task_selection(app.pane_heights.tasks.max(1) as i32);
-                            }
-                            Focus::Output => {
-                                app.scroll_output(-(app.pane_heights.output.max(1) as i32));
-                            }
-                        },
-                        KeyCode::PageUp => match app.focus {
-                            Focus::Modules => {
-                                app.move_module_selection(
-                                    -(app.pane_heights.modules.max(1) as i32),
-                                );
-                            }
-                            Focus::Tasks => {
-                                app.move_task_selection(-(app.pane_heights.tasks.max(1) as i32));
-                            }
-                            Focus::Output => {
-                                app.scroll_output(app.pane_heights.output.max(1) as i32);
-                            }
-                        },
-
-                        // Module actions.
-                        KeyCode::Char(' ') => match app.focus {
-                            Focus::Modules => {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    app.range_select();
-                                } else {
-                                    app.toggle_multi_select();
-                                }
-                            }
-                            Focus::Tasks => {
-                                app.toggle_task_select();
-                            }
-                            Focus::Output => {}
-                        },
-                        KeyCode::Char('c') => match app.focus {
-                            Focus::Tasks => app.task_multi_select.clear(),
-                            _ => {
-                                app.multi_select.clear();
-                                app.max_depth = None;
-                            }
-                        },
-                        KeyCode::Enter => {
-                            if app.focus == Focus::Modules {
-                                app.open_state_explorer();
-                            } else if app.focus == Focus::Output || app.focus == Focus::Tasks {
-                                app.output_fullscreen = true;
-                                execute!(io::stdout(), DisableMouseCapture)?;
-                            }
+                        ScreenAction::EnterFullscreen => {
+                            execute!(io::stdout(), DisableMouseCapture)?;
                         }
-
-                        // Terraform commands.
-                        KeyCode::Char('i') => app.enqueue_command("init", vec![]),
-                        KeyCode::Char('u') => app.request_init_upgrade_confirm(),
-                        KeyCode::Char('p') => app.enqueue_plan(),
-                        // Destructive commands require confirmation.
-                        KeyCode::Char('a') => app.request_apply_confirm(),
-                        KeyCode::Char('d') => app.request_destroy_confirm(),
-                        KeyCode::Char('U') => app.request_force_unlock_confirm(),
-
-                        // Cancel the selected task (with confirmation).
-                        KeyCode::Char('C') => app.request_cancel_task_confirm(),
-
-                        // Clear completed task history (Tasks pane only).
-                        KeyCode::Char('x') => {
-                            if app.focus == Focus::Tasks {
-                                app.request_clear_tasks_confirm();
-                            }
-                        }
-
-                        // Depth limiter.
-                        KeyCode::Char('[') => app.decrease_depth(),
-                        KeyCode::Char(']') => app.increase_depth(),
-
-                        // Toggle output line wrap.
-                        KeyCode::Char('w') => {
-                            app.output_wrap = !app.output_wrap;
-                        }
-
-                        // Filter.
-                        KeyCode::Char('/') => {
-                            app.filter_active = true;
-                            app.filter.clear();
-                        }
-
-                        _ => {}
+                        ScreenAction::None => {}
                     }
                 } // end Event::Key
                 _ => {}
@@ -570,20 +473,25 @@ fn event_loop<B: ratatui::backend::Backend>(
 }
 
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
-    use ratatui::layout::{Constraint, Direction, Layout};
-
     let area = f.area();
 
-    if app.output_fullscreen {
-        app.pane_heights.output = area.height.saturating_sub(2);
-        output::render(f, area, app);
+    // Min-size guard runs before any other draw path (prevents panics in the
+    // legacy split math at degenerate sizes).
+    if layout::too_small(area) {
+        render_too_small(f, area);
+        return;
+    }
+
+    // Fullscreen output (Run session) takes over the full window.
+    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
+        run::render_fullscreen_output(f, area, app);
         return;
     }
 
     // State explorer (list or detail) takes over the full window.
     if app.state_explorer.is_some() {
         // Reserve: 2 border + 1 blank top + 1 blank before hint + 1 hint + 1 counter + 1 filter bar.
-        app.pane_heights.explorer = area.height.saturating_sub(7);
+        app.viewport.explorer = area.height.saturating_sub(7);
         let spinner =
             theme::SPINNER_FRAMES[(app.spinner_tick as usize / 2) % theme::SPINNER_FRAMES.len()];
         if let Some(explorer) = &app.state_explorer {
@@ -602,32 +510,14 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         return;
     }
 
-    // Outer split: left (modules) | right (output + tasks)
-    let left_width = app.effective_h_split(area.width);
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(left_width), Constraint::Min(0)])
-        .split(area);
-
-    // Right split: output (top) | tasks (bottom)
-    let top_height = app.effective_v_split(area.height);
-    let v_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(top_height), Constraint::Min(0)])
-        .split(h_chunks[1]);
-
-    // Save inner heights (minus borders) for page up/down.
-    app.pane_heights.modules = h_chunks[0].height.saturating_sub(2);
-    app.pane_heights.output = v_chunks[0].height.saturating_sub(2);
-    app.pane_heights.tasks = v_chunks[1].height.saturating_sub(2);
-
-    tree::render(f, h_chunks[0], app);
-    output::render(f, v_chunks[0], app);
-    tasks::render(f, v_chunks[1], app);
+    match app.screen {
+        Screen::Select => select::render(f, area, app),
+        Screen::Run => run::render(f, area, app),
+    }
 
     match &app.modal {
         Some(Modal::Quit) => render_quit_wait(f, area, app),
-        Some(Modal::Help) => render_help(f, area),
+        Some(Modal::Help) => render_help(f, area, app.screen),
         Some(Modal::Confirm(confirm)) => render_confirm(f, area, confirm),
         Some(Modal::CancelTasks(ids)) => {
             let tasks: Vec<(&str, &str)> = ids
@@ -656,56 +546,148 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         }
         None => {}
     }
-
-    if app.filter_active {
-        render_filter_bar(f, area, &app.filter);
-    }
 }
 
-fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+/// Render the minimum-size guard screen. No app state is mutated here.
+fn render_too_small(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::{
         layout::{Alignment, Rect},
+        text::{Line, Span},
+        widgets::{Clear, Paragraph},
+    };
+
+    let lines = vec![
+        Line::from(Span::styled("terminal too small", theme::title())),
+        Line::from(Span::styled(
+            format!(
+                "need ≥ {}×{} (now {}×{})",
+                layout::MIN_W,
+                layout::MIN_H,
+                area.width,
+                area.height
+            ),
+            theme::dim(),
+        )),
+        Line::from(Span::styled("resize, or q to quit", theme::dim())),
+    ];
+
+    let h = 3u16;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let r = Rect::new(area.x, y, area.width, h.min(area.height.max(1)));
+
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), r);
+}
+
+/// Key-hint entries for the Select screen help table.
+const SELECT_HELP: &[(&str, &str)] = &[
+    ("j/k ↑/↓", "move cursor"),
+    ("PgUp/PgDn", "page up / down"),
+    ("g / G", "first / last"),
+    ("Space", "toggle select"),
+    ("Ctrl+Space", "range select"),
+    ("* / c", "all / clear"),
+    ("/ Esc", "filter / clear"),
+    ("[ / ]", "depth − / +"),
+    ("Enter", "run selection"),
+    ("Tab", "resume session"),
+    ("i / u", "init / upgrade"),
+    ("p / a", "plan / apply"),
+    ("d / U", "destroy / unlock"),
+    ("s", "state explorer"),
+    ("r / R", "refresh / reset"),
+    ("? / q", "help / quit"),
+];
+
+/// Key-hint entries for the Run screen help table.
+const RUN_HELP: &[(&str, &str)] = &[
+    ("j/k ↑/↓", "move cursor"),
+    ("g / G", "first / last"),
+    ("PgUp/PgDn", "scroll output"),
+    ("Space", "toggle subset"),
+    ("Ctrl+Space", "range select"),
+    ("* / c", "all / clear subset"),
+    ("i / p", "init / plan"),
+    ("a / d", "apply / destroy"),
+    ("u / U", "upgrade / unlock"),
+    ("I/P/A/D", "same, this row"),
+    ("C / x", "cancel / clear tasks"),
+    ("Enter", "fullscreen output"),
+    ("w", "wrap output"),
+    ("s", "state explorer"),
+    ("Esc", "back (tasks run on)"),
+    ("? / q", "help / quit"),
+];
+
+fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect, screen: Screen) {
+    use ratatui::{
+        layout::Alignment,
+        style::{Modifier, Style},
+        text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
     };
 
-    let help_text = "\
-j/k ↑/↓   Navigate lists or scroll output
-PgUp/PgDn  Page up / page down
-g / G      Jump to first / last
-Space      Toggle multi-select (Modules or Tasks pane)
-Ctrl+Space Range-select modules
-c          Clear selection (current pane)
-x          Clear completed tasks (Tasks pane)
-Enter      State explorer (Modules) / Fullscreen (Output or Tasks)
-w          Toggle line wrap (output pane)
-Esc        Close overlay / clear filter
-i          Init selected modules
-u          Init -upgrade selected modules
-p          Plan selected modules
-a          Apply selected modules
-d          Destroy selected modules
-U          Force-unlock state (if locked)
-C          Cancel selected task
-/          Filter modules by name
-[ / ]      Decrease / increase depth
-r          Refresh module list
-R          Reset session (clear plans, finished tasks, selection)
-Tab        Cycle focus between panes
-h / ?      Toggle this help
-q / Ctrl-C Quit";
+    let (entries, title): (&[(&str, &str)], &str) = match screen {
+        Screen::Select => (SELECT_HELP, " Help — Select (any key to close) "),
+        Screen::Run => (RUN_HELP, " Help — Run (any key to close) "),
+    };
 
-    let width = 60u16;
-    let height = 26u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width.min(area.width), height.min(area.height));
+    let key_style = Style::default()
+        .fg(theme::ACCENT)
+        .add_modifier(Modifier::BOLD);
+    let chars = |s: &str| s.chars().count();
+
+    // Two columns at W1–W2 (≥80), single column at W3– (<80).
+    let two_col = area.width >= 80;
+
+    let (rows, content_w): (Vec<Line>, usize) = if two_col {
+        let mid = entries.len().div_ceil(2);
+        let (left, right) = entries.split_at(mid);
+        let lk = left.iter().map(|(k, _)| chars(k)).max().unwrap_or(0);
+        let ld = left.iter().map(|(_, d)| chars(d)).max().unwrap_or(0);
+        let rk = right.iter().map(|(k, _)| chars(k)).max().unwrap_or(0);
+        let rd = right.iter().map(|(_, d)| chars(d)).max().unwrap_or(0);
+
+        let mut lines = Vec::with_capacity(mid);
+        for (i, &(k, d)) in left.iter().enumerate() {
+            let mut spans = vec![
+                Span::styled(format!("{:<lk$}", k), key_style),
+                Span::styled(format!("  {:<ld$}", d), theme::dim()),
+            ];
+            if let Some(&(k2, d2)) = right.get(i) {
+                spans.push(Span::raw("   "));
+                spans.push(Span::styled(format!("{:<rk$}", k2), key_style));
+                spans.push(Span::styled(format!("  {d2}"), theme::dim()));
+            }
+            lines.push(Line::from(spans));
+        }
+        let w = lk + 2 + ld + 3 + rk + 2 + rd;
+        (lines, w)
+    } else {
+        let kw = entries.iter().map(|(k, _)| chars(k)).max().unwrap_or(0);
+        let dw = entries.iter().map(|(_, d)| chars(d)).max().unwrap_or(0);
+        let lines = entries
+            .iter()
+            .map(|&(k, d)| {
+                Line::from(vec![
+                    Span::styled(format!("{:<kw$}", k), key_style),
+                    Span::styled(format!("  {d}"), theme::dim()),
+                ])
+            })
+            .collect();
+        (lines, kw + 2 + dw)
+    };
+
+    let desired_h = (rows.len() + 2) as u16; // + top/bottom border
+    let desired_w = (content_w + 4) as u16; // + borders + 1-cell padding each side
+    let popup = layout::popup_rect(desired_w, desired_h, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
-        Paragraph::new(help_text)
+        Paragraph::new(rows)
             .block(
                 Block::default()
-                    .title(" Help (any key to close) ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(theme::overlay_border_warn()),
             )
@@ -714,51 +696,9 @@ q / Ctrl-C Quit";
     );
 }
 
-/// Map a mouse click position to the pane it landed in.
-fn pane_for_click(col: u16, row: u16, size: ratatui::layout::Size, app: &App) -> Option<Focus> {
-    if size.width == 0 || size.height == 0 {
-        return None;
-    }
-    let h_split = app.effective_h_split(size.width);
-    if col < h_split {
-        Some(Focus::Modules)
-    } else {
-        let v_split = app.effective_v_split(size.height);
-        if row < v_split {
-            Some(Focus::Output)
-        } else {
-            Some(Focus::Tasks)
-        }
-    }
-}
-
-fn render_filter_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, filter: &str) {
-    use ratatui::{
-        layout::Rect,
-        widgets::{Block, Borders, Clear, Paragraph},
-    };
-
-    let bar = Rect::new(
-        area.x,
-        area.y + area.height.saturating_sub(3),
-        area.width,
-        3,
-    );
-    f.render_widget(Clear, bar);
-    f.render_widget(
-        Paragraph::new(format!("/{filter}_")).block(
-            Block::default()
-                .title(" Filter ")
-                .borders(Borders::ALL)
-                .border_style(theme::overlay_border_filter()),
-        ),
-        bar,
-    );
-}
-
 fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: &PendingConfirm) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -880,9 +820,7 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -904,7 +842,7 @@ fn render_cancel_task_confirm(
     tasks: &[(&str, &str)],
 ) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -953,9 +891,7 @@ fn render_cancel_task_confirm(
 
     let height = (lines.len() + 2) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -978,7 +914,7 @@ fn render_clear_tasks_confirm(
     active: usize,
 ) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1027,9 +963,7 @@ fn render_clear_tasks_confirm(
         .max(28);
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1053,7 +987,7 @@ fn render_reset_confirm(
     finished: usize,
 ) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1115,9 +1049,7 @@ fn render_reset_confirm(
         .max(40);
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1135,7 +1067,7 @@ fn render_reset_confirm(
 
 fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &App) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1209,9 +1141,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1601,9 +1531,9 @@ fn style_json_line(line: &str) -> ratatui::text::Line<'static> {
     if trimmed.starts_with('"') {
         if let Some(key_end) = json_string_end(trimmed, 0) {
             let after_key = trimmed[key_end..].trim_start();
-            if after_key.starts_with(':') {
+            if let Some(rest) = after_key.strip_prefix(':') {
                 let key = trimmed[..key_end].to_string();
-                let value_raw = after_key[1..].trim_start();
+                let value_raw = rest.trim_start();
                 let value_body = value_raw.trim_end_matches(',');
                 let value_comma = if value_raw.ends_with(',') { "," } else { "" };
                 return Line::from(vec![
@@ -1667,7 +1597,7 @@ fn json_string_end(s: &str, start: usize) -> Option<usize> {
 
 fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1689,9 +1619,7 @@ fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect
 
     let height = (lines.len() + 2) as u16;
     let width = 46u16.min(area.width);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1714,7 +1642,7 @@ fn render_op_confirm(
     targets: &[String],
 ) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1768,9 +1696,7 @@ fn render_op_confirm(
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1788,7 +1714,7 @@ fn render_op_confirm(
 
 fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &PendingOp) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1839,9 +1765,7 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1859,7 +1783,7 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
 
 fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result: &OpResult) {
     use ratatui::{
-        layout::{Alignment, Rect},
+        layout::Alignment,
         style::{Color, Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
@@ -1902,9 +1826,7 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
+    let popup = layout::popup_rect(width, height, area);
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -1947,4 +1869,192 @@ fn highlight_filter_match(text: String, filter_lower: &str) -> ratatui::text::Li
         }
     }
     Line::from(Span::raw(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{RunSession, SessionModule};
+    use crate::config::Config;
+    use crate::module::{Module, ModuleKind};
+    use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
+
+    /// Sizes spanning every width/height tier plus the two responsiveness-pass
+    /// checkpoints (45×12, 40×10) and the mockup targets (120×35, 80×24).
+    const SIZES: &[(u16, u16)] = &[(120, 35), (80, 24), (60, 18), (45, 12), (40, 10)];
+
+    fn demo_app(n: usize) -> App {
+        let root = PathBuf::from("/tmp/rug-ui-test");
+        let modules: Vec<Module> = (0..n)
+            .map(|i| Module {
+                path: root.join(format!("mod{i}")),
+                display_name: format!("infra/network/mod{i}"),
+                kind: ModuleKind::Root,
+            })
+            .collect();
+        let config = Config {
+            binary: "terraform".to_string(),
+            parallelism: 2,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+        };
+        App::new(config, root, modules).unwrap()
+    }
+
+    fn make_session(app: &mut App) {
+        let mods: Vec<SessionModule> = app
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(i, m)| SessionModule {
+                module_idx: i,
+                path: m.path.clone(),
+                name: m.display_name.clone(),
+            })
+            .collect();
+        app.session = Some(RunSession::new(mods));
+        app.screen = Screen::Run;
+    }
+
+    fn draw_at(app: &mut App, w: u16, h: u16) {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+    }
+
+    /// Render and flatten the back buffer to a per-row string for substring
+    /// assertions (mockup-fidelity checks).
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buffer = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn select_mockup_fidelity() {
+        let mut app = demo_app(6);
+        for &(w, h) in &[(120u16, 30u16), (80, 24)] {
+            let s = render_to_string(&mut app, w, h);
+            // Header content: app title + binary/module count line.
+            assert!(s.contains("rug"), "select header missing title at {w}×{h}");
+            assert!(
+                s.contains("terraform · 6 modules"),
+                "select header missing binary/count at {w}×{h}"
+            );
+            // A module row is present.
+            assert!(
+                s.contains("infra/network/mod0"),
+                "select missing module row at {w}×{h}"
+            );
+            // Keybar present.
+            assert!(
+                s.contains("j/k") && s.contains("move"),
+                "select keybar missing at {w}×{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_mockup_fidelity() {
+        let mut app = demo_app(6);
+        make_session(&mut app);
+        for &(w, h) in &[(120u16, 30u16), (80, 24)] {
+            let s = render_to_string(&mut app, w, h);
+            // Header content.
+            assert!(
+                s.contains("Run") && s.contains("6 modules"),
+                "run header missing at {w}×{h}"
+            );
+            // Column header (STATUS shows at every width tier ≥ W4).
+            assert!(s.contains("STATUS"), "run col header missing at {w}×{h}");
+            // Board row shape: cursor bar + name + idle status glyph.
+            assert!(
+                s.contains(theme::CURSOR_BAR),
+                "run cursor bar missing at {w}×{h}"
+            );
+            assert!(
+                s.contains("infra/network/mod0"),
+                "run board row missing at {w}×{h}"
+            );
+            // Keybar present.
+            assert!(s.contains("plan"), "run keybar missing at {w}×{h}");
+        }
+    }
+
+    #[test]
+    fn help_is_screen_aware() {
+        // Select help mentions Select-only keys (filter/depth); Run help
+        // mentions Run-only keys (subset/back) and not depth.
+        let mut app = demo_app(3);
+        app.modal = Some(Modal::Help);
+        let select_help = render_to_string(&mut app, 120, 30);
+        assert!(
+            select_help.contains("filter"),
+            "select help should list filter"
+        );
+
+        let mut app = demo_app(3);
+        make_session(&mut app);
+        app.modal = Some(Modal::Help);
+        let run_help = render_to_string(&mut app, 120, 30);
+        assert!(
+            run_help.contains("back"),
+            "run help should list esc back"
+        );
+    }
+
+    #[test]
+    fn select_renders_at_all_sizes() {
+        let mut app = demo_app(6);
+        for &(w, h) in SIZES {
+            draw_at(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn run_board_and_output_render_at_all_sizes() {
+        let mut app = demo_app(6);
+        make_session(&mut app);
+        for &(w, h) in SIZES {
+            draw_at(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn run_fullscreen_renders_at_all_sizes() {
+        let mut app = demo_app(4);
+        make_session(&mut app);
+        if let Some(s) = app.session.as_mut() {
+            s.fullscreen = true;
+        }
+        for &(w, h) in SIZES {
+            draw_at(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn help_modal_renders_one_and_two_column() {
+        let mut app = demo_app(3);
+        app.modal = Some(Modal::Help);
+        // 120/80 → two-column; 60/45/40 → single-column. None may panic.
+        for &(w, h) in SIZES {
+            draw_at(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn too_small_guard_never_panics() {
+        let mut app = demo_app(3);
+        for &(w, h) in &[(38u16, 9u16), (20, 8), (2, 2), (1, 1)] {
+            draw_at(&mut app, w, h);
+        }
+    }
 }

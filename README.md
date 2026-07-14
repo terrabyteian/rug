@@ -70,38 +70,70 @@ rug --dir infra/ list
 
 ## TUI key bindings
 
-Use `/` to filter the module list by name, then `Space` to multi-select before running a command.
-Modules with a successful cached plan ready to apply are marked in the module pane, and the current ready plan task is marked in the task pane.
-When the Tasks pane is focused, applying from selected plan tasks only uses current ready plan tasks; stale plan task selections are ignored.
-Long module and task entries wrap to the current pane width, including after pane or terminal resize.
+The TUI has two screens. The **Select** screen is a full-window module picker: use
+`/` to filter by name and `Space` to multi-select. Press `Enter` (or any action key)
+to move to the **Run** screen — a status board of the modules you brought over, with a
+live output pane for the highlighted module. Actions on the Run screen apply to the
+whole session (or a board subset you mark with `Space`); the `Shift` variant targets
+just the highlighted row. Press `Esc` to return to Select while tasks keep running,
+and `Tab` from Select to jump back into the running session.
+
+Modules with a successful cached plan ready to apply are marked `P:{age}`; a later
+apply consumes that cached plan file automatically.
+
+<!-- TODO: re-record docs/demo-filter.gif for the two-screen flow -->
 
 ![Filter and select demo](docs/demo-filter.gif)
 
+**Select screen**
+
 | Key | Action |
 |---|---|
-| `j` / `k` / `↑` / `↓` | Navigate lists or scroll output |
-| `PgUp` / `PgDn` | Page up / page down |
+| `j` / `k` / `↑` / `↓` | Move cursor |
+| `PgUp` / `PgDn` | Page up / down |
 | `g` / `G` | Jump to first / last |
-| `Space` | Toggle multi-select (Modules or Tasks pane) |
-| `Ctrl+Space` | Range-select modules |
-| `c` | Clear selection (current pane) |
-| `x` | Clear completed tasks (Tasks pane) |
-| `Enter` | State explorer (Modules pane) / Fullscreen (Output pane) |
-| `Esc` | Close overlay / clear filter |
-| `i` | Init selected modules |
-| `u` | Init -upgrade selected modules |
-| `p` | Plan selected modules |
-| `a` | Apply selected modules |
-| `d` | Destroy selected modules |
-| `U` | Force-unlock state (if locked) |
-| `C` | Cancel selected task |
-| `/` | Filter modules by name |
+| `Space` | Toggle multi-select |
+| `Ctrl+Space` | Range-select |
+| `*` / `c` | Select all visible / clear selection |
+| `/` | Filter modules by name (`Enter` keep, `Esc` clear) |
+| `Esc` | Clear the applied filter |
 | `[` / `]` | Decrease / increase depth |
-| `r` | Refresh module list |
-| `R` | Reset session (clear plans, finished tasks, selection) |
-| `Tab` | Cycle focus between panes |
-| `h` / `?` | Toggle help |
+| `Enter` | Run the current selection |
+| `Tab` | Resume the existing run session |
+| `i` / `u` | Init / init `-upgrade` |
+| `p` / `a` | Plan / apply |
+| `d` / `U` | Destroy / force-unlock |
+| `s` | State explorer for the highlighted module |
+| `r` / `R` | Refresh modules / reset session |
+| `?` | Help |
 | `q` / `Ctrl-C` | Quit |
+
+**Run screen**
+
+| Key | Action |
+|---|---|
+| `j` / `k` / `↑` / `↓` | Move board cursor |
+| `g` / `G` | Jump to first / last |
+| `PgUp` / `PgDn` | Scroll output pane |
+| `Space` | Toggle row in the board subset |
+| `Ctrl+Space` | Range-select rows |
+| `*` / `c` | Select all rows / clear subset |
+| `i` / `p` / `a` / `d` | Init / plan / apply / destroy (subset, or all if none marked) |
+| `I` / `P` / `A` / `D` | Same, highlighted row only |
+| `u` / `U` | Init `-upgrade` / force-unlock |
+| `C` | Cancel active tasks in scope |
+| `x` | Clear completed task history |
+| `Enter` | Fullscreen output |
+| `w` | Toggle output wrap |
+| `s` | State explorer for the highlighted module |
+| `Esc` | Back to Select (tasks keep running) |
+| `?` | Help |
+| `q` / `Ctrl-C` | Quit |
+
+Apply and destroy prompt for confirmation. `apply` consumes a cached plan (`P:{age}`)
+per module when one is available. The state explorer opens with `s` on either screen —
+`Enter` no longer opens it. Pane dragging has been removed. The minimum usable terminal
+size is 40×10; below that the TUI shows a resize prompt.
 
 ## Configuration
 

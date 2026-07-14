@@ -9,11 +9,12 @@ use crate::task::{CancelHandle, TaskEvent, TaskEventSender};
 /// Spawn a task in a background tokio task, emitting events to `tx`.
 ///
 /// Returns a `CancelHandle` with two escalation levels:
-///   1. `cancel()`     → sends SIGINT (same as Ctrl+C); waits indefinitely for
-///                        the process to exit gracefully so tofu can release
-///                        locks and print its interrupt message.
-///   2. `force_kill()` → sends SIGKILL immediately if the process is still
-///                        running after a graceful-cancel request.
+/// 1. `cancel()` → sends SIGINT (same as Ctrl+C); waits indefinitely for the
+///    process to exit gracefully so tofu can release locks and print its
+///    interrupt message.
+/// 2. `force_kill()` → sends SIGKILL immediately if the process is still
+///    running after a graceful-cancel request.
+#[allow(clippy::too_many_arguments)] // subprocess spawn params; a struct would just move the noise
 pub fn spawn_task(
     task_id: usize,
     module_path: std::path::PathBuf,

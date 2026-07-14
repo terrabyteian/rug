@@ -69,7 +69,7 @@ pub fn parse_lock_from_output(lines: &[String]) -> Option<LockInfo> {
 fn strip_border(s: &str) -> String {
     let no_ansi = strip_ansi(s);
     no_ansi
-        .trim_start_matches(|c: char| matches!(c, '\u{2502}' | '\u{2577}' | '\u{2575}' | ' '))
+        .trim_start_matches(['\u{2502}', '\u{2577}', '\u{2575}', ' '])
         .to_string()
 }
 

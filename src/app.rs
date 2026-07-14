@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::discovery;
@@ -7,23 +8,60 @@ use crate::engine::{EngineUpdate, TaskEngine, TaskSpec};
 use crate::lock::{parse_lock_from_output, read_lock_info};
 use crate::module::Module;
 use crate::state::StateContent;
-use crate::task::{Task, TaskStatus};
+use crate::task::{ResourceCounts, Task, TaskStatus};
 
-/// Which pane currently has keyboard focus.
+/// The two top-level screens: the module picker and the run board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Modules,
-    Tasks,
-    Output,
+pub enum Screen {
+    Select,
+    Run,
 }
 
-/// Which resize divider is being dragged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DragHandle {
-    /// Vertical border between the modules pane and the right panel.
-    Vertical,
-    /// Horizontal border between the output pane and the tasks pane.
-    Horizontal,
+/// One module brought into a Run session. `path` is the source of truth;
+/// `module_idx` is a cache into `app.modules`, re-resolved after a refresh.
+#[derive(Debug, Clone)]
+pub struct SessionModule {
+    pub module_idx: usize,
+    pub path: PathBuf,
+    pub name: String,
+}
+
+/// The set of modules the user is running actions against on the Run screen,
+/// plus that screen's board/output view state.
+pub struct RunSession {
+    /// Display order = selection order at creation.
+    pub modules: Vec<SessionModule>,
+    /// Cursor index into `modules` (never into `app.modules`).
+    pub cursor: usize,
+    /// Board multi-select: indices into `modules`.
+    pub selected: Vec<usize>,
+    /// Anchor position for range-select on the board.
+    pub select_anchor: Option<usize>,
+    /// Latest task id started by this session, per module path.
+    pub latest_task: HashMap<PathBuf, usize>,
+    /// Output pane fills the whole window (mouse capture off).
+    pub fullscreen: bool,
+    /// Lines scrolled up from the tail; 0 = tail-follow.
+    pub output_scroll: u16,
+    /// Soft-wrap long output lines.
+    pub output_wrap: bool,
+    pub created_at: Instant,
+}
+
+impl RunSession {
+    pub fn new(modules: Vec<SessionModule>) -> Self {
+        Self {
+            modules,
+            cursor: 0,
+            selected: Vec::new(),
+            select_anchor: None,
+            latest_task: HashMap::new(),
+            fullscreen: false,
+            output_scroll: 0,
+            output_wrap: false,
+            created_at: Instant::now(),
+        }
+    }
 }
 
 /// Per-module info shown in a confirmation overlay.
@@ -168,14 +206,28 @@ pub struct OpResult {
     pub entries: Vec<(String, bool)>,
 }
 
-/// Heights of each scrollable pane, updated every draw pass.
-/// Used to compute page-up/page-down scroll amounts.
+/// Heights of each scrollable region, updated every draw pass.
+/// Used to compute page-up/page-down scroll amounts and mouse hit-testing.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PaneHeights {
-    pub modules: u16,
+pub struct ViewportHeights {
+    /// Select list height (for page navigation).
+    pub list: u16,
+    /// Run output pane height (for page navigation).
     pub output: u16,
-    pub tasks: u16,
+    /// State explorer viewport height (for page navigation).
     pub explorer: u16,
+    /// Run board list height (for page navigation).
+    pub board: u16,
+    /// Select list area top row (mouse hit-testing).
+    pub list_top: u16,
+    /// Select list scroll offset from the last render (mouse hit-testing).
+    pub list_offset: u16,
+    /// Run board list area top row (mouse hit-testing).
+    pub board_top: u16,
+    /// Run board list scroll offset from the last render (mouse hit-testing).
+    pub board_offset: u16,
+    /// Run output area top row; `u16::MAX` when no output pane is shown (H4).
+    pub output_top: u16,
 }
 
 /// State shown in the state-explorer for a single module.
@@ -274,21 +326,15 @@ pub struct App {
     pub config: Config,
     /// Root directory used for module discovery (re-used on refresh).
     pub root: PathBuf,
+    /// Which top-level screen is showing.
+    pub screen: Screen,
     pub modules: Vec<Module>,
     pub selected_module: usize,
-    /// ID of the currently highlighted task (`task.id`), stable across re-sorts.
-    pub selected_task_id: Option<usize>,
-    /// How many lines the output pane is scrolled up from the bottom.
-    /// 0 = auto-follow the tail. Resets when switching tasks.
-    pub output_scroll: u16,
-    pub focus: Focus,
     /// Modules currently multi-selected (indices into `modules`).
     pub multi_select: Vec<usize>,
     /// Visible-list position of the last Space press; used as the anchor for
     /// Ctrl+Space range selection.
     pub multi_select_anchor: Option<usize>,
-    /// Tasks currently multi-selected (task IDs).
-    pub task_multi_select: Vec<usize>,
     /// Spinner frame counter, incremented each drain_events call (~10 Hz).
     /// Used by the UI to animate the Cancelling status indicator.
     pub spinner_tick: u8,
@@ -299,22 +345,15 @@ pub struct App {
     pub max_depth: Option<usize>,
     /// The single active overlay modal, if any. Mutually exclusive by construction.
     pub modal: Option<Modal>,
-    /// When true the output pane fills the whole terminal (mouse capture off).
-    pub output_fullscreen: bool,
-    /// When true, long lines in the output pane are soft-wrapped (fullscreen only).
-    pub output_wrap: bool,
-    /// Width of the modules (left) pane in columns. None → default 25%.
-    pub h_split_col: Option<u16>,
-    /// Height of the output (top-right) pane in rows. None → default 65%.
-    pub v_split_row: Option<u16>,
-    /// Which resize divider is currently being dragged, if any.
-    pub dragging: Option<DragHandle>,
-    /// Heights of scrollable panes from the last render pass (for page up/down).
-    pub pane_heights: PaneHeights,
+    /// Heights/positions of scrollable regions from the last render pass
+    /// (page up/down amounts and mouse hit-testing).
+    pub viewport: ViewportHeights,
     /// Task execution engine: task list, plan cache, run/queue bookkeeping.
     pub engine: TaskEngine,
     /// State explorer popup, open when `Some`.
     pub state_explorer: Option<StateExplorer>,
+    /// Active Run session. Invariant: `screen == Run` ⇒ `session.is_some()`.
+    pub session: Option<RunSession>,
 }
 
 impl App {
@@ -324,44 +363,21 @@ impl App {
         Ok(Self {
             config,
             root,
+            screen: Screen::Select,
             modules,
             selected_module: 0,
-            selected_task_id: None,
-            output_scroll: 0,
-            focus: Focus::Modules,
             multi_select: Vec::new(),
             multi_select_anchor: None,
-            task_multi_select: Vec::new(),
             spinner_tick: 0,
             filter: String::new(),
             filter_active: false,
             max_depth: None,
             modal: None,
-            output_fullscreen: false,
-            output_wrap: false,
-            h_split_col: None,
-            v_split_row: None,
-            dragging: None,
-            pane_heights: PaneHeights::default(),
+            viewport: ViewportHeights::default(),
             engine,
             state_explorer: None,
+            session: None,
         })
-    }
-
-    // ── Layout splits ────────────────────────────────────────────────────────
-
-    /// Width of the left (modules) pane, clamped to stay usable.
-    pub fn effective_h_split(&self, total_width: u16) -> u16 {
-        self.h_split_col
-            .unwrap_or(total_width / 4)
-            .clamp(5, total_width.saturating_sub(10))
-    }
-
-    /// Height of the top-right (output) pane, clamped to stay usable.
-    pub fn effective_v_split(&self, total_height: u16) -> u16 {
-        self.v_split_row
-            .unwrap_or(total_height * 65 / 100)
-            .clamp(4, total_height.saturating_sub(4))
     }
 
     // ── Module navigation ────────────────────────────────────────────────────
@@ -374,7 +390,7 @@ impl App {
             .enumerate()
             .filter(|(_, m)| {
                 (filter.is_empty() || m.display_name.to_lowercase().contains(&filter))
-                    && self.max_depth.map_or(true, |d| module_depth(m) <= d)
+                    && self.max_depth.is_none_or(|d| module_depth(m) <= d)
             })
             .map(|(i, _)| i)
             .collect()
@@ -401,6 +417,14 @@ impl App {
         // already unlimited — nothing to do
     }
 
+    /// Set the module cursor to an absolute position in the visible list
+    /// (mouse click). No-op if out of range.
+    pub fn set_module_cursor(&mut self, pos: usize) {
+        if pos < self.visible_module_indices().len() {
+            self.selected_module = pos;
+        }
+    }
+
     /// Returns true if the selection actually moved.
     pub fn move_module_selection(&mut self, delta: i32) -> bool {
         let count = self.visible_module_indices().len();
@@ -411,69 +435,6 @@ impl App {
         let changed = new != self.selected_module;
         self.selected_module = new;
         changed
-    }
-
-    /// Returns true if the selection actually moved.
-    pub fn move_task_selection(&mut self, delta: i32) -> bool {
-        if self.engine.tasks.is_empty() {
-            return false;
-        }
-        let sorted = self.sorted_task_display();
-        let current_pos = self
-            .selected_task_id
-            .and_then(|id| sorted.iter().position(|&vi| self.engine.tasks[vi].id == id))
-            .unwrap_or(0) as i32;
-        let new_pos = (current_pos + delta).clamp(0, sorted.len() as i32 - 1) as usize;
-        if let Some(id) = sorted.get(new_pos).map(|&vi| self.engine.tasks[vi].id) {
-            if Some(id) != self.selected_task_id {
-                self.set_selected_task(id);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn set_selected_task(&mut self, id: usize) {
-        self.selected_task_id = Some(id);
-        self.output_scroll = 0;
-    }
-
-    /// Scroll the output pane. Positive = scroll up (see earlier lines).
-    /// Clamped to 0 at the bottom and to the total line count at the top.
-    /// Returns true if the scroll position actually changed.
-    pub fn scroll_output(&mut self, delta: i32) -> bool {
-        let max_scroll = self.current_output().len() as u16;
-        let before = self.output_scroll;
-        if delta < 0 {
-            self.output_scroll = self.output_scroll.saturating_sub((-delta) as u16);
-        } else {
-            self.output_scroll = self
-                .output_scroll
-                .saturating_add(delta as u16)
-                .min(max_scroll);
-        }
-        self.output_scroll != before
-    }
-
-    /// Returns indices into `self.engine.tasks` in display order: most recently active first.
-    ///
-    /// Sort key per task (descending):
-    ///   finished_at > started_at > task.id (newest enqueued first for pending)
-    pub fn sorted_task_display(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..self.engine.tasks.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let ta = &self.engine.tasks[a];
-            let tb = &self.engine.tasks[b];
-            let time_a = ta.finished_at.or(ta.started_at);
-            let time_b = tb.finished_at.or(tb.started_at);
-            match (time_b, time_a) {
-                (Some(t2), Some(t1)) => t2.cmp(&t1), // newer finished/started first
-                (Some(_), None) => std::cmp::Ordering::Less, // timed before untimed
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => tb.id.cmp(&ta.id), // newer pending first
-            }
-        });
-        indices
     }
 
     pub fn toggle_multi_select(&mut self) {
@@ -487,18 +448,6 @@ impl App {
             self.multi_select.push(real_idx);
         }
         self.multi_select_anchor = Some(self.selected_module);
-    }
-
-    /// Toggle the currently highlighted task in/out of `task_multi_select`.
-    pub fn toggle_task_select(&mut self) {
-        let Some(task_id) = self.selected_task_id else {
-            return;
-        };
-        if let Some(pos) = self.task_multi_select.iter().position(|&id| id == task_id) {
-            self.task_multi_select.remove(pos);
-        } else {
-            self.task_multi_select.push(task_id);
-        }
     }
 
     /// Add all visible modules between the last Space anchor and the cursor to
@@ -521,53 +470,6 @@ impl App {
         self.multi_select_anchor = Some(current);
     }
 
-    pub fn go_to_first(&mut self) {
-        match self.focus {
-            Focus::Modules => {
-                self.selected_module = 0;
-            }
-            Focus::Tasks => {
-                let sorted = self.sorted_task_display();
-                if let Some(&vi) = sorted.first() {
-                    let id = self.engine.tasks[vi].id;
-                    self.set_selected_task(id);
-                }
-            }
-            Focus::Output => {
-                self.output_scroll = self.current_output().len() as u16;
-            }
-        }
-    }
-
-    pub fn go_to_last(&mut self) {
-        match self.focus {
-            Focus::Modules => {
-                let count = self.visible_module_indices().len();
-                if count > 0 {
-                    self.selected_module = count - 1;
-                }
-            }
-            Focus::Tasks => {
-                let sorted = self.sorted_task_display();
-                if let Some(&vi) = sorted.last() {
-                    let id = self.engine.tasks[vi].id;
-                    self.set_selected_task(id);
-                }
-            }
-            Focus::Output => {
-                self.output_scroll = 0; // tail-follow
-            }
-        }
-    }
-
-    pub fn cycle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Modules => Focus::Tasks,
-            Focus::Tasks => Focus::Output,
-            Focus::Output => Focus::Modules,
-        };
-    }
-
     /// Re-run module discovery against the original root directory and update
     /// the module list. Selection is clamped; multi-select is cleared since
     /// indices may have shifted.
@@ -583,6 +485,376 @@ impl App {
         } else if self.selected_module >= visible_count {
             self.selected_module = visible_count - 1;
         }
+
+        self.remap_session();
+    }
+
+    /// `*` key: select every visible module, or clear them all if they are
+    /// already all selected. Only touches visible modules; hidden selections
+    /// (under a filter) are preserved when selecting all.
+    pub fn toggle_select_all_visible(&mut self) {
+        let visible = self.visible_module_indices();
+        if visible.is_empty() {
+            return;
+        }
+        let all_selected = visible.iter().all(|i| self.multi_select.contains(i));
+        if all_selected {
+            self.multi_select.retain(|i| !visible.contains(i));
+        } else {
+            for i in visible {
+                if !self.multi_select.contains(&i) {
+                    self.multi_select.push(i);
+                }
+            }
+        }
+    }
+
+    /// Spinner frame index + command for the newest non-terminal task on
+    /// `path`, if any. Used to draw a running indicator next to a module.
+    pub fn module_activity(&self, path: &Path) -> Option<(usize, String)> {
+        let task = self
+            .engine
+            .tasks
+            .iter()
+            .filter(|t| t.module_path == *path && !t.status.is_terminal())
+            .max_by_key(|t| t.id)?;
+        let frame =
+            (self.spinner_tick as usize / 2) % crate::ui::theme::SPINNER_FRAMES.len();
+        Some((frame, task.command.clone()))
+    }
+
+    /// Resource counts from the plan currently cached for `path` (looked up via
+    /// the cache entry's owning task), if that task recorded a summary.
+    pub fn ready_plan_counts(&self, path: &Path) -> Option<&ResourceCounts> {
+        let entry = self.engine.plan_cache.get(path)?;
+        let task = self.engine.task(entry.task_id)?;
+        task.resource_counts.as_ref()
+    }
+
+    // ── Run session ──────────────────────────────────────────────────────────
+
+    /// Enter the Run screen for the current Select targets. Resumes an existing
+    /// session if the target set matches it exactly; otherwise starts a fresh
+    /// session (old tasks keep running in the engine). No-op if no targets.
+    pub fn enter_run(&mut self) {
+        let mut targets = self.target_indices();
+        if targets.is_empty() {
+            return;
+        }
+        targets.sort_unstable();
+        targets.dedup();
+
+        let target_paths: HashSet<PathBuf> = targets
+            .iter()
+            .map(|&i| self.modules[i].path.clone())
+            .collect();
+
+        let same = self
+            .session
+            .as_ref()
+            .map(|s| {
+                let session_paths: HashSet<PathBuf> =
+                    s.modules.iter().map(|m| m.path.clone()).collect();
+                session_paths == target_paths
+            })
+            .unwrap_or(false);
+
+        if same {
+            self.screen = Screen::Run;
+            return;
+        }
+
+        let modules: Vec<SessionModule> = targets
+            .iter()
+            .map(|&i| SessionModule {
+                module_idx: i,
+                path: self.modules[i].path.clone(),
+                name: self.modules[i].display_name.clone(),
+            })
+            .collect();
+
+        self.session = Some(RunSession::new(modules));
+        self.screen = Screen::Run;
+    }
+
+    /// Raw `app.modules` indices the next Run action should target: the board
+    /// multi-selected subset if non-empty, else ALL session modules.
+    pub fn run_scope_indices(&self) -> Vec<usize> {
+        let Some(s) = &self.session else {
+            return Vec::new();
+        };
+        if s.selected.is_empty() {
+            s.modules.iter().map(|m| m.module_idx).collect()
+        } else {
+            s.selected
+                .iter()
+                .filter_map(|&i| s.modules.get(i))
+                .map(|m| m.module_idx)
+                .collect()
+        }
+    }
+
+    /// Raw `app.modules` index of the highlighted board row.
+    pub fn run_highlight_index(&self) -> Option<usize> {
+        let s = self.session.as_ref()?;
+        s.modules.get(s.cursor).map(|m| m.module_idx)
+    }
+
+    /// Path of the highlighted board module, if any.
+    pub fn run_cursor_path(&self) -> Option<PathBuf> {
+        let s = self.session.as_ref()?;
+        s.modules.get(s.cursor).map(|m| m.path.clone())
+    }
+
+    /// The task shown for `path` on the Run board, plus whether it is a
+    /// background task from a previous session (the `·prev` tag). Resolution:
+    /// this session's latest task for the path, else the newest non-terminal
+    /// task for it in the engine, else none (idle).
+    pub fn display_task_for(&self, path: &Path) -> Option<(&Task, bool)> {
+        if let Some(s) = &self.session {
+            if let Some(&id) = s.latest_task.get(path) {
+                if let Some(t) = self.engine.task(id) {
+                    return Some((t, false));
+                }
+            }
+        }
+        self.engine
+            .tasks
+            .iter()
+            .filter(|t| t.module_path == *path && !t.status.is_terminal())
+            .max_by_key(|t| t.id)
+            .map(|t| (t, true))
+    }
+
+    /// Output lines of the highlighted board module's display task.
+    pub fn run_output_lines(&self) -> &[String] {
+        self.session
+            .as_ref()
+            .and_then(|s| s.modules.get(s.cursor))
+            .and_then(|m| self.display_task_for(&m.path))
+            .map(|(t, _)| t.output_lines.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Move the board cursor by `delta`, resetting output scroll on a change.
+    /// Returns true if the cursor moved.
+    pub fn run_move_cursor(&mut self, delta: i32) -> bool {
+        let Some(s) = self.session.as_mut() else {
+            return false;
+        };
+        let count = s.modules.len();
+        if count == 0 {
+            return false;
+        }
+        let new = (s.cursor as i32 + delta).clamp(0, count as i32 - 1) as usize;
+        let changed = new != s.cursor;
+        s.cursor = new;
+        if changed {
+            s.output_scroll = 0;
+        }
+        changed
+    }
+
+    /// Set the board cursor to an absolute index (mouse click), resetting the
+    /// output scroll on a change. Returns true if the cursor moved.
+    pub fn run_set_cursor(&mut self, pos: usize) -> bool {
+        let Some(s) = self.session.as_mut() else {
+            return false;
+        };
+        if pos >= s.modules.len() {
+            return false;
+        }
+        let changed = pos != s.cursor;
+        s.cursor = pos;
+        if changed {
+            s.output_scroll = 0;
+        }
+        changed
+    }
+
+    /// Toggle the cursor row in/out of the board multi-select; set the anchor.
+    pub fn run_board_toggle(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            let cur = s.cursor;
+            if let Some(pos) = s.selected.iter().position(|&i| i == cur) {
+                s.selected.remove(pos);
+            } else {
+                s.selected.push(cur);
+            }
+            s.select_anchor = Some(cur);
+        }
+    }
+
+    /// Range-select board rows from the anchor to the cursor (inclusive).
+    pub fn run_board_range(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            let Some(anchor) = s.select_anchor else {
+                let cur = s.cursor;
+                if !s.selected.contains(&cur) {
+                    s.selected.push(cur);
+                }
+                s.select_anchor = Some(cur);
+                return;
+            };
+            let lo = anchor.min(s.cursor);
+            let hi = anchor.max(s.cursor).min(s.modules.len().saturating_sub(1));
+            for i in lo..=hi {
+                if !s.selected.contains(&i) {
+                    s.selected.push(i);
+                }
+            }
+            s.select_anchor = Some(s.cursor);
+        }
+    }
+
+    /// Select every board row, or clear if all are already selected.
+    pub fn run_board_toggle_all(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            if !s.modules.is_empty() && s.selected.len() == s.modules.len() {
+                s.selected.clear();
+            } else {
+                s.selected = (0..s.modules.len()).collect();
+            }
+        }
+    }
+
+    /// Clear the board multi-select.
+    pub fn run_board_clear(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            s.selected.clear();
+        }
+    }
+
+    /// Stage a cancel confirmation for the non-terminal display tasks of the
+    /// modules in `targets` (raw indices). No-op if none are active.
+    pub fn request_cancel_run_scope(&mut self, targets: &[usize]) {
+        let paths: Vec<PathBuf> = targets
+            .iter()
+            .filter_map(|&i| self.modules.get(i).map(|m| m.path.clone()))
+            .collect();
+        let mut ids = Vec::new();
+        for p in paths {
+            if let Some((t, _)) = self.display_task_for(&p) {
+                if !t.status.is_terminal() {
+                    ids.push(t.id);
+                }
+            }
+        }
+        if !ids.is_empty() {
+            self.modal = Some(Modal::CancelTasks(ids));
+        }
+    }
+
+    /// Scroll the Run output pane (positive = scroll up toward older lines).
+    /// Clamped to the display task's line count. Returns true if it moved.
+    pub fn run_scroll_output(&mut self, delta: i32) -> bool {
+        let max = self.run_output_lines().len() as u16;
+        let Some(s) = self.session.as_mut() else {
+            return false;
+        };
+        let before = s.output_scroll;
+        if delta < 0 {
+            s.output_scroll = s.output_scroll.saturating_sub((-delta) as u16);
+        } else {
+            s.output_scroll = s.output_scroll.saturating_add(delta as u16).min(max);
+        }
+        s.output_scroll != before
+    }
+
+    /// `(module_count, running_count)` for the current session, if any.
+    pub fn session_indicator(&self) -> Option<(usize, usize)> {
+        let s = self.session.as_ref()?;
+        let n = s.modules.len();
+        let running = s
+            .modules
+            .iter()
+            .filter(|m| {
+                self.engine
+                    .tasks
+                    .iter()
+                    .any(|t| t.module_path == m.path && !t.status.is_terminal())
+            })
+            .count();
+        Some((n, running))
+    }
+
+    /// Record the newest task id per module path into the session's
+    /// `latest_task` map (each module's display task on the Run board).
+    pub fn record_session_tasks(&mut self, ids: &[usize]) {
+        if self.session.is_none() {
+            return;
+        }
+        let pairs: Vec<(PathBuf, usize)> = ids
+            .iter()
+            .filter_map(|&id| {
+                self.engine
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| (t.module_path.clone(), id))
+            })
+            .collect();
+        if let Some(session) = self.session.as_mut() {
+            for (path, id) in pairs {
+                session.latest_task.insert(path, id);
+            }
+        }
+    }
+
+    /// Re-resolve the session against the current module list after a refresh:
+    /// remap `module_idx` by path, drop missing modules, clamp cursor and
+    /// selection. Drops the session entirely (and leaves the Run screen) if no
+    /// module survives.
+    fn remap_session(&mut self) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+
+        let index: HashMap<PathBuf, usize> = self
+            .modules
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.path.clone(), i))
+            .collect();
+
+        let mut kept: Vec<SessionModule> = Vec::new();
+        let mut old_to_new: HashMap<usize, usize> = HashMap::new();
+        for (old_pos, sm) in session.modules.iter().enumerate() {
+            if let Some(&new_idx) = index.get(&sm.path) {
+                old_to_new.insert(old_pos, kept.len());
+                kept.push(SessionModule {
+                    module_idx: new_idx,
+                    path: sm.path.clone(),
+                    name: sm.name.clone(),
+                });
+            }
+        }
+
+        if kept.is_empty() {
+            if self.screen == Screen::Run {
+                self.screen = Screen::Select;
+            }
+            return; // session already taken; stays None
+        }
+
+        let new_selected: Vec<usize> = session
+            .selected
+            .iter()
+            .filter_map(|old| old_to_new.get(old).copied())
+            .collect();
+        let cursor = old_to_new
+            .get(&session.cursor)
+            .copied()
+            .unwrap_or(0)
+            .min(kept.len() - 1);
+
+        session.modules = kept;
+        session.selected = new_selected;
+        session.cursor = cursor;
+        session.select_anchor = None;
+        session.latest_task.retain(|p, _| index.contains_key(p));
+
+        self.session = Some(session);
     }
 
     // ── Target resolution ────────────────────────────────────────────────────
@@ -603,35 +875,30 @@ impl App {
 
     // ── Command enqueueing ───────────────────────────────────────────────────
 
-    /// Enqueue `plan` for the current target modules, writing plan files into
-    /// the managed temp dir so they can be reused by a subsequent apply.
-    pub fn enqueue_plan(&mut self) {
-        let targets = self.target_indices();
-        if targets.is_empty() {
-            return;
-        }
-
-        for idx in targets {
+    /// Enqueue `plan` for `targets`, writing plan files into the managed temp
+    /// dir so they can be reused by a subsequent apply. Returns created ids.
+    pub fn enqueue_plan(&mut self, targets: &[usize]) -> Vec<usize> {
+        let mut ids = Vec::new();
+        for &idx in targets {
             let plan_path = self.engine.plan_cache.plan_path_for(&self.modules[idx].path);
             let args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
-            self.push_task_for(idx, "plan", args, Some(plan_path), None);
+            ids.push(self.push_task_for(idx, "plan", args, Some(plan_path), None));
         }
-
-        self.maybe_auto_select_task();
+        ids
     }
 
-    /// Enqueue a generic command (init, exec, etc.) for the current targets.
-    pub fn enqueue_command(&mut self, command: &str, extra_args: Vec<String>) {
-        let targets = self.target_indices();
-        if targets.is_empty() {
-            return;
+    /// Enqueue a generic command (init, exec, etc.) for `targets`. Returns ids.
+    pub fn enqueue_command(
+        &mut self,
+        command: &str,
+        extra_args: Vec<String>,
+        targets: &[usize],
+    ) -> Vec<usize> {
+        let mut ids = Vec::new();
+        for &idx in targets {
+            ids.push(self.push_task_for(idx, command, extra_args.clone(), None, None));
         }
-
-        for idx in targets {
-            self.push_task_for(idx, command, extra_args.clone(), None, None);
-        }
-
-        self.maybe_auto_select_task();
+        ids
     }
 
     /// Enqueue apply for explicitly captured target indices (from a PendingConfirm).
@@ -640,11 +907,8 @@ impl App {
     /// otherwise fall back to `-auto-approve`. The cache entry is removed so
     /// the UI stops advertising a stale plan, and the file is deleted after the
     /// apply process exits.
-    fn enqueue_apply_for(&mut self, targets: &[usize]) {
-        if targets.is_empty() {
-            return;
-        }
-
+    fn enqueue_apply_for(&mut self, targets: &[usize]) -> Vec<usize> {
+        let mut ids = Vec::new();
         for &idx in targets {
             let module_path = self.modules[idx].path.clone();
             // `take` removes the cache entry but does NOT delete the file.
@@ -657,27 +921,25 @@ impl App {
                 } else {
                     (vec!["-auto-approve".to_string()], None)
                 };
-            self.push_task_for(idx, "apply", args, None, cleanup_plan_path);
+            ids.push(self.push_task_for(idx, "apply", args, None, cleanup_plan_path));
         }
 
-        self.maybe_auto_select_task();
+        ids
     }
 
     /// Enqueue destroy for explicitly captured target indices.
-    fn enqueue_destroy_for(&mut self, targets: &[usize]) {
-        if targets.is_empty() {
-            return;
-        }
+    fn enqueue_destroy_for(&mut self, targets: &[usize]) -> Vec<usize> {
+        let mut ids = Vec::new();
         for &idx in targets {
-            self.push_task_for(
+            ids.push(self.push_task_for(
                 idx,
                 "destroy",
                 vec!["-auto-approve".to_string()],
                 None,
                 None,
-            );
+            ));
         }
-        self.maybe_auto_select_task();
+        ids
     }
 
     /// Bridge from module-index-based call sites to the `TaskEngine`, which
@@ -701,96 +963,19 @@ impl App {
         })
     }
 
-    fn maybe_auto_select_task(&mut self) {
-        // Always jump to the top of the sorted task list so the user sees the
-        // most recently submitted tasks immediately after enqueueing.
-        let sorted = self.sorted_task_display();
-        if let Some(&vi) = sorted.first() {
-            let id = self.engine.tasks[vi].id;
-            self.set_selected_task(id);
-        }
-    }
-
     // ── Confirmation flow ────────────────────────────────────────────────────
 
-    /// Stage `apply` for confirmation, annotating each target with plan info.
-    ///
-    /// When the Tasks pane is focused and all selected tasks are plan commands,
-    /// the apply targets are derived from current ready plan tasks rather than
-    /// the module selection. Stale plan-task selections stage nothing.
-    /// Otherwise falls back to the normal module selection.
-    pub fn request_apply_confirm(&mut self) {
-        if self.focus == Focus::Tasks {
-            if let Some(confirm_targets) = self.apply_targets_from_plan_tasks() {
-                if confirm_targets.is_empty() {
-                    return;
-                }
-                self.modal = Some(Modal::Confirm(PendingConfirm {
-                    kind: ConfirmKind::Apply,
-                    targets: confirm_targets,
-                }));
-                return;
-            }
-        }
-        self.stage_module_confirm(ConfirmKind::Apply);
+    /// Stage `apply` for confirmation against `targets`, annotating each with
+    /// plan info. Apply consumes any cached plan file per module.
+    pub fn request_apply_confirm(&mut self, targets: &[usize]) {
+        self.stage_module_confirm(ConfirmKind::Apply, targets);
     }
 
-    /// Derive apply `ConfirmTarget`s from the currently selected plan task(s)
-    /// in the Tasks pane. Returns `None` if the selection contains non-plan tasks.
-    /// Stale plan tasks are ignored; if none are current, returns an empty vec
-    /// so callers do not fall back to the module selection.
-    fn apply_targets_from_plan_tasks(&self) -> Option<Vec<ConfirmTarget>> {
-        let task_ids: Vec<usize> = if !self.task_multi_select.is_empty() {
-            self.task_multi_select.clone()
-        } else {
-            self.selected_task_id.into_iter().collect()
-        };
-
-        if task_ids.is_empty() {
-            return None;
-        }
-
-        let tasks: Vec<&Task> = task_ids
-            .iter()
-            .filter_map(|&id| self.engine.tasks.iter().find(|t| t.id == id))
-            .collect();
-
-        if tasks.is_empty() {
-            return None;
-        }
-
-        // All selected tasks must be plan commands; otherwise fall back.
-        if tasks.iter().any(|t| t.command != "plan") {
-            return None;
-        }
-
-        let mut seen = HashSet::new();
-        let mut targets = Vec::new();
-        for task in tasks {
-            let Some(plan) = self.ready_plan_for_task(task) else {
-                continue;
-            };
-            if let Some((idx, module)) = self
-                .modules
-                .iter()
-                .enumerate()
-                .find(|(_, m)| m.path == task.module_path)
-            {
-                if seen.insert(idx) {
-                    targets.push(ConfirmTarget {
-                        module_idx: idx,
-                        module_name: module.display_name.clone(),
-                        plan_age: Some(plan.age_str()),
-                        lock_id: None,
-                        lock_who: None,
-                    });
-                }
-            }
-        }
-
-        Some(targets)
-    }
-
+    /// Whether `task` is the plan whose output file the plan cache currently
+    /// owns for its module (i.e. a subsequent apply would consume it). Retained
+    /// for the cache-owner invariant it encodes and its regression test; the
+    /// live apply path re-derives this via `plan_cache.take` in `enqueue_apply_for`.
+    #[allow(dead_code)]
     pub fn ready_plan_for_task(&self, task: &Task) -> Option<&crate::plan_cache::PlanEntry> {
         let plan = self.engine.plan_cache.get(&task.module_path)?;
         if task.command == "plan"
@@ -804,9 +989,9 @@ impl App {
         }
     }
 
-    /// Stage `destroy` for confirmation.
-    pub fn request_destroy_confirm(&mut self) {
-        self.stage_module_confirm(ConfirmKind::Destroy);
+    /// Stage `destroy` for confirmation against `targets`.
+    pub fn request_destroy_confirm(&mut self, targets: &[usize]) {
+        self.stage_module_confirm(ConfirmKind::Destroy, targets);
     }
 
     /// Build a `ConfirmTarget` for `module_idx` under `kind`, or `None` to skip
@@ -845,11 +1030,10 @@ impl App {
         }
     }
 
-    /// Stage `kind` for confirmation against the current module selection
-    /// (`target_indices()`), annotating each target via `annotate_confirm_target`.
-    /// Stages nothing if the selection or the annotated target list is empty.
-    fn stage_module_confirm(&mut self, kind: ConfirmKind) {
-        let targets = self.target_indices();
+    /// Stage `kind` for confirmation against `targets`, annotating each target
+    /// via `annotate_confirm_target`. Stages nothing if the target list or the
+    /// annotated target list is empty.
+    fn stage_module_confirm(&mut self, kind: ConfirmKind, targets: &[usize]) {
         if targets.is_empty() {
             return;
         }
@@ -873,48 +1057,49 @@ impl App {
     /// Execute the confirmed command. Call after user presses `y`.
     pub fn confirm_execute(&mut self) {
         match self.modal.take() {
-            Some(Modal::Confirm(confirm)) => match confirm.kind {
-                ConfirmKind::Apply => {
-                    let indices: Vec<usize> =
-                        confirm.targets.iter().map(|t| t.module_idx).collect();
-                    self.enqueue_apply_for(&indices);
-                }
-                ConfirmKind::Destroy => {
-                    let indices: Vec<usize> =
-                        confirm.targets.iter().map(|t| t.module_idx).collect();
-                    self.enqueue_destroy_for(&indices);
-                }
-                ConfirmKind::InitUpgrade => {
-                    let indices: Vec<usize> =
-                        confirm.targets.iter().map(|t| t.module_idx).collect();
-                    self.enqueue_init_upgrade_for(&indices);
-                }
-                ConfirmKind::ForceUnlock => {
-                    let pairs: Vec<(usize, String)> = confirm
-                        .targets
-                        .into_iter()
-                        .filter_map(|t| t.lock_id.map(|id| (t.module_idx, id)))
-                        .collect();
-                    self.enqueue_force_unlock_for(&pairs);
-                }
-            },
+            Some(Modal::Confirm(confirm)) => {
+                let ids = match confirm.kind {
+                    ConfirmKind::Apply => {
+                        let indices: Vec<usize> =
+                            confirm.targets.iter().map(|t| t.module_idx).collect();
+                        self.enqueue_apply_for(&indices)
+                    }
+                    ConfirmKind::Destroy => {
+                        let indices: Vec<usize> =
+                            confirm.targets.iter().map(|t| t.module_idx).collect();
+                        self.enqueue_destroy_for(&indices)
+                    }
+                    ConfirmKind::InitUpgrade => {
+                        let indices: Vec<usize> =
+                            confirm.targets.iter().map(|t| t.module_idx).collect();
+                        self.enqueue_init_upgrade_for(&indices)
+                    }
+                    ConfirmKind::ForceUnlock => {
+                        let pairs: Vec<(usize, String)> = confirm
+                            .targets
+                            .into_iter()
+                            .filter_map(|t| t.lock_id.map(|id| (t.module_idx, id)))
+                            .collect();
+                        self.enqueue_force_unlock_for(&pairs)
+                    }
+                };
+                self.record_session_tasks(&ids);
+            }
             other => self.modal = other,
         }
     }
 
-    /// Stage `init -upgrade` for confirmation.
-    pub fn request_init_upgrade_confirm(&mut self) {
-        self.stage_module_confirm(ConfirmKind::InitUpgrade);
+    /// Stage `init -upgrade` for confirmation against `targets`.
+    pub fn request_init_upgrade_confirm(&mut self, targets: &[usize]) {
+        self.stage_module_confirm(ConfirmKind::InitUpgrade, targets);
     }
 
-    fn enqueue_init_upgrade_for(&mut self, targets: &[usize]) {
-        if targets.is_empty() {
-            return;
-        }
+    fn enqueue_init_upgrade_for(&mut self, targets: &[usize]) -> Vec<usize> {
+        let mut ids = Vec::new();
         for &idx in targets {
-            self.push_task_for(idx, "init", vec!["-upgrade".to_string()], None, None);
+            ids.push(self.push_task_for(idx, "init", vec!["-upgrade".to_string()], None, None));
         }
-        self.maybe_auto_select_task();
+        ids
     }
 
     /// Detect a lock for a module by parsing the output of its most recent
@@ -943,60 +1128,30 @@ impl App {
     /// falls back to parsing the "Lock Info:" block from recent task output
     /// (works for any backend — S3, remote, etc.).
     /// If no lock is detected for any target, returns silently.
-    pub fn request_force_unlock_confirm(&mut self) {
-        self.stage_module_confirm(ConfirmKind::ForceUnlock);
+    pub fn request_force_unlock_confirm(&mut self, targets: &[usize]) {
+        self.stage_module_confirm(ConfirmKind::ForceUnlock, targets);
     }
 
     /// Enqueue `force-unlock -force <lock_id>` for each (module_idx, lock_id) pair.
-    fn enqueue_force_unlock_for(&mut self, targets: &[(usize, String)]) {
-        if targets.is_empty() {
-            return;
-        }
+    fn enqueue_force_unlock_for(&mut self, targets: &[(usize, String)]) -> Vec<usize> {
+        let mut ids = Vec::new();
         for (idx, lock_id) in targets {
-            self.push_task_for(
+            ids.push(self.push_task_for(
                 *idx,
                 "force-unlock",
                 vec!["-force".to_string(), lock_id.clone()],
                 None,
                 None,
-            );
+            ));
         }
-        self.maybe_auto_select_task();
+        ids
     }
 
     pub fn cancel_confirm(&mut self) {
         self.modal = None;
     }
 
-    /// Stage tasks for cancel confirmation.
-    ///
-    /// Targets `task_multi_select` if non-empty, otherwise the highlighted task.
-    /// Filters out already-terminal tasks. No-op if nothing active remains.
-    pub fn request_cancel_task_confirm(&mut self) {
-        let candidates: Vec<usize> = if self.task_multi_select.is_empty() {
-            self.selected_task_id.into_iter().collect()
-        } else {
-            self.task_multi_select.clone()
-        };
-
-        let active: Vec<usize> = candidates
-            .into_iter()
-            .filter(|&id| {
-                self.engine
-                    .tasks
-                    .iter()
-                    .find(|t| t.id == id)
-                    .map(|t| !t.status.is_terminal())
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if !active.is_empty() {
-            self.modal = Some(Modal::CancelTasks(active));
-        }
-    }
-
-    /// Execute cancellation for all staged task IDs, then clear staging + multi-select.
+    /// Execute cancellation for all staged task IDs.
     pub fn cancel_staged_tasks(&mut self) {
         let Some(Modal::CancelTasks(ids)) = self.modal.take() else {
             return;
@@ -1004,7 +1159,6 @@ impl App {
         for id in ids {
             self.engine.cancel_task(id);
         }
-        self.task_multi_select.clear();
     }
 
     pub fn completed_task_count(&self) -> usize {
@@ -1025,31 +1179,12 @@ impl App {
         }
     }
 
-    /// Clear terminal tasks from the task pane, preserving active tasks.
+    /// Clear terminal tasks from the engine history, preserving active tasks.
+    /// The Run board falls back to live task resolution for any module whose
+    /// recorded display task was cleared (see `display_task_for`).
     pub fn clear_completed_tasks(&mut self) {
         self.modal = None;
-        if self.engine.tasks.is_empty() {
-            return;
-        }
-
-        let previous_selection = self.selected_task_id;
         self.engine.tasks.retain(|t| !t.status.is_terminal());
-
-        let remaining_ids: HashSet<usize> = self.engine.tasks.iter().map(|t| t.id).collect();
-        self.task_multi_select
-            .retain(|id| remaining_ids.contains(id));
-
-        let selection_still_exists = previous_selection
-            .map(|id| remaining_ids.contains(&id))
-            .unwrap_or(false);
-
-        if !selection_still_exists {
-            self.selected_task_id = self
-                .sorted_task_display()
-                .first()
-                .map(|&vi| self.engine.tasks[vi].id);
-            self.output_scroll = 0;
-        }
     }
 
     /// Stage a session reset for confirmation.
@@ -1102,13 +1237,10 @@ impl App {
         self.max_depth = None;
         self.selected_module = 0;
 
-        self.task_multi_select.clear();
-        self.selected_task_id = None;
-        self.output_scroll = 0;
-
         self.modal = None;
 
-        self.focus = Focus::Modules;
+        self.session = None;
+        self.screen = Screen::Select;
     }
 
     // ── State explorer ───────────────────────────────────────────────────────
@@ -1116,14 +1248,12 @@ impl App {
     /// Open the state explorer for the currently selected (or focused) module.
     /// State is loaded in the background (see `spawn_state_load`); the
     /// explorer opens immediately showing `StateContent::Loading`.
-    pub fn open_state_explorer(&mut self) {
-        let visible = self.visible_module_indices();
-        let Some(&idx) = visible.get(self.selected_module) else {
+    pub fn open_state_explorer(&mut self, module_idx: usize) {
+        let Some(module) = self.modules.get(module_idx) else {
             return;
         };
-        let module = &self.modules[idx];
         self.state_explorer = Some(StateExplorer {
-            module_idx: idx,
+            module_idx,
             module_name: module.display_name.clone(),
             content: StateContent::Loading,
             selected: 0,
@@ -1333,7 +1463,6 @@ impl App {
             args.push(format!("-target={}", addr));
         }
         self.push_task_for(module_idx, "plan", args, Some(plan_path), None);
-        self.maybe_auto_select_task();
         if let Some(explorer) = self.state_explorer.as_mut() {
             explorer.plan_queued_notice = true;
         }
@@ -1585,32 +1714,6 @@ impl App {
         self.poll_state_load();
     }
 
-    // ── Output pane ──────────────────────────────────────────────────────────
-
-    fn output_task(&self) -> Option<&Task> {
-        if let Some(id) = self.selected_task_id {
-            return self.engine.tasks.iter().find(|t| t.id == id);
-        }
-        // Fallback: most recently active task with output.
-        self.sorted_task_display()
-            .into_iter()
-            .map(|vi| &self.engine.tasks[vi])
-            .find(|t| !t.output_lines.is_empty() || t.status == TaskStatus::Running)
-    }
-
-    pub fn current_output(&self) -> &[String] {
-        self.output_task()
-            .map(|t| t.output_lines.as_slice())
-            .unwrap_or_default()
-    }
-
-    pub fn output_title(&self) -> String {
-        if let Some(task) = self.output_task() {
-            return format!("Output [{}: {}]", task.module_name, task.command);
-        }
-        "Output".to_string()
-    }
-
     /// Tasks that are still Pending or Running.
     pub fn active_tasks(&self) -> Vec<&Task> {
         self.engine
@@ -1669,6 +1772,54 @@ mod tests {
         });
     }
 
+    fn multi_module_app(n: usize) -> App {
+        let root = PathBuf::from("/tmp/rug-test-multi");
+        let modules: Vec<Module> = (0..n)
+            .map(|i| Module {
+                path: root.join(format!("m{i}")),
+                display_name: format!("m{i}"),
+                kind: ModuleKind::Root,
+            })
+            .collect();
+        let config = Config {
+            binary: "terraform".to_string(),
+            parallelism: 1,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+        };
+        App::new(config, root, modules).unwrap()
+    }
+
+    #[test]
+    fn enter_run_resumes_same_set_and_forks_on_change() {
+        let mut app = multi_module_app(3);
+
+        // Enter Run for modules {0,1}.
+        app.multi_select = vec![0, 1];
+        app.enter_run();
+        assert_eq!(app.screen, Screen::Run);
+        assert_eq!(app.session.as_ref().unwrap().modules.len(), 2);
+
+        // Dirty the board state, go back, re-enter with the same set → RESUME
+        // (board state preserved, no fresh session).
+        app.session.as_mut().unwrap().cursor = 1;
+        app.session.as_mut().unwrap().selected = vec![0];
+        app.screen = Screen::Select;
+        app.enter_run();
+        assert_eq!(app.screen, Screen::Run);
+        assert_eq!(app.session.as_ref().unwrap().cursor, 1);
+        assert_eq!(app.session.as_ref().unwrap().selected, vec![0]);
+        assert_eq!(app.session.as_ref().unwrap().modules.len(), 2);
+
+        // Change the target set → FRESH session (board state reset).
+        app.screen = Screen::Select;
+        app.multi_select = vec![0, 1, 2];
+        app.enter_run();
+        assert_eq!(app.session.as_ref().unwrap().cursor, 0);
+        assert!(app.session.as_ref().unwrap().selected.is_empty());
+        assert_eq!(app.session.as_ref().unwrap().modules.len(), 3);
+    }
+
     #[test]
     fn ready_plan_for_task_requires_current_cache_owner() {
         let mut app = test_app();
@@ -1683,25 +1834,5 @@ mod tests {
 
         assert!(app.ready_plan_for_task(&app.engine.tasks[0]).is_none());
         assert!(app.ready_plan_for_task(&app.engine.tasks[1]).is_some());
-    }
-
-    #[test]
-    fn stale_plan_task_apply_does_not_fallback_to_module_selection() {
-        let mut app = test_app();
-        let module_path = app.modules[0].path.clone();
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
-
-        push_plan_task(&mut app, 1, plan_path.clone());
-        push_plan_task(&mut app, 2, plan_path.clone());
-        app.engine
-            .plan_cache
-            .register(module_path, plan_path, app.engine.tasks[1].id);
-
-        app.focus = Focus::Tasks;
-        app.selected_module = 0;
-        app.selected_task_id = Some(app.engine.tasks[0].id);
-        app.request_apply_confirm();
-
-        assert!(app.modal.is_none());
     }
 }

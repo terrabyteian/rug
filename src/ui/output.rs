@@ -1,48 +1,7 @@
 use ratatui::{
-    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
-
-use crate::app::{App, Focus};
-use crate::ui::theme;
-
-/// Render the output viewer pane (scrollable log of the selected task).
-pub fn render(f: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Focus::Output;
-    let border_style = theme::pane_border(focused);
-
-    let lines: Vec<Line> = app.current_output().iter().map(|l| parse_ansi(l)).collect();
-
-    let visible_height = area.height.saturating_sub(2) as usize;
-    // auto_bottom keeps the tail visible; output_scroll pulls the view upward.
-    let auto_bottom = lines.len().saturating_sub(visible_height);
-    let scroll_row = auto_bottom.saturating_sub(app.output_scroll as usize) as u16;
-
-    // Show a scroll indicator in the title when not at the bottom.
-    let title = if app.output_scroll > 0 {
-        format!(" {} [↑ scrolled] ", app.output_title())
-    } else {
-        format!(" {} ", app.output_title())
-    };
-
-    let mut para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        )
-        .scroll((scroll_row, 0));
-
-    if app.output_wrap {
-        para = para.wrap(Wrap { trim: false });
-    }
-
-    f.render_widget(para, area);
-}
 
 /// Parse a raw string that may contain ANSI SGR escape sequences into a
 /// ratatui `Line` made up of styled `Span`s.
@@ -50,7 +9,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 /// Covers the subset of SGR codes that terraform/tofu actually emits:
 /// resets, bold/dim, standard colours (30-37), bright colours (90-97),
 /// and compound codes like `1;32`.
-fn parse_ansi(s: &str) -> Line<'static> {
+pub(crate) fn parse_ansi(s: &str) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut style = Style::default();
     let mut text = String::new();
