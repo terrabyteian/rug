@@ -101,3 +101,48 @@ fn file_has_backend(path: &Path) -> bool {
         trimmed.starts_with("backend ") || trimmed == "backend{"
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_tf_files_is_not_a_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(classify_dir(tmp.path()), None);
+    }
+
+    #[test]
+    fn tf_with_lock_file_is_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.tf"), "").unwrap();
+        std::fs::write(tmp.path().join(".terraform.lock.hcl"), "").unwrap();
+        assert_eq!(classify_dir(tmp.path()), Some(ModuleKind::Root));
+    }
+
+    #[test]
+    fn tf_with_tfstate_is_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.tf"), "").unwrap();
+        std::fs::write(tmp.path().join("terraform.tfstate"), "").unwrap();
+        assert_eq!(classify_dir(tmp.path()), Some(ModuleKind::Root));
+    }
+
+    #[test]
+    fn tf_with_backend_block_is_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("main.tf"),
+            "terraform {\n  backend \"s3\" {}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(classify_dir(tmp.path()), Some(ModuleKind::Root));
+    }
+
+    #[test]
+    fn tf_only_is_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.tf"), "resource \"x\" \"y\" {}\n").unwrap();
+        assert_eq!(classify_dir(tmp.path()), Some(ModuleKind::Library));
+    }
+}

@@ -7,15 +7,12 @@ use ratatui::{
 };
 
 use crate::app::{App, Focus};
+use crate::ui::theme;
 
 /// Render the output viewer pane (scrollable log of the selected task).
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Output;
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
+    let border_style = theme::pane_border(focused);
 
     let lines: Vec<Line> = app.current_output().iter().map(|l| parse_ansi(l)).collect();
 

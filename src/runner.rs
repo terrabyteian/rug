@@ -103,6 +103,7 @@ pub fn spawn_task(
             // A second escalation (force_kill) can arrive via sigkill_rx.
             _ = &mut sigint_rx => {
                 if let Some(pid) = pid {
+                    // NOTE: no non-unix cancel path; SIGINT escalation is unix-only by design.
                     #[cfg(unix)]
                     unsafe { libc::kill(pid as i32, libc::SIGINT); }
                 }

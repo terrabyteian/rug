@@ -1,5 +1,6 @@
 pub mod output;
 pub mod tasks;
+pub mod theme;
 pub mod tree;
 mod wrap;
 
@@ -17,7 +18,8 @@ use std::io;
 use std::time::Duration;
 
 use crate::app::{
-    App, ConfirmKind, DragHandle, ExplorerOpKind, Focus, OpResult, PendingConfirm, PendingOp,
+    App, ConfirmKind, DragHandle, ExplorerOpKind, Focus, Modal, OpResult, PendingConfirm,
+    PendingOp,
 };
 
 /// Run the full TUI event loop until the user quits.
@@ -55,13 +57,9 @@ fn event_loop<B: ratatui::backend::Backend>(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Mouse(mouse) => {
-                    // Hard overlays absorb all mouse events.
-                    if app.pending_quit
-                        || app.pending_confirm.is_some()
-                        || !app.pending_cancel_task.is_empty()
-                        || app.pending_clear_tasks
-                        || app.pending_reset
-                        || app.filter_active
+                    // Hard overlays absorb all mouse events. Help does not.
+                    if app.filter_active
+                        || app.modal.as_ref().is_some_and(|m| !matches!(m, Modal::Help))
                     {
                         continue;
                     }
@@ -165,10 +163,11 @@ fn event_loop<B: ratatui::backend::Backend>(
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
-                        if app.pending_quit || app.active_tasks().is_empty() {
+                        if matches!(app.modal, Some(Modal::Quit)) || app.active_tasks().is_empty()
+                        {
                             break;
                         }
-                        app.pending_quit = true;
+                        app.modal = Some(Modal::Quit);
                         continue;
                     }
 
@@ -201,64 +200,55 @@ fn event_loop<B: ratatui::backend::Backend>(
                         continue;
                     }
 
-                    // Graceful-quit overlay: q force-quits, Esc cancels, everything else is swallowed.
-                    if app.pending_quit {
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc => app.pending_quit = false,
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Confirmation dialog intercepts all keys.
-                    if app.pending_confirm.is_some() {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                app.confirm_execute();
+                    // Modal overlay intercepts all keys: Quit (q force-quits, Esc
+                    // cancels); Confirm/CancelTasks/ClearTasks/Reset (y/Y/Enter act,
+                    // anything else dismisses); Help (any key closes).
+                    if app.modal.is_some() {
+                        if matches!(app.modal, Some(Modal::Quit)) {
+                            match key.code {
+                                KeyCode::Char('q') => break,
+                                KeyCode::Esc => app.modal = None,
+                                _ => {}
                             }
-                            _ => {
-                                app.cancel_confirm();
+                        } else if matches!(app.modal, Some(Modal::Confirm(_))) {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    app.confirm_execute();
+                                }
+                                _ => {
+                                    app.cancel_confirm();
+                                }
                             }
-                        }
-                        continue;
-                    }
-
-                    // Cancel-task confirmation intercepts all keys.
-                    if !app.pending_cancel_task.is_empty() {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                app.cancel_staged_tasks();
+                        } else if matches!(app.modal, Some(Modal::CancelTasks(_))) {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    app.cancel_staged_tasks();
+                                }
+                                _ => {
+                                    app.modal = None;
+                                }
                             }
-                            _ => {
-                                app.pending_cancel_task.clear();
+                        } else if matches!(app.modal, Some(Modal::ClearTasks)) {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    app.clear_completed_tasks();
+                                }
+                                _ => {
+                                    app.modal = None;
+                                }
                             }
-                        }
-                        continue;
-                    }
-
-                    // Clear-task-history confirmation intercepts all keys.
-                    if app.pending_clear_tasks {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                app.clear_completed_tasks();
+                        } else if matches!(app.modal, Some(Modal::Reset)) {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    app.reset_session();
+                                }
+                                _ => {
+                                    app.modal = None;
+                                }
                             }
-                            _ => {
-                                app.pending_clear_tasks = false;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Reset-session confirmation intercepts all keys.
-                    if app.pending_reset {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                app.reset_session();
-                            }
-                            _ => {
-                                app.pending_reset = false;
-                            }
+                        } else {
+                            // Help: any key closes.
+                            app.modal = None;
                         }
                         continue;
                     }
@@ -281,12 +271,6 @@ fn event_loop<B: ratatui::backend::Backend>(
                             }
                             _ => {}
                         }
-                        continue;
-                    }
-
-                    // Help overlay.
-                    if app.show_help {
-                        app.show_help = false;
                         continue;
                     }
 
@@ -449,9 +433,9 @@ fn event_loop<B: ratatui::backend::Backend>(
                             if app.active_tasks().is_empty() {
                                 break;
                             }
-                            app.pending_quit = true;
+                            app.modal = Some(Modal::Quit);
                         }
-                        KeyCode::Char('h') | KeyCode::Char('?') => app.show_help = !app.show_help,
+                        KeyCode::Char('h') | KeyCode::Char('?') => app.modal = Some(Modal::Help),
                         KeyCode::Char('r') => app.refresh_modules(),
                         KeyCode::Char('R') => app.request_reset_confirm(),
                         KeyCode::Tab => app.cycle_focus(),
@@ -600,8 +584,10 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     if app.state_explorer.is_some() {
         // Reserve: 2 border + 1 blank top + 1 blank before hint + 1 hint + 1 counter + 1 filter bar.
         app.pane_heights.explorer = area.height.saturating_sub(7);
+        let spinner =
+            theme::SPINNER_FRAMES[(app.spinner_tick as usize / 2) % theme::SPINNER_FRAMES.len()];
         if let Some(explorer) = &app.state_explorer {
-            render_state_explorer(f, area, explorer);
+            render_state_explorer(f, area, explorer, spinner);
             // Op overlays render on top of the state explorer.
             if let Some(op_kind) = explorer.op_confirm {
                 render_op_confirm(f, area, op_kind, &explorer.op_targets);
@@ -639,56 +625,46 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     output::render(f, v_chunks[0], app);
     tasks::render(f, v_chunks[1], app);
 
-    if app.pending_quit {
-        render_quit_wait(f, area, app);
-    }
-
-    if app.show_help {
-        render_help(f, area);
+    match &app.modal {
+        Some(Modal::Quit) => render_quit_wait(f, area, app),
+        Some(Modal::Help) => render_help(f, area),
+        Some(Modal::Confirm(confirm)) => render_confirm(f, area, confirm),
+        Some(Modal::CancelTasks(ids)) => {
+            let tasks: Vec<(&str, &str)> = ids
+                .iter()
+                .filter_map(|&id| app.engine.task(id))
+                .map(|t| (t.module_name.as_str(), t.command.as_str()))
+                .collect();
+            if !tasks.is_empty() {
+                render_cancel_task_confirm(f, area, &tasks);
+            }
+        }
+        Some(Modal::ClearTasks) => {
+            let completed = app.completed_task_count();
+            if completed > 0 {
+                render_clear_tasks_confirm(
+                    f,
+                    area,
+                    completed,
+                    app.engine.tasks.len().saturating_sub(completed),
+                );
+            }
+        }
+        Some(Modal::Reset) => {
+            let (plans, queued, finished) = app.reset_summary();
+            render_reset_confirm(f, area, plans, queued, finished);
+        }
+        None => {}
     }
 
     if app.filter_active {
         render_filter_bar(f, area, &app.filter);
-    }
-
-    if let Some(confirm) = &app.pending_confirm {
-        render_confirm(f, area, confirm);
-    }
-
-    if !app.pending_cancel_task.is_empty() {
-        let tasks: Vec<(&str, &str)> = app
-            .pending_cancel_task
-            .iter()
-            .filter_map(|&id| app.tasks.iter().find(|t| t.id == id))
-            .map(|t| (t.module_name.as_str(), t.command.as_str()))
-            .collect();
-        if !tasks.is_empty() {
-            render_cancel_task_confirm(f, area, &tasks);
-        }
-    }
-
-    if app.pending_clear_tasks {
-        let completed = app.completed_task_count();
-        if completed > 0 {
-            render_clear_tasks_confirm(
-                f,
-                area,
-                completed,
-                app.tasks.len().saturating_sub(completed),
-            );
-        }
-    }
-
-    if app.pending_reset {
-        let (plans, queued, finished) = app.reset_summary();
-        render_reset_confirm(f, area, plans, queued, finished);
     }
 }
 
 fn render_help(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::{
         layout::{Alignment, Rect},
-        style::{Color, Style},
         widgets::{Block, Borders, Clear, Paragraph},
     };
 
@@ -731,7 +707,7 @@ q / Ctrl-C Quit";
                 Block::default()
                     .title(" Help (any key to close) ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme::overlay_border_warn()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -759,7 +735,6 @@ fn pane_for_click(col: u16, row: u16, size: ratatui::layout::Size, app: &App) ->
 fn render_filter_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, filter: &str) {
     use ratatui::{
         layout::Rect,
-        style::{Color, Style},
         widgets::{Block, Borders, Clear, Paragraph},
     };
 
@@ -775,7 +750,7 @@ fn render_filter_bar(f: &mut ratatui::Frame, area: ratatui::layout::Rect, filter
             Block::default()
                 .title(" Filter ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(theme::overlay_border_filter()),
         ),
         bar,
     );
@@ -900,7 +875,7 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
-        Span::styled("[any] Cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled("[any] Cancel", theme::dim()),
     ]));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
@@ -916,7 +891,7 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
                 Block::default()
                     .title(format!(" Confirm {label} "))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red)),
+                    .border_style(theme::overlay_border_danger()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -973,7 +948,7 @@ fn render_cancel_task_confirm(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
-        Span::styled("[any] Keep running", Style::default().fg(Color::DarkGray)),
+        Span::styled("[any] Keep running", theme::dim()),
     ]));
 
     let height = (lines.len() + 2) as u16;
@@ -989,7 +964,7 @@ fn render_cancel_task_confirm(
                 Block::default()
                     .title(format!(" Cancel {n} Task(s) "))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme::overlay_border_warn()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1024,10 +999,7 @@ fn render_clear_tasks_confirm(
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            active_line,
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(active_line, theme::dim())),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
@@ -1038,7 +1010,7 @@ fn render_clear_tasks_confirm(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled("[any] Keep", Style::default().fg(Color::DarkGray)),
+            Span::styled("[any] Keep", theme::dim()),
         ]),
     ];
 
@@ -1066,7 +1038,7 @@ fn render_clear_tasks_confirm(
                 Block::default()
                     .title(" Clear Completed Tasks ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme::overlay_border_warn()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1100,25 +1072,22 @@ fn render_reset_confirm(
         Line::from(""),
         Line::from(Span::styled(
             format!("  • Drop {plans} cached {plan_noun}"),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )),
         Line::from(Span::styled(
             format!("  • Cancel {queued} queued {queued_noun}"),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )),
         Line::from(Span::styled(
             format!("  • Drop {finished} finished {finished_noun}"),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )),
         Line::from(Span::styled(
             "  • Clear filter, selection, depth limit",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Running tasks continue.",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("  Running tasks continue.", theme::dim())),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
@@ -1129,7 +1098,7 @@ fn render_reset_confirm(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled("[any] Cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled("[any] Cancel", theme::dim()),
         ]),
     ];
 
@@ -1157,7 +1126,7 @@ fn render_reset_confirm(
                 Block::default()
                     .title(" Reset Session ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme::overlay_border_warn()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1201,7 +1170,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
 
     for task in &active {
         lines.push(Line::from(vec![
-            Span::raw(format!("  {} ", task.status.icon())),
+            Span::raw(format!("  {} ", theme::status_icon(&task.status))),
             Span::styled(
                 format!("{:<width$}", task.module_name, width = name_width),
                 Style::default().fg(Color::Cyan),
@@ -1251,7 +1220,7 @@ fn render_quit_wait(f: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &A
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme::overlay_border_warn()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1262,6 +1231,7 @@ fn render_state_explorer(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     explorer: &crate::app::StateExplorer,
+    spinner: &str,
 ) {
     // If the user has drilled into a resource, show that view instead.
     if let Some(detail) = &explorer.detail_view {
@@ -1283,6 +1253,19 @@ fn render_state_explorer(
     let mut lines: Vec<Line> = vec![Line::from("")];
 
     match &explorer.content {
+        StateContent::Loading => {
+            lines.push(Line::from(Span::styled(
+                format!("  {spinner} Loading state…"),
+                theme::dim(),
+            )));
+        }
+        StateContent::Error(msg) => {
+            lines.push(Line::from(Span::styled(
+                "  Failed to load state",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(format!("  {msg}"), theme::dim())));
+        }
         StateContent::NotInitialized => {
             lines.push(Line::from(Span::styled(
                 "  Not initialized",
@@ -1292,7 +1275,7 @@ fn render_state_explorer(
             )));
             lines.push(Line::from(Span::styled(
                 "  Run `i` to initialize this module.",
-                Style::default().fg(Color::DarkGray),
+                theme::dim(),
             )));
         }
         StateContent::NoState => {
@@ -1304,7 +1287,7 @@ fn render_state_explorer(
             )));
             lines.push(Line::from(Span::styled(
                 "  Module is initialized but has no resources in state.",
-                Style::default().fg(Color::DarkGray),
+                theme::dim(),
             )));
         }
         StateContent::Resources(resources) => {
@@ -1326,7 +1309,7 @@ fn render_state_explorer(
             if filtered.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("  No resources match \"{}\"", explorer.filter),
-                    Style::default().fg(Color::DarkGray),
+                    theme::dim(),
                 )));
             } else {
                 // Scroll window: keep selected visible at bottom of window.
@@ -1338,7 +1321,7 @@ fn render_state_explorer(
                 if scroll_start > 0 {
                     lines.push(Line::from(Span::styled(
                         format!("  ↑ {} more above", scroll_start),
-                        Style::default().fg(Color::DarkGray),
+                        theme::dim(),
                     )));
                 }
 
@@ -1406,7 +1389,7 @@ fn render_state_explorer(
                 if shown_end < visible_count {
                     lines.push(Line::from(Span::styled(
                         format!("  ↓ {} more below", visible_count - shown_end),
-                        Style::default().fg(Color::DarkGray),
+                        theme::dim(),
                     )));
                 }
             }
@@ -1416,7 +1399,7 @@ fn render_state_explorer(
             if !explorer.filter.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("  {} / {} resources", visible_count, total),
-                    Style::default().fg(Color::DarkGray),
+                    theme::dim(),
                 )));
             }
         }
@@ -1436,37 +1419,37 @@ fn render_state_explorer(
         ])
     } else if !explorer.filter.is_empty() {
         Line::from(vec![
-            Span::styled("  /", Style::default().fg(Color::DarkGray)),
+            Span::styled("  /", theme::dim()),
             Span::styled(
                 explorer.filter.clone(),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             ),
-            Span::styled("  (Esc to clear)", Style::default().fg(Color::DarkGray)),
+            Span::styled("  (Esc to clear)", theme::dim()),
         ])
     } else {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("[j/k] Nav", Style::default().fg(Color::DarkGray)),
+            Span::styled("[j/k] Nav", theme::dim()),
             Span::raw("  "),
-            Span::styled("[Space] Select", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Space] Select", theme::dim()),
             Span::raw("  "),
-            Span::styled("[t] Taint", Style::default().fg(Color::DarkGray)),
+            Span::styled("[t] Taint", theme::dim()),
             Span::raw("  "),
-            Span::styled("[D] Rm state", Style::default().fg(Color::DarkGray)),
+            Span::styled("[D] Rm state", theme::dim()),
             Span::raw("  "),
-            Span::styled("[p] Plan", Style::default().fg(Color::DarkGray)),
+            Span::styled("[p] Plan", theme::dim()),
             Span::raw("  "),
-            Span::styled("[d] Destroy", Style::default().fg(Color::DarkGray)),
+            Span::styled("[d] Destroy", theme::dim()),
             Span::raw("  "),
-            Span::styled("[Enter] Inspect", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Enter] Inspect", theme::dim()),
             Span::raw("  "),
-            Span::styled("[/] Filter", Style::default().fg(Color::DarkGray)),
+            Span::styled("[/] Filter", theme::dim()),
             Span::raw("  "),
-            Span::styled("[r] Refresh", Style::default().fg(Color::DarkGray)),
+            Span::styled("[r] Refresh", theme::dim()),
             Span::raw("  "),
-            Span::styled("[Esc] Close", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Esc] Close", theme::dim()),
         ])
     };
     lines.push(Line::from(""));
@@ -1490,10 +1473,10 @@ fn render_state_explorer(
         String::new()
     };
 
-    let border_color = if explorer.filter_active {
-        Color::Cyan
+    let border_style = if explorer.filter_active {
+        theme::overlay_border_filter()
     } else {
-        Color::Blue
+        theme::overlay_border_explorer()
     };
 
     f.render_widget(
@@ -1502,7 +1485,7 @@ fn render_state_explorer(
                 Block::default()
                     .title(format!(" State: {}{} ", explorer.module_name, title_suffix))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
+                    .border_style(border_style),
             )
             .alignment(Alignment::Left),
         area,
@@ -1546,14 +1529,14 @@ fn render_resource_detail(
     // Separator spanning the full inner width.
     lines.push(Line::from(Span::styled(
         "  ".to_string() + &"─".repeat(sep_width),
-        Style::default().fg(Color::DarkGray),
+        theme::dim(),
     )));
 
     // Scroll-up indicator.
     if scroll > 0 {
         lines.push(Line::from(Span::styled(
             format!("  ↑ {} lines above", scroll),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
     }
 
@@ -1567,7 +1550,7 @@ fn render_resource_detail(
     if shown_end < total_lines {
         lines.push(Line::from(Span::styled(
             format!("  ↓ {} lines below", total_lines - shown_end),
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )));
     }
 
@@ -1575,9 +1558,9 @@ fn render_resource_detail(
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("[j/k] Scroll", Style::default().fg(Color::DarkGray)),
+        Span::styled("[j/k] Scroll", theme::dim()),
         Span::raw("   "),
-        Span::styled("[Esc] Back to list", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Esc] Back to list", theme::dim()),
     ]));
 
     f.render_widget(
@@ -1586,7 +1569,7 @@ fn render_resource_detail(
                 Block::default()
                     .title(format!(" State: {} ", module_name))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Blue)),
+                    .border_style(theme::overlay_border_explorer()),
             )
             .alignment(Alignment::Left),
         area,
@@ -1685,7 +1668,7 @@ fn json_string_end(s: &str, start: usize) -> Option<usize> {
 fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::{
         layout::{Alignment, Rect},
-        style::{Color, Modifier, Style},
+        style::{Modifier, Style},
         text::{Line, Span},
         widgets::{Block, Borders, Clear, Paragraph},
     };
@@ -1698,13 +1681,10 @@ fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect
         )),
         Line::from(Span::styled(
             "  Tab to the task list to view output.",
-            Style::default().fg(Color::DarkGray),
+            theme::dim(),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "  [any key] Dismiss",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("  [any key] Dismiss", theme::dim())),
     ];
 
     let height = (lines.len() + 2) as u16;
@@ -1720,7 +1700,7 @@ fn render_plan_queued_notice(f: &mut ratatui::Frame, area: ratatui::layout::Rect
                 Block::default()
                     .title(" Plan Queued ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)),
+                    .border_style(theme::overlay_border_success()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1783,7 +1763,7 @@ fn render_op_confirm(
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
-        Span::styled("[any] Cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled("[any] Cancel", theme::dim()),
     ]));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
@@ -1799,7 +1779,7 @@ fn render_op_confirm(
                 Block::default()
                     .title(kind.confirm_title())
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red)),
+                    .border_style(theme::overlay_border_danger()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1852,8 +1832,8 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
     for addr in &pt.queue {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("· ", Style::default().fg(Color::DarkGray)),
-            Span::styled(addr.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled("· ", theme::dim()),
+            Span::styled(addr.clone(), theme::dim()),
         ]));
     }
 
@@ -1870,7 +1850,7 @@ fn render_op_progress(f: &mut ratatui::Frame, area: ratatui::layout::Rect, pt: &
                 Block::default()
                     .title(pt.kind.progress_title())
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(theme::overlay_border_warn()),
             )
             .alignment(Alignment::Left),
         popup,
@@ -1886,7 +1866,11 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
     };
 
     let all_ok = result.entries.iter().all(|(_, ok)| *ok);
-    let border_color = if all_ok { Color::Green } else { Color::Red };
+    let border_style = if all_ok {
+        theme::overlay_border_success()
+    } else {
+        theme::overlay_border_danger()
+    };
 
     // Dynamic width: fit the longest address; 20 = "  [any key] Dismiss".
     let addr_width = result
@@ -1914,10 +1898,7 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  [any key] Dismiss",
-        Style::default().fg(Color::DarkGray),
-    )));
+    lines.push(Line::from(Span::styled("  [any key] Dismiss", theme::dim())));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
@@ -1932,7 +1913,7 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
                 Block::default()
                     .title(result.kind.result_title(all_ok))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
+                    .border_style(border_style),
             )
             .alignment(Alignment::Left),
         popup,

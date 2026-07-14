@@ -1,26 +1,13 @@
-#![allow(dead_code)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
 
 use crate::config::Config;
 use crate::discovery;
+use crate::engine::{EngineUpdate, TaskEngine, TaskSpec};
 use crate::lock::{parse_lock_from_output, read_lock_info};
 use crate::module::Module;
-use crate::plan_cache::PlanCache;
-use crate::runner::spawn_task;
 use crate::state::StateContent;
-use crate::task::{Task, TaskEvent, TaskEventReceiver, TaskEventSender, TaskStatus};
-
-/// Parameters for a task that is queued behind a running task on the same module.
-struct QueuedTask {
-    task_id: usize,
-    module_idx: usize,
-    command: String,
-    args: Vec<String>,
-    plan_output_path: Option<PathBuf>,
-}
+use crate::task::{Task, TaskStatus};
 
 /// Which pane currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +64,17 @@ impl ConfirmKind {
 pub struct PendingConfirm {
     pub kind: ConfirmKind,
     pub targets: Vec<ConfirmTarget>,
+}
+
+/// A single overlay modal. At most one is active at a time.
+pub enum Modal {
+    Help,
+    Confirm(PendingConfirm),
+    /// Task IDs staged for cancel confirmation. Always non-empty.
+    CancelTasks(Vec<usize>),
+    ClearTasks,
+    Reset,
+    Quit,
 }
 
 /// Detail view for a single resource instance — the drill-down from the list.
@@ -205,15 +203,78 @@ pub struct StateExplorer {
     pub op_result: Option<OpResult>,
     /// Set briefly after a targeted plan is queued; dismissed on any keypress.
     pub plan_queued_notice: bool,
+    /// Receiver for an in-flight background state load, if one is running.
+    /// `content` is `Loading` for as long as this is `Some`.
+    pub load_rx: Option<tokio::sync::oneshot::Receiver<StateContent>>,
 }
 
-/// Shared application state, used by both TUI and headless modes.
+impl StateExplorer {
+    /// Resources in the current content, if any were successfully loaded.
+    pub fn resources(&self) -> Option<&[crate::state::StateResource]> {
+        match &self.content {
+            StateContent::Resources(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Indices into `resources()` that match the current filter (all, if the
+    /// filter is empty).
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        let Some(resources) = self.resources() else {
+            return Vec::new();
+        };
+        if self.filter.is_empty() {
+            (0..resources.len()).collect()
+        } else {
+            let fl = self.filter.to_lowercase();
+            resources
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.address.to_lowercase().contains(&fl))
+                .map(|(i, _)| i)
+                .collect()
+        }
+    }
+
+    /// Number of resources currently visible under the filter.
+    pub fn filtered_count(&self) -> usize {
+        self.filtered_indices().len()
+    }
+
+    /// Real (unfiltered) resource index for the currently highlighted filtered row.
+    pub fn selected_real_index(&self) -> Option<usize> {
+        self.filtered_indices().get(self.selected).copied()
+    }
+
+    /// Addresses an operation should target: the multi-selected set
+    /// (unfiltered — this ignores the active filter) if non-empty, otherwise
+    /// just the currently highlighted filtered row.
+    pub fn target_addresses(&self) -> Vec<String> {
+        let Some(resources) = self.resources() else {
+            return Vec::new();
+        };
+        if !self.multi_select.is_empty() {
+            self.multi_select
+                .iter()
+                .filter_map(|&i| resources.get(i))
+                .map(|r| r.address.clone())
+                .collect()
+        } else {
+            self.selected_real_index()
+                .and_then(|i| resources.get(i))
+                .map(|r| r.address.clone())
+                .into_iter()
+                .collect()
+        }
+    }
+}
+
+/// TUI application state: module selection, UI modes, and a TaskEngine.
 pub struct App {
     pub config: Config,
     /// Root directory used for module discovery (re-used on refresh).
     pub root: PathBuf,
     pub modules: Vec<Module>,
-    pub tasks: Vec<Task>,
     pub selected_module: usize,
     /// ID of the currently highlighted task (`task.id`), stable across re-sorts.
     pub selected_task_id: Option<usize>,
@@ -236,18 +297,8 @@ pub struct App {
     pub filter_active: bool,
     /// Maximum directory depth to show (None = unlimited). Controlled by `[`/`]`.
     pub max_depth: Option<usize>,
-    pub show_help: bool,
-    /// Staged destructive command awaiting user confirmation.
-    pub pending_confirm: Option<PendingConfirm>,
-    /// Task IDs staged for cancel confirmation (`C` key). Empty = no dialog.
-    pub pending_cancel_task: Vec<usize>,
-    /// Set when the user requested clearing completed task history.
-    pub pending_clear_tasks: bool,
-    /// Set when the user pressed `R` to reset the session.
-    pub pending_reset: bool,
-    /// Set when the user pressed `q` while tasks were still running.
-    /// The TUI stays alive until all tasks finish (or user force-quits).
-    pub pending_quit: bool,
+    /// The single active overlay modal, if any. Mutually exclusive by construction.
+    pub modal: Option<Modal>,
     /// When true the output pane fills the whole terminal (mouse capture off).
     pub output_fullscreen: bool,
     /// When true, long lines in the output pane are soft-wrapped (fullscreen only).
@@ -260,30 +311,20 @@ pub struct App {
     pub dragging: Option<DragHandle>,
     /// Heights of scrollable panes from the last render pass (for page up/down).
     pub pane_heights: PaneHeights,
-    pub next_task_id: usize,
-    pub event_tx: TaskEventSender,
-    pub event_rx: TaskEventReceiver,
-    pub semaphore: Arc<Semaphore>,
-    /// In-session plan file cache; files live in a managed temp dir.
-    pub plan_cache: PlanCache,
+    /// Task execution engine: task list, plan cache, run/queue bookkeeping.
+    pub engine: TaskEngine,
     /// State explorer popup, open when `Some`.
     pub state_explorer: Option<StateExplorer>,
-    /// Modules that currently have a running task.
-    running_modules: HashSet<PathBuf>,
-    /// At most one pending task per module, waiting for the running task to
-    /// finish. A new enqueue replaces (and cancels) any existing entry.
-    module_queues: HashMap<PathBuf, QueuedTask>,
 }
 
 impl App {
     pub fn new(config: Config, root: PathBuf, modules: Vec<Module>) -> std::io::Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
         let parallelism = config.parallelism;
+        let engine = TaskEngine::new(config.binary.clone(), parallelism)?;
         Ok(Self {
             config,
             root,
             modules,
-            tasks: Vec::new(),
             selected_module: 0,
             selected_task_id: None,
             output_scroll: 0,
@@ -295,26 +336,15 @@ impl App {
             filter: String::new(),
             filter_active: false,
             max_depth: None,
-            show_help: false,
-            pending_confirm: None,
-            pending_cancel_task: Vec::new(),
-            pending_clear_tasks: false,
-            pending_reset: false,
-            pending_quit: false,
+            modal: None,
             output_fullscreen: false,
             output_wrap: false,
             h_split_col: None,
             v_split_row: None,
             dragging: None,
             pane_heights: PaneHeights::default(),
-            next_task_id: 0,
-            event_tx: tx,
-            event_rx: rx,
-            semaphore: Arc::new(Semaphore::new(parallelism)),
-            plan_cache: PlanCache::new()?,
+            engine,
             state_explorer: None,
-            running_modules: HashSet::new(),
-            module_queues: HashMap::new(),
         })
     }
 
@@ -385,16 +415,16 @@ impl App {
 
     /// Returns true if the selection actually moved.
     pub fn move_task_selection(&mut self, delta: i32) -> bool {
-        if self.tasks.is_empty() {
+        if self.engine.tasks.is_empty() {
             return false;
         }
         let sorted = self.sorted_task_display();
         let current_pos = self
             .selected_task_id
-            .and_then(|id| sorted.iter().position(|&vi| self.tasks[vi].id == id))
+            .and_then(|id| sorted.iter().position(|&vi| self.engine.tasks[vi].id == id))
             .unwrap_or(0) as i32;
         let new_pos = (current_pos + delta).clamp(0, sorted.len() as i32 - 1) as usize;
-        if let Some(id) = sorted.get(new_pos).map(|&vi| self.tasks[vi].id) {
+        if let Some(id) = sorted.get(new_pos).map(|&vi| self.engine.tasks[vi].id) {
             if Some(id) != self.selected_task_id {
                 self.set_selected_task(id);
                 return true;
@@ -425,15 +455,15 @@ impl App {
         self.output_scroll != before
     }
 
-    /// Returns indices into `self.tasks` in display order: most recently active first.
+    /// Returns indices into `self.engine.tasks` in display order: most recently active first.
     ///
     /// Sort key per task (descending):
     ///   finished_at > started_at > task.id (newest enqueued first for pending)
     pub fn sorted_task_display(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..self.tasks.len()).collect();
+        let mut indices: Vec<usize> = (0..self.engine.tasks.len()).collect();
         indices.sort_by(|&a, &b| {
-            let ta = &self.tasks[a];
-            let tb = &self.tasks[b];
+            let ta = &self.engine.tasks[a];
+            let tb = &self.engine.tasks[b];
             let time_a = ta.finished_at.or(ta.started_at);
             let time_b = tb.finished_at.or(tb.started_at);
             match (time_b, time_a) {
@@ -499,7 +529,7 @@ impl App {
             Focus::Tasks => {
                 let sorted = self.sorted_task_display();
                 if let Some(&vi) = sorted.first() {
-                    let id = self.tasks[vi].id;
+                    let id = self.engine.tasks[vi].id;
                     self.set_selected_task(id);
                 }
             }
@@ -520,7 +550,7 @@ impl App {
             Focus::Tasks => {
                 let sorted = self.sorted_task_display();
                 if let Some(&vi) = sorted.last() {
-                    let id = self.tasks[vi].id;
+                    let id = self.engine.tasks[vi].id;
                     self.set_selected_task(id);
                 }
             }
@@ -580,15 +610,14 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let first_new_idx = self.tasks.len();
 
         for idx in targets {
-            let plan_path = self.plan_cache.plan_path_for(&self.modules[idx].path);
+            let plan_path = self.engine.plan_cache.plan_path_for(&self.modules[idx].path);
             let args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
-            self.push_task(idx, "plan", args, Some(plan_path), None);
+            self.push_task_for(idx, "plan", args, Some(plan_path), None);
         }
 
-        self.maybe_auto_select_task(first_new_idx);
+        self.maybe_auto_select_task();
     }
 
     /// Enqueue a generic command (init, exec, etc.) for the current targets.
@@ -597,13 +626,12 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let first_new_idx = self.tasks.len();
 
         for idx in targets {
-            self.push_task(idx, command, extra_args.clone(), None, None);
+            self.push_task_for(idx, command, extra_args.clone(), None, None);
         }
 
-        self.maybe_auto_select_task(first_new_idx);
+        self.maybe_auto_select_task();
     }
 
     /// Enqueue apply for explicitly captured target indices (from a PendingConfirm).
@@ -616,13 +644,12 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let first_new_idx = self.tasks.len();
 
         for &idx in targets {
             let module_path = self.modules[idx].path.clone();
             // `take` removes the cache entry but does NOT delete the file.
             let (args, cleanup_plan_path) =
-                if let Some(plan_path) = self.plan_cache.take(&module_path) {
+                if let Some(plan_path) = self.engine.plan_cache.take(&module_path) {
                     (
                         vec![plan_path.to_string_lossy().into_owned()],
                         Some(plan_path),
@@ -630,10 +657,10 @@ impl App {
                 } else {
                     (vec!["-auto-approve".to_string()], None)
                 };
-            self.push_task(idx, "apply", args, None, cleanup_plan_path);
+            self.push_task_for(idx, "apply", args, None, cleanup_plan_path);
         }
 
-        self.maybe_auto_select_task(first_new_idx);
+        self.maybe_auto_select_task();
     }
 
     /// Enqueue destroy for explicitly captured target indices.
@@ -641,9 +668,8 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let first_new_idx = self.tasks.len();
         for &idx in targets {
-            self.push_task(
+            self.push_task_for(
                 idx,
                 "destroy",
                 vec!["-auto-approve".to_string()],
@@ -651,87 +677,36 @@ impl App {
                 None,
             );
         }
-        self.maybe_auto_select_task(first_new_idx);
+        self.maybe_auto_select_task();
     }
 
-    /// Low-level: push a task onto `self.tasks` and either start it immediately
-    /// (if the module is idle) or slot it as the single pending task for the
-    /// module (replacing and cancelling any previously-queued task).
-    fn push_task(
+    /// Bridge from module-index-based call sites to the `TaskEngine`, which
+    /// only knows about module path/name (not the `App`-level module list).
+    fn push_task_for(
         &mut self,
         module_idx: usize,
         command: &str,
         args: Vec<String>,
         plan_output_path: Option<PathBuf>,
         cleanup_plan_path: Option<PathBuf>,
-    ) {
+    ) -> usize {
         let module = &self.modules[module_idx];
-        let task_id = self.next_task_id;
-        self.next_task_id += 1;
-        let module_path = module.path.clone();
-
-        self.tasks.push(Task {
-            id: task_id,
-            module_path: module_path.clone(),
+        self.engine.push_task(TaskSpec {
+            module_path: module.path.clone(),
             module_name: module.display_name.clone(),
             command: command.to_string(),
-            args: args.clone(),
-            status: TaskStatus::Pending,
-            output_lines: Vec::new(),
-            started_at: None,
-            finished_at: None,
-            plan_output_path: plan_output_path.clone(),
+            args,
+            plan_output_path,
             cleanup_plan_path,
-            resource_counts: None,
-            cancel_handle: None,
-        });
-
-        if !self.running_modules.contains(&module_path) {
-            // Module is idle: start immediately.
-            self.running_modules.insert(module_path.clone());
-            let handle = spawn_task(
-                task_id,
-                module_path,
-                module.display_name.clone(),
-                self.config.binary.clone(),
-                command.to_string(),
-                args,
-                self.event_tx.clone(),
-                self.semaphore.clone(),
-            );
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                t.cancel_handle = Some(handle);
-            }
-        } else {
-            // Module is busy: slot as the single pending task, cancelling any
-            // previously-queued task that hasn't started yet.
-            if let Some(old) = self.module_queues.insert(
-                module_path,
-                QueuedTask {
-                    task_id,
-                    module_idx,
-                    command: command.to_string(),
-                    args,
-                    plan_output_path,
-                },
-            ) {
-                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == old.task_id) {
-                    t.status = TaskStatus::Cancelled;
-                    t.finished_at = Some(std::time::Instant::now());
-                    if let Some(path) = t.cleanup_plan_path.take() {
-                        PlanCache::remove_file(&path);
-                    }
-                }
-            }
-        }
+        })
     }
 
-    fn maybe_auto_select_task(&mut self, _first_new_idx: usize) {
+    fn maybe_auto_select_task(&mut self) {
         // Always jump to the top of the sorted task list so the user sees the
         // most recently submitted tasks immediately after enqueueing.
         let sorted = self.sorted_task_display();
         if let Some(&vi) = sorted.first() {
-            let id = self.tasks[vi].id;
+            let id = self.engine.tasks[vi].id;
             self.set_selected_task(id);
         }
     }
@@ -745,32 +720,19 @@ impl App {
     /// the module selection. Stale plan-task selections stage nothing.
     /// Otherwise falls back to the normal module selection.
     pub fn request_apply_confirm(&mut self) {
-        let confirm_targets = if self.focus == Focus::Tasks {
-            self.apply_targets_from_plan_tasks()
-        } else {
-            None
+        if self.focus == Focus::Tasks {
+            if let Some(confirm_targets) = self.apply_targets_from_plan_tasks() {
+                if confirm_targets.is_empty() {
+                    return;
+                }
+                self.modal = Some(Modal::Confirm(PendingConfirm {
+                    kind: ConfirmKind::Apply,
+                    targets: confirm_targets,
+                }));
+                return;
+            }
         }
-        .unwrap_or_else(|| {
-            self.target_indices()
-                .iter()
-                .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
-                .map(|(i, m)| ConfirmTarget {
-                    module_idx: i,
-                    module_name: m.display_name.clone(),
-                    plan_age: self.plan_cache.get(&m.path).map(|e| e.age_str()),
-                    lock_id: None,
-                    lock_who: None,
-                })
-                .collect()
-        });
-
-        if confirm_targets.is_empty() {
-            return;
-        }
-        self.pending_confirm = Some(PendingConfirm {
-            kind: ConfirmKind::Apply,
-            targets: confirm_targets,
-        });
+        self.stage_module_confirm(ConfirmKind::Apply);
     }
 
     /// Derive apply `ConfirmTarget`s from the currently selected plan task(s)
@@ -790,7 +752,7 @@ impl App {
 
         let tasks: Vec<&Task> = task_ids
             .iter()
-            .filter_map(|&id| self.tasks.iter().find(|t| t.id == id))
+            .filter_map(|&id| self.engine.tasks.iter().find(|t| t.id == id))
             .collect();
 
         if tasks.is_empty() {
@@ -830,7 +792,7 @@ impl App {
     }
 
     pub fn ready_plan_for_task(&self, task: &Task) -> Option<&crate::plan_cache::PlanEntry> {
-        let plan = self.plan_cache.get(&task.module_path)?;
+        let plan = self.engine.plan_cache.get(&task.module_path)?;
         if task.command == "plan"
             && task.status == TaskStatus::Success
             && task.plan_output_path.as_ref() == Some(&plan.path)
@@ -844,6 +806,49 @@ impl App {
 
     /// Stage `destroy` for confirmation.
     pub fn request_destroy_confirm(&mut self) {
+        self.stage_module_confirm(ConfirmKind::Destroy);
+    }
+
+    /// Build a `ConfirmTarget` for `module_idx` under `kind`, or `None` to skip
+    /// the module (only possible for `ForceUnlock`, when no lock is detected).
+    fn annotate_confirm_target(
+        &self,
+        kind: &ConfirmKind,
+        idx: usize,
+        m: &Module,
+    ) -> Option<ConfirmTarget> {
+        match kind {
+            ConfirmKind::Apply => Some(ConfirmTarget {
+                module_idx: idx,
+                module_name: m.display_name.clone(),
+                plan_age: self.engine.plan_cache.get(&m.path).map(|e| e.age_str()),
+                lock_id: None,
+                lock_who: None,
+            }),
+            ConfirmKind::Destroy | ConfirmKind::InitUpgrade => Some(ConfirmTarget {
+                module_idx: idx,
+                module_name: m.display_name.clone(),
+                plan_age: None,
+                lock_id: None,
+                lock_who: None,
+            }),
+            ConfirmKind::ForceUnlock => {
+                let lock = read_lock_info(&m.path).or_else(|| self.detect_lock_from_tasks(idx))?;
+                Some(ConfirmTarget {
+                    module_idx: idx,
+                    module_name: m.display_name.clone(),
+                    plan_age: None,
+                    lock_id: Some(lock.id),
+                    lock_who: Some(lock.who),
+                })
+            }
+        }
+    }
+
+    /// Stage `kind` for confirmation against the current module selection
+    /// (`target_indices()`), annotating each target via `annotate_confirm_target`.
+    /// Stages nothing if the selection or the annotated target list is empty.
+    fn stage_module_confirm(&mut self, kind: ConfirmKind) {
         let targets = self.target_indices();
         if targets.is_empty() {
             return;
@@ -852,25 +857,23 @@ impl App {
         let confirm_targets: Vec<ConfirmTarget> = targets
             .iter()
             .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
-            .map(|(i, m)| ConfirmTarget {
-                module_idx: i,
-                module_name: m.display_name.clone(),
-                plan_age: None,
-                lock_id: None,
-                lock_who: None,
-            })
+            .filter_map(|(i, m)| self.annotate_confirm_target(&kind, i, m))
             .collect();
 
-        self.pending_confirm = Some(PendingConfirm {
-            kind: ConfirmKind::Destroy,
+        if confirm_targets.is_empty() {
+            return;
+        }
+
+        self.modal = Some(Modal::Confirm(PendingConfirm {
+            kind,
             targets: confirm_targets,
-        });
+        }));
     }
 
     /// Execute the confirmed command. Call after user presses `y`.
     pub fn confirm_execute(&mut self) {
-        if let Some(confirm) = self.pending_confirm.take() {
-            match confirm.kind {
+        match self.modal.take() {
+            Some(Modal::Confirm(confirm)) => match confirm.kind {
                 ConfirmKind::Apply => {
                     let indices: Vec<usize> =
                         confirm.targets.iter().map(|t| t.module_idx).collect();
@@ -894,44 +897,24 @@ impl App {
                         .collect();
                     self.enqueue_force_unlock_for(&pairs);
                 }
-            }
+            },
+            other => self.modal = other,
         }
     }
 
     /// Stage `init -upgrade` for confirmation.
     pub fn request_init_upgrade_confirm(&mut self) {
-        let targets = self.target_indices();
-        if targets.is_empty() {
-            return;
-        }
-
-        let confirm_targets: Vec<ConfirmTarget> = targets
-            .iter()
-            .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
-            .map(|(i, m)| ConfirmTarget {
-                module_idx: i,
-                module_name: m.display_name.clone(),
-                plan_age: None,
-                lock_id: None,
-                lock_who: None,
-            })
-            .collect();
-
-        self.pending_confirm = Some(PendingConfirm {
-            kind: ConfirmKind::InitUpgrade,
-            targets: confirm_targets,
-        });
+        self.stage_module_confirm(ConfirmKind::InitUpgrade);
     }
 
     fn enqueue_init_upgrade_for(&mut self, targets: &[usize]) {
         if targets.is_empty() {
             return;
         }
-        let first_new_idx = self.tasks.len();
         for &idx in targets {
-            self.push_task(idx, "init", vec!["-upgrade".to_string()], None, None);
+            self.push_task_for(idx, "init", vec!["-upgrade".to_string()], None, None);
         }
-        self.maybe_auto_select_task(first_new_idx);
+        self.maybe_auto_select_task();
     }
 
     /// Detect a lock for a module by parsing the output of its most recent
@@ -942,7 +925,8 @@ impl App {
     /// lock acquisition fails.
     fn detect_lock_from_tasks(&self, module_idx: usize) -> Option<crate::lock::LockInfo> {
         let module_path = &self.modules[module_idx].path;
-        self.tasks
+        self.engine
+            .tasks
             .iter()
             .filter(|t| &t.module_path == module_path && t.status.is_terminal())
             .filter_map(|t| {
@@ -960,34 +944,7 @@ impl App {
     /// (works for any backend — S3, remote, etc.).
     /// If no lock is detected for any target, returns silently.
     pub fn request_force_unlock_confirm(&mut self) {
-        let targets = self.target_indices();
-        if targets.is_empty() {
-            return;
-        }
-
-        let confirm_targets: Vec<ConfirmTarget> = targets
-            .iter()
-            .filter_map(|&i| self.modules.get(i).map(|m| (i, m)))
-            .filter_map(|(i, m)| {
-                let lock = read_lock_info(&m.path).or_else(|| self.detect_lock_from_tasks(i))?;
-                Some(ConfirmTarget {
-                    module_idx: i,
-                    module_name: m.display_name.clone(),
-                    plan_age: None,
-                    lock_id: Some(lock.id),
-                    lock_who: Some(lock.who),
-                })
-            })
-            .collect();
-
-        if confirm_targets.is_empty() {
-            return;
-        }
-
-        self.pending_confirm = Some(PendingConfirm {
-            kind: ConfirmKind::ForceUnlock,
-            targets: confirm_targets,
-        });
+        self.stage_module_confirm(ConfirmKind::ForceUnlock);
     }
 
     /// Enqueue `force-unlock -force <lock_id>` for each (module_idx, lock_id) pair.
@@ -995,9 +952,8 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let first_new_idx = self.tasks.len();
         for (idx, lock_id) in targets {
-            self.push_task(
+            self.push_task_for(
                 *idx,
                 "force-unlock",
                 vec!["-force".to_string(), lock_id.clone()],
@@ -1005,11 +961,11 @@ impl App {
                 None,
             );
         }
-        self.maybe_auto_select_task(first_new_idx);
+        self.maybe_auto_select_task();
     }
 
     pub fn cancel_confirm(&mut self) {
-        self.pending_confirm = None;
+        self.modal = None;
     }
 
     /// Stage tasks for cancel confirmation.
@@ -1026,7 +982,8 @@ impl App {
         let active: Vec<usize> = candidates
             .into_iter()
             .filter(|&id| {
-                self.tasks
+                self.engine
+                    .tasks
                     .iter()
                     .find(|t| t.id == id)
                     .map(|t| !t.status.is_terminal())
@@ -1035,21 +992,27 @@ impl App {
             .collect();
 
         if !active.is_empty() {
-            self.pending_cancel_task = active;
+            self.modal = Some(Modal::CancelTasks(active));
         }
     }
 
     /// Execute cancellation for all staged task IDs, then clear staging + multi-select.
     pub fn cancel_staged_tasks(&mut self) {
-        let ids = std::mem::take(&mut self.pending_cancel_task);
+        let Some(Modal::CancelTasks(ids)) = self.modal.take() else {
+            return;
+        };
         for id in ids {
-            self.cancel_task(id);
+            self.engine.cancel_task(id);
         }
         self.task_multi_select.clear();
     }
 
     pub fn completed_task_count(&self) -> usize {
-        self.tasks.iter().filter(|t| t.status.is_terminal()).count()
+        self.engine
+            .tasks
+            .iter()
+            .filter(|t| t.status.is_terminal())
+            .count()
     }
 
     /// Stage clearing completed task history for confirmation.
@@ -1058,24 +1021,22 @@ impl App {
     /// to be tracked by the app.
     pub fn request_clear_tasks_confirm(&mut self) {
         if self.completed_task_count() > 0 {
-            self.pending_clear_tasks = true;
+            self.modal = Some(Modal::ClearTasks);
         }
     }
 
     /// Clear terminal tasks from the task pane, preserving active tasks.
     pub fn clear_completed_tasks(&mut self) {
-        self.pending_clear_tasks = false;
-        if self.tasks.is_empty() {
+        self.modal = None;
+        if self.engine.tasks.is_empty() {
             return;
         }
 
         let previous_selection = self.selected_task_id;
-        self.tasks.retain(|t| !t.status.is_terminal());
+        self.engine.tasks.retain(|t| !t.status.is_terminal());
 
-        let remaining_ids: HashSet<usize> = self.tasks.iter().map(|t| t.id).collect();
+        let remaining_ids: HashSet<usize> = self.engine.tasks.iter().map(|t| t.id).collect();
         self.task_multi_select
-            .retain(|id| remaining_ids.contains(id));
-        self.pending_cancel_task
             .retain(|id| remaining_ids.contains(id));
 
         let selection_still_exists = previous_selection
@@ -1086,26 +1047,32 @@ impl App {
             self.selected_task_id = self
                 .sorted_task_display()
                 .first()
-                .map(|&vi| self.tasks[vi].id);
+                .map(|&vi| self.engine.tasks[vi].id);
             self.output_scroll = 0;
         }
     }
 
     /// Stage a session reset for confirmation.
     pub fn request_reset_confirm(&mut self) {
-        self.pending_reset = true;
+        self.modal = Some(Modal::Reset);
     }
 
     /// Counts of items the next `reset_session` call will clear.
     /// Returns (cached plans, queued tasks, finished tasks).
     pub fn reset_summary(&self) -> (usize, usize, usize) {
         let queued = self
+            .engine
             .tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
             .count();
-        let finished = self.tasks.iter().filter(|t| t.status.is_terminal()).count();
-        (self.plan_cache.entry_count(), queued, finished)
+        let finished = self
+            .engine
+            .tasks
+            .iter()
+            .filter(|t| t.status.is_terminal())
+            .count();
+        (self.engine.plan_cache.entry_count(), queued, finished)
     }
 
     /// Reset session state to a fresh-launch feel, preserving only tasks that
@@ -1114,18 +1081,19 @@ impl App {
     /// dismisses any open overlays.
     pub fn reset_session(&mut self) {
         let queued_ids: Vec<usize> = self
+            .engine
             .tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
             .map(|t| t.id)
             .collect();
         for id in queued_ids {
-            self.cancel_task(id);
+            self.engine.cancel_task(id);
         }
 
-        self.tasks.retain(|t| !t.status.is_terminal());
+        self.engine.tasks.retain(|t| !t.status.is_terminal());
 
-        self.plan_cache.clear();
+        self.engine.plan_cache.clear();
 
         self.multi_select.clear();
         self.multi_select_anchor = None;
@@ -1138,82 +1106,26 @@ impl App {
         self.selected_task_id = None;
         self.output_scroll = 0;
 
-        self.pending_confirm = None;
-        self.pending_cancel_task.clear();
-        self.pending_clear_tasks = false;
-        self.pending_reset = false;
-        self.pending_quit = false;
-        self.show_help = false;
+        self.modal = None;
 
         self.focus = Focus::Modules;
-    }
-
-    /// Cancel a single task by ID.
-    ///
-    /// - Queued (not yet spawned): removed from the module queue immediately.
-    /// - Pending/Running (spawned, first call): sends SIGINT for graceful
-    ///   shutdown; status becomes `Cancelling`. Module cleanup happens when
-    ///   the process actually exits (via the `Finished` event in drain_events).
-    /// - Cancelling (spawned, second call): sends SIGKILL immediately.
-    fn cancel_task(&mut self, task_id: usize) {
-        let (status, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
-            Some(t) => (t.status.clone(), t.module_path.clone()),
-            None => return,
-        };
-
-        if status.is_terminal() {
-            return;
-        }
-
-        // Case 1: task is queued (not yet spawned).
-        if let Some(queued) = self.module_queues.get(&module_path) {
-            if queued.task_id == task_id {
-                self.module_queues.remove(&module_path);
-                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                    t.status = TaskStatus::Cancelled;
-                    t.finished_at = Some(std::time::Instant::now());
-                    if let Some(path) = t.cleanup_plan_path.take() {
-                        PlanCache::remove_file(&path);
-                    }
-                }
-                return;
-            }
-        }
-
-        // Case 2: already cancelling — escalate to SIGKILL.
-        if status == TaskStatus::Cancelling {
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                if let Some(handle) = t.cancel_handle.as_mut() {
-                    handle.force_kill();
-                }
-            }
-            return;
-        }
-
-        // Case 3: spawned and running — send SIGINT, enter Cancelling state.
-        // Module queue cleanup is deferred until the Finished event arrives.
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-            if let Some(handle) = t.cancel_handle.as_mut() {
-                handle.cancel();
-            }
-            t.status = TaskStatus::Cancelling;
-        }
     }
 
     // ── State explorer ───────────────────────────────────────────────────────
 
     /// Open the state explorer for the currently selected (or focused) module.
+    /// State is loaded in the background (see `spawn_state_load`); the
+    /// explorer opens immediately showing `StateContent::Loading`.
     pub fn open_state_explorer(&mut self) {
         let visible = self.visible_module_indices();
         let Some(&idx) = visible.get(self.selected_module) else {
             return;
         };
         let module = &self.modules[idx];
-        let content = crate::state::read_state(&module.path, &self.config.binary);
         self.state_explorer = Some(StateExplorer {
             module_idx: idx,
             module_name: module.display_name.clone(),
-            content,
+            content: StateContent::Loading,
             selected: 0,
             filter: String::new(),
             filter_active: false,
@@ -1224,7 +1136,9 @@ impl App {
             pending_op: None,
             op_result: None,
             plan_queued_notice: false,
+            load_rx: None,
         });
+        self.spawn_state_load();
     }
 
     pub fn close_state_explorer(&mut self) {
@@ -1237,14 +1151,11 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        if let StateContent::Resources(ref resources) = explorer.content {
-            let count = explorer_filtered_count(resources, &explorer.filter);
-            if count == 0 {
-                return;
-            }
-            explorer.selected =
-                (explorer.selected as i32 + delta).clamp(0, count as i32 - 1) as usize;
+        let count = explorer.filtered_count();
+        if count == 0 {
+            return;
         }
+        explorer.selected = (explorer.selected as i32 + delta).clamp(0, count as i32 - 1) as usize;
     }
 
     pub fn state_explorer_go_first(&mut self) {
@@ -1255,11 +1166,9 @@ impl App {
 
     pub fn state_explorer_go_last(&mut self) {
         if let Some(explorer) = &mut self.state_explorer {
-            if let StateContent::Resources(ref resources) = explorer.content {
-                let count = explorer_filtered_count(resources, &explorer.filter);
-                if count > 0 {
-                    explorer.selected = count - 1;
-                }
+            let count = explorer.filtered_count();
+            if count > 0 {
+                explorer.selected = count - 1;
             }
         }
     }
@@ -1306,13 +1215,11 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        if let StateContent::Resources(ref resources) = explorer.content {
-            let count = explorer_filtered_count(resources, &explorer.filter);
-            if count == 0 {
-                explorer.selected = 0;
-            } else if explorer.selected >= count {
-                explorer.selected = count - 1;
-            }
+        let count = explorer.filtered_count();
+        if count == 0 {
+            explorer.selected = 0;
+        } else if explorer.selected >= count {
+            explorer.selected = count - 1;
         }
     }
 
@@ -1323,21 +1230,9 @@ impl App {
         // Gather data under an immutable borrow first.
         let result: Option<(String, Vec<String>)> = (|| {
             let explorer = self.state_explorer.as_ref()?;
-            let StateContent::Resources(ref resources) = explorer.content else {
-                return None;
-            };
-
-            let fl = explorer.filter.to_lowercase();
-            let filtered: Vec<&crate::state::StateResource> = if explorer.filter.is_empty() {
-                resources.iter().collect()
-            } else {
-                resources
-                    .iter()
-                    .filter(|r| r.address.to_lowercase().contains(&fl))
-                    .collect()
-            };
-
-            let resource = filtered.get(explorer.selected)?;
+            let resources = explorer.resources()?;
+            let real_idx = explorer.selected_real_index()?;
+            let resource = resources.get(real_idx)?;
             let address = resource.address.clone();
             let json = serde_json::to_string_pretty(&resource.instance)
                 .unwrap_or_else(|_| "{}".to_string());
@@ -1399,22 +1294,9 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        let StateContent::Resources(ref resources) = explorer.content else {
+        let Some(real_idx) = explorer.selected_real_index() else {
             return;
         };
-
-        let fl = explorer.filter.to_lowercase();
-        let real_idx = if explorer.filter.is_empty() {
-            Some(explorer.selected)
-        } else {
-            resources
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.address.to_lowercase().contains(&fl))
-                .nth(explorer.selected)
-                .map(|(i, _)| i)
-        };
-        let Some(real_idx) = real_idx else { return };
 
         if let Some(pos) = explorer.multi_select.iter().position(|&i| i == real_idx) {
             explorer.multi_select.remove(pos);
@@ -1432,54 +1314,26 @@ impl App {
     /// Enqueue a targeted plan for the selected (or multi-selected) resources.
     /// Runs as a normal task (appears in the task list). No confirmation needed.
     pub fn enqueue_targeted_plan(&mut self) {
-        let (module_idx, targets) = {
-            let Some(explorer) = self.state_explorer.as_ref() else {
-                return;
-            };
-            let StateContent::Resources(ref resources) = explorer.content else {
-                return;
-            };
-
-            let fl = explorer.filter.to_lowercase();
-            let targets: Vec<String> = if explorer.multi_select.is_empty() {
-                let filtered: Vec<&crate::state::StateResource> = if explorer.filter.is_empty() {
-                    resources.iter().collect()
-                } else {
-                    resources
-                        .iter()
-                        .filter(|r| r.address.to_lowercase().contains(&fl))
-                        .collect()
-                };
-                match filtered.get(explorer.selected) {
-                    Some(r) => vec![r.address.clone()],
-                    None => return,
-                }
-            } else {
-                explorer
-                    .multi_select
-                    .iter()
-                    .filter_map(|&i| resources.get(i))
-                    .map(|r| r.address.clone())
-                    .collect()
-            };
-
-            (explorer.module_idx, targets)
+        let Some(explorer) = self.state_explorer.as_ref() else {
+            return;
         };
+        let module_idx = explorer.module_idx;
+        let targets = explorer.target_addresses();
 
         if targets.is_empty() {
             return;
         }
 
         let plan_path = self
+            .engine
             .plan_cache
             .plan_path_for(&self.modules[module_idx].path);
         let mut args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
         for addr in &targets {
             args.push(format!("-target={}", addr));
         }
-        let first_new_idx = self.tasks.len();
-        self.push_task(module_idx, "plan", args, Some(plan_path), None);
-        self.maybe_auto_select_task(first_new_idx);
+        self.push_task_for(module_idx, "plan", args, Some(plan_path), None);
+        self.maybe_auto_select_task();
         if let Some(explorer) = self.state_explorer.as_mut() {
             explorer.plan_queued_notice = true;
         }
@@ -1490,36 +1344,7 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        let StateContent::Resources(ref resources) = explorer.content else {
-            return;
-        };
-        if resources.is_empty() {
-            return;
-        }
-
-        let targets: Vec<String> = if explorer.multi_select.is_empty() {
-            let fl = explorer.filter.to_lowercase();
-            let filtered: Vec<&crate::state::StateResource> = if explorer.filter.is_empty() {
-                resources.iter().collect()
-            } else {
-                resources
-                    .iter()
-                    .filter(|r| r.address.to_lowercase().contains(&fl))
-                    .collect()
-            };
-            match filtered.get(explorer.selected) {
-                Some(r) => vec![r.address.clone()],
-                None => return,
-            }
-        } else {
-            explorer
-                .multi_select
-                .iter()
-                .filter_map(|&i| resources.get(i))
-                .map(|r| r.address.clone())
-                .collect()
-        };
-
+        let targets = explorer.target_addresses();
         if targets.is_empty() {
             return;
         }
@@ -1558,8 +1383,7 @@ impl App {
                 let remaining = targets;
                 let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
                 args.push(first.clone());
-                let task_id = self.next_task_id;
-                self.push_task(module_idx, kind.command(), args, None, None);
+                let task_id = self.push_task_for(module_idx, kind.command(), args, None, None);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {
                         kind,
@@ -1582,8 +1406,7 @@ impl App {
                 } else {
                     format!("{} targeted resources", n)
                 };
-                let task_id = self.next_task_id;
-                self.push_task(module_idx, "destroy", args, None, None);
+                let task_id = self.push_task_for(module_idx, "destroy", args, None, None);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {
                         kind,
@@ -1598,56 +1421,80 @@ impl App {
     }
 
     /// Called from drain_events when a task finishes: chains the next op or
-    /// moves to the result view.
+    /// moves to the result view. No-op if there's no pending op, or the
+    /// finished task isn't the one it's currently waiting on.
     fn check_op_completion(&mut self, task_id: usize, success: bool) {
-        let (module_idx, kind) = {
-            let Some(explorer) = self.state_explorer.as_ref() else {
-                return;
-            };
-            let Some(pt) = explorer.pending_op.as_ref() else {
-                return;
-            };
-            let Some((rid, _)) = pt.running.as_ref() else {
-                return;
-            };
-            if *rid != task_id {
-                return;
-            }
-            (explorer.module_idx, pt.kind)
-        };
+        // Phase 1: mutate the PendingOp (record the completion, dequeue the
+        // next address if any) under one scoped borrow, then decide what to
+        // do next without holding any borrow of `self`.
+        enum NextAction {
+            RunNext {
+                module_idx: usize,
+                kind: ExplorerOpKind,
+                addr: String,
+            },
+            Finished {
+                kind: ExplorerOpKind,
+            },
+        }
 
-        let next_addr = {
-            let explorer = self.state_explorer.as_mut().unwrap();
-            let pt = explorer.pending_op.as_mut().unwrap();
-            let (_, addr) = pt.running.take().unwrap();
+        let next_action: Option<NextAction> = (|| {
+            let explorer = self.state_explorer.as_mut()?;
+            let module_idx = explorer.module_idx;
+            let pt = explorer.pending_op.as_mut()?;
+            let (rid, addr) = pt.running.take()?;
+            if rid != task_id {
+                // Not the task we're waiting on — put it back untouched.
+                pt.running = Some((rid, addr));
+                return None;
+            }
             pt.done.push((addr, success));
+            let kind = pt.kind;
             if pt.queue.is_empty() {
-                None
+                Some(NextAction::Finished { kind })
             } else {
-                Some(pt.queue.remove(0))
-            }
-        };
-
-        if let Some(next) = next_addr {
-            let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
-            args.push(next.clone());
-            let new_task_id = self.next_task_id;
-            self.push_task(module_idx, kind.command(), args, None, None);
-            let explorer = self.state_explorer.as_mut().unwrap();
-            let pt = explorer.pending_op.as_mut().unwrap();
-            pt.running = Some((new_task_id, next));
-        } else {
-            {
-                let explorer = self.state_explorer.as_mut().unwrap();
-                let done = explorer.pending_op.take().unwrap().done;
-                explorer.op_result = Some(OpResult {
+                let next_addr = pt.queue.remove(0);
+                Some(NextAction::RunNext {
+                    module_idx,
                     kind,
-                    entries: done,
-                });
+                    addr: next_addr,
+                })
             }
-            // Refresh the resource list so tainted/removed resources reflect
-            // their new status when the result popup is dismissed.
-            self.refresh_state_explorer();
+        })();
+
+        // Phase 2: act on the decision. `push_task_for` needs `&mut self`,
+        // so this happens after the scoped borrow above has ended.
+        match next_action {
+            Some(NextAction::RunNext {
+                module_idx,
+                kind,
+                addr,
+            }) => {
+                let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
+                args.push(addr.clone());
+                let new_task_id = self.push_task_for(module_idx, kind.command(), args, None, None);
+                if let Some(pt) = self
+                    .state_explorer
+                    .as_mut()
+                    .and_then(|e| e.pending_op.as_mut())
+                {
+                    pt.running = Some((new_task_id, addr));
+                }
+            }
+            Some(NextAction::Finished { kind }) => {
+                if let Some(explorer) = self.state_explorer.as_mut() {
+                    if let Some(pending) = explorer.pending_op.take() {
+                        explorer.op_result = Some(OpResult {
+                            kind,
+                            entries: pending.done,
+                        });
+                    }
+                }
+                // Refresh the resource list so tainted/removed resources reflect
+                // their new status when the result popup is dismissed.
+                self.refresh_state_explorer();
+            }
+            None => {}
         }
     }
 
@@ -1657,158 +1504,97 @@ impl App {
         }
     }
 
-    /// Re-read the state file for the current explorer module and update the
-    /// resource list in-place. Clamps selection and clears multi-select.
+    /// Re-read the state file for the current explorer module in the
+    /// background and update the resource list once it lands. The view shows
+    /// a loading spinner while the read is in flight (unlike the old
+    /// synchronous refresh, which froze the UI thread for remote backends).
     pub fn refresh_state_explorer(&mut self) {
-        let module_path = {
-            let Some(explorer) = self.state_explorer.as_ref() else {
-                return;
-            };
-            self.modules[explorer.module_idx].path.clone()
+        self.spawn_state_load();
+    }
+
+    /// Kick off a background state read for the current explorer module, if
+    /// one isn't already in flight. Sets `content = Loading` immediately;
+    /// the result is installed by `poll_state_load` once it arrives.
+    fn spawn_state_load(&mut self) {
+        let Some(explorer) = self.state_explorer.as_mut() else {
+            return;
+        };
+        if explorer.load_rx.is_some() {
+            // A load is already in flight — don't start a second one.
+            return;
+        }
+        let Some(module) = self.modules.get(explorer.module_idx) else {
+            return;
+        };
+        let path = module.path.clone();
+        let binary = self.config.binary.clone();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(crate::state::read_state(&path, &binary));
+        });
+
+        explorer.content = StateContent::Loading;
+        explorer.load_rx = Some(rx);
+    }
+
+    /// Poll for a completed background state load, installing the result and
+    /// clamping selection if one has landed. Called at the end of `drain_events`.
+    fn poll_state_load(&mut self) {
+        let Some(explorer) = self.state_explorer.as_mut() else {
+            return;
+        };
+        let Some(rx) = explorer.load_rx.as_mut() else {
+            return;
         };
 
-        let content = crate::state::read_state(&module_path, &self.config.binary);
-
-        if let Some(explorer) = self.state_explorer.as_mut() {
-            explorer.content = content;
-            explorer.multi_select.clear();
-            let count = if let StateContent::Resources(ref r) = explorer.content {
-                explorer_filtered_count(r, &explorer.filter)
-            } else {
-                0
-            };
-            if count == 0 {
-                explorer.selected = 0;
-            } else if explorer.selected >= count {
-                explorer.selected = count - 1;
+        let content = match rx.try_recv() {
+            Ok(content) => content,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                StateContent::Error("state load task failed".to_string())
             }
+        };
+
+        explorer.load_rx = None;
+        explorer.content = content;
+        explorer.multi_select.clear();
+        let count = explorer.filtered_count();
+        if count == 0 {
+            explorer.selected = 0;
+        } else if explorer.selected >= count {
+            explorer.selected = count - 1;
         }
     }
 
     // ── Event processing ─────────────────────────────────────────────────────
 
     /// Drain pending task events (non-blocking).
+    ///
+    /// Bumps the spinner tick, applies every engine update to `self.engine.tasks`
+    /// (already done inside the engine), and reacts to `Finished` updates by
+    /// chaining any pending state-explorer operation. Also polls for a
+    /// completed background state load (see `spawn_state_load`).
     pub fn drain_events(&mut self) {
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
-        while let Ok(event) = self.event_rx.try_recv() {
-            match event {
-                TaskEvent::Started { task_id } => {
-                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                        task.status = TaskStatus::Running;
-                        task.started_at = Some(std::time::Instant::now());
-                    }
-                }
-                TaskEvent::Line { task_id, line } => {
-                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                        if matches!(task.command.as_str(), "plan" | "apply" | "destroy") {
-                            if let Some(counts) = crate::task::parse_counts_from_line(&line) {
-                                task.resource_counts = Some(counts);
-                            }
-                        }
-                        task.output_lines.push(line);
-                    }
-                }
-                TaskEvent::Finished { task_id, success } => {
-                    // Skip stale Finished events for tasks that were already
-                    // fully cancelled (e.g. task completed just before SIGINT).
-                    // Cancelling tasks are NOT skipped — we need the event to
-                    // transition them to Cancelled and clean up the module queue.
-                    let already_cancelled = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.id == task_id)
-                        .map(|t| t.status == TaskStatus::Cancelled)
-                        .unwrap_or(false);
-                    if already_cancelled {
-                        continue;
-                    }
-
-                    let is_cancelling = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.id == task_id)
-                        .map(|t| t.status == TaskStatus::Cancelling)
-                        .unwrap_or(false);
-
-                    // Collect plan info and module path before the mutable borrow below.
-                    let (plan_info, module_path) = match self.tasks.iter().find(|t| t.id == task_id)
-                    {
-                        Some(t) => {
-                            let plan = if success && !is_cancelling {
-                                t.plan_output_path
-                                    .as_ref()
-                                    .map(|p| (t.module_path.clone(), p.clone(), t.id))
-                            } else {
-                                None
-                            };
-                            (plan, Some(t.module_path.clone()))
-                        }
-                        None => (None, None),
-                    };
-
-                    let mut cleanup_plan_path = None;
-                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                        cleanup_plan_path = task.cleanup_plan_path.take();
-                        task.cancel_handle = None;
-                        task.status = if is_cancelling {
-                            TaskStatus::Cancelled
-                        } else if success {
-                            TaskStatus::Success
-                        } else {
-                            TaskStatus::Failed
-                        };
-                        task.finished_at = Some(std::time::Instant::now());
-                    }
-
-                    // Register the plan file now that the mutable borrow is released.
-                    if let Some((mp, plan_path, plan_task_id)) = plan_info {
-                        self.plan_cache.register(mp, plan_path, plan_task_id);
-                    }
-
-                    if let Some(path) = cleanup_plan_path {
-                        PlanCache::remove_file(&path);
-                    }
-
-                    // Dequeue the next task for this module, or mark it idle.
-                    if let Some(path) = module_path {
-                        if let Some(queued) = self.module_queues.remove(&path) {
-                            let module = &self.modules[queued.module_idx];
-                            let handle = spawn_task(
-                                queued.task_id,
-                                path.clone(),
-                                module.display_name.clone(),
-                                self.config.binary.clone(),
-                                queued.command,
-                                queued.args,
-                                self.event_tx.clone(),
-                                self.semaphore.clone(),
-                            );
-                            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == queued.task_id)
-                            {
-                                t.cancel_handle = Some(handle);
-                            }
-                        } else {
-                            self.running_modules.remove(&path);
-                        }
-                    }
-
-                    // Chain the next op task if one is waiting.
-                    self.check_op_completion(task_id, success);
-                }
+        for update in self.engine.drain_events() {
+            if let EngineUpdate::Finished { task_id, success } = update {
+                self.check_op_completion(task_id, success);
             }
         }
+        self.poll_state_load();
     }
 
     // ── Output pane ──────────────────────────────────────────────────────────
 
     fn output_task(&self) -> Option<&Task> {
         if let Some(id) = self.selected_task_id {
-            return self.tasks.iter().find(|t| t.id == id);
+            return self.engine.tasks.iter().find(|t| t.id == id);
         }
         // Fallback: most recently active task with output.
         self.sorted_task_display()
             .into_iter()
-            .map(|vi| &self.tasks[vi])
+            .map(|vi| &self.engine.tasks[vi])
             .find(|t| !t.output_lines.is_empty() || t.status == TaskStatus::Running)
     }
 
@@ -1825,13 +1611,10 @@ impl App {
         "Output".to_string()
     }
 
-    pub fn any_task_failed(&self) -> bool {
-        self.tasks.iter().any(|t| t.status == TaskStatus::Failed)
-    }
-
     /// Tasks that are still Pending or Running.
     pub fn active_tasks(&self) -> Vec<&Task> {
-        self.tasks
+        self.engine
+            .tasks
             .iter()
             .filter(|t| !t.status.is_terminal())
             .collect()
@@ -1842,19 +1625,6 @@ fn module_depth(module: &crate::module::Module) -> usize {
     std::path::Path::new(&module.display_name)
         .components()
         .count()
-}
-
-/// Count resources in `resources` that match `filter` (empty = all).
-pub fn explorer_filtered_count(resources: &[crate::state::StateResource], filter: &str) -> usize {
-    if filter.is_empty() {
-        resources.len()
-    } else {
-        let fl = filter.to_lowercase();
-        resources
-            .iter()
-            .filter(|r| r.address.to_lowercase().contains(&fl))
-            .count()
-    }
 }
 
 #[cfg(test)]
@@ -1883,12 +1653,11 @@ mod tests {
 
     fn push_plan_task(app: &mut App, id: usize, plan_path: PathBuf) {
         let module = &app.modules[0];
-        app.tasks.push(Task {
+        app.engine.tasks.push(Task {
             id,
             module_path: module.path.clone(),
             module_name: module.display_name.clone(),
             command: "plan".to_string(),
-            args: vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()],
             status: TaskStatus::Success,
             output_lines: Vec::new(),
             started_at: Some(Instant::now()),
@@ -1904,33 +1673,35 @@ mod tests {
     fn ready_plan_for_task_requires_current_cache_owner() {
         let mut app = test_app();
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.plan_cache.plan_path_for(&module_path);
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
 
         push_plan_task(&mut app, 1, plan_path.clone());
         push_plan_task(&mut app, 2, plan_path.clone());
-        app.plan_cache
-            .register(module_path, plan_path, app.tasks[1].id);
+        app.engine
+            .plan_cache
+            .register(module_path, plan_path, app.engine.tasks[1].id);
 
-        assert!(app.ready_plan_for_task(&app.tasks[0]).is_none());
-        assert!(app.ready_plan_for_task(&app.tasks[1]).is_some());
+        assert!(app.ready_plan_for_task(&app.engine.tasks[0]).is_none());
+        assert!(app.ready_plan_for_task(&app.engine.tasks[1]).is_some());
     }
 
     #[test]
     fn stale_plan_task_apply_does_not_fallback_to_module_selection() {
         let mut app = test_app();
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.plan_cache.plan_path_for(&module_path);
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
 
         push_plan_task(&mut app, 1, plan_path.clone());
         push_plan_task(&mut app, 2, plan_path.clone());
-        app.plan_cache
-            .register(module_path, plan_path, app.tasks[1].id);
+        app.engine
+            .plan_cache
+            .register(module_path, plan_path, app.engine.tasks[1].id);
 
         app.focus = Focus::Tasks;
         app.selected_module = 0;
-        app.selected_task_id = Some(app.tasks[0].id);
+        app.selected_task_id = Some(app.engine.tasks[0].id);
         app.request_apply_confirm();
 
-        assert!(app.pending_confirm.is_none());
+        assert!(app.modal.is_none());
     }
 }

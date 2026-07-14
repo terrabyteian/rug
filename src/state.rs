@@ -26,12 +26,16 @@ impl StateResource {
 /// The result of reading a module's terraform state.
 #[derive(Debug, Clone)]
 pub enum StateContent {
+    /// A background load is in flight; no content to show yet.
+    Loading,
     /// Module has no `.terraform/` dir and no local state file.
     NotInitialized,
     /// Module is initialized but has no resources in state.
     NoState,
     /// Resources found in state.
     Resources(Vec<StateResource>),
+    /// State could not be read or parsed; message is shown to the user.
+    Error(String),
 }
 
 /// Read the terraform state for a module directory.
@@ -89,7 +93,15 @@ fn pull_remote_state(module_path: &Path, binary: &str) -> StateContent {
             let json = String::from_utf8_lossy(&out.stdout);
             parse_state_from_str(&json)
         }
-        _ => StateContent::NoState,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            StateContent::Error(if stderr.is_empty() {
+                "`state pull` failed".to_string()
+            } else {
+                stderr
+            })
+        }
+        Err(e) => StateContent::Error(format!("failed to run `state pull`: {e}")),
     }
 }
 
@@ -125,10 +137,10 @@ pub(crate) fn resolve_state_path(module_path: &Path) -> Option<PathBuf> {
 
 /// Parse a state file and return one `StateResource` per instance.
 fn parse_state_content(path: &Path) -> StateContent {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return StateContent::NoState;
-    };
-    parse_state_from_str(&content)
+    match std::fs::read_to_string(path) {
+        Ok(content) => parse_state_from_str(&content),
+        Err(e) => StateContent::Error(format!("failed to read state file: {e}")),
+    }
 }
 
 /// Parse terraform state JSON (from a file or `state pull` stdout).
@@ -136,8 +148,9 @@ fn parse_state_content(path: &Path) -> StateContent {
 /// count/for_each resources with N instances produce N addresses, matching
 /// `terraform state list` output exactly.
 fn parse_state_from_str(content: &str) -> StateContent {
-    let Ok(state) = serde_json::from_str::<TfState>(content) else {
-        return StateContent::NoState;
+    let state = match serde_json::from_str::<TfState>(content) {
+        Ok(s) => s,
+        Err(e) => return StateContent::Error(format!("failed to parse state: {e}")),
     };
 
     let resources: Vec<StateResource> = state
@@ -247,4 +260,103 @@ struct TfResource {
     /// Raw instance objects; each carries index_key, attributes, etc.
     #[serde(default)]
     instances: Vec<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn addresses(content: StateContent) -> Vec<String> {
+        match content {
+            StateContent::Resources(rs) => rs.into_iter().map(|r| r.address).collect(),
+            other => panic!("expected Resources, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_json_is_error_not_no_state() {
+        let content = parse_state_from_str("{ not valid json");
+        match content {
+            StateContent::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_resources_is_no_state() {
+        let content = parse_state_from_str(r#"{"resources": []}"#);
+        assert!(matches!(content, StateContent::NoState));
+    }
+
+    #[test]
+    fn unindexed_instance_has_no_suffix() {
+        let r = TfResource {
+            mode: "managed".to_string(),
+            resource_type: "aws_vpc".to_string(),
+            name: "main".to_string(),
+            module: None,
+            instances: vec![json!({"schema_version": 0})],
+        };
+        let addrs: Vec<String> = expand_resource(r).into_iter().map(|s| s.address).collect();
+        assert_eq!(addrs, vec!["aws_vpc.main"]);
+    }
+
+    #[test]
+    fn count_instances_get_numeric_index_suffix() {
+        let r = TfResource {
+            mode: "managed".to_string(),
+            resource_type: "aws_instance".to_string(),
+            name: "web".to_string(),
+            module: None,
+            instances: vec![
+                json!({"index_key": 0}),
+                json!({"index_key": 1}),
+            ],
+        };
+        let addrs: Vec<String> = expand_resource(r).into_iter().map(|s| s.address).collect();
+        assert_eq!(addrs, vec!["aws_instance.web[0]", "aws_instance.web[1]"]);
+    }
+
+    #[test]
+    fn for_each_instance_gets_string_key_suffix() {
+        let r = TfResource {
+            mode: "managed".to_string(),
+            resource_type: "null_resource".to_string(),
+            name: "zone".to_string(),
+            module: None,
+            instances: vec![json!({"index_key": "us-east-1"})],
+        };
+        let addrs: Vec<String> = expand_resource(r).into_iter().map(|s| s.address).collect();
+        assert_eq!(addrs, vec!["null_resource.zone[\"us-east-1\"]"]);
+    }
+
+    #[test]
+    fn module_and_data_address_forms() {
+        let data = TfResource {
+            mode: "data".to_string(),
+            resource_type: "aws_ami".to_string(),
+            name: "ubuntu".to_string(),
+            module: Some("module.net".to_string()),
+            instances: vec![json!({})],
+        };
+        let addrs: Vec<String> = expand_resource(data).into_iter().map(|s| s.address).collect();
+        assert_eq!(addrs, vec!["module.net.data.aws_ami.ubuntu"]);
+    }
+
+    #[test]
+    fn parse_state_from_str_expands_multiple_resources() {
+        let json_str = r#"{
+            "resources": [
+                {
+                    "mode": "managed",
+                    "type": "aws_vpc",
+                    "name": "main",
+                    "instances": [{"schema_version": 0}]
+                }
+            ]
+        }"#;
+        let addrs = addresses(parse_state_from_str(json_str));
+        assert_eq!(addrs, vec!["aws_vpc.main"]);
+    }
 }

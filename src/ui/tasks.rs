@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
@@ -8,16 +8,13 @@ use ratatui::{
 
 use crate::app::{App, Focus};
 use crate::task::{ResourceCounts, TaskStatus};
+use crate::ui::theme;
 use crate::ui::wrap::wrap_line;
 
 /// Render the task list pane, sorted by most recently active first.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Tasks;
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
+    let border_style = theme::pane_border(focused);
 
     let sorted = app.sorted_task_display();
     let inner_width = area.width.saturating_sub(2);
@@ -26,31 +23,22 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     // Find which display position is currently selected (for ListState).
     let selected_display_pos = app
         .selected_task_id
-        .and_then(|id| sorted.iter().position(|&vi| app.tasks[vi].id == id));
+        .and_then(|id| sorted.iter().position(|&vi| app.engine.tasks[vi].id == id));
 
     let items: Vec<ListItem> = sorted
         .iter()
         .enumerate()
         .map(|(display_pos, &vec_idx)| {
-            let task = &app.tasks[vec_idx];
+            let task = &app.engine.tasks[vec_idx];
             let is_selected = Some(display_pos) == selected_display_pos;
             let is_multi = app.task_multi_select.contains(&task.id);
 
-            const CANCEL_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
-
-            let status_style = match &task.status {
-                TaskStatus::Pending => Style::default().fg(Color::DarkGray),
-                TaskStatus::Running => Style::default().fg(Color::Yellow),
-                TaskStatus::Cancelling => Style::default().fg(Color::Magenta),
-                TaskStatus::Success => Style::default().fg(Color::Green),
-                TaskStatus::Failed => Style::default().fg(Color::Red),
-                TaskStatus::Cancelled => Style::default().fg(Color::DarkGray),
-            };
+            let status_style = theme::status_style(&task.status);
 
             let icon = if task.status == TaskStatus::Cancelling {
-                CANCEL_FRAMES[(app.spinner_tick as usize / 2) % CANCEL_FRAMES.len()]
+                theme::SPINNER_FRAMES[(app.spinner_tick as usize / 2) % theme::SPINNER_FRAMES.len()]
             } else {
-                task.status.icon()
+                theme::status_icon(&task.status)
             };
             let elapsed = task.elapsed_str();
             let elapsed_part = if elapsed.is_empty() {
@@ -63,23 +51,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let ready_plan = app.ready_plan_for_task(task);
 
             let mut spans = vec![
-                Span::styled(check.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled(check.to_string(), theme::multi_select_marker()),
                 Span::styled(format!("{icon} "), status_style),
                 Span::raw(format!("{:<20} ", task.module_name)),
-                Span::styled(
-                    format!("{:<8}", task.command),
-                    Style::default().fg(Color::Blue),
-                ),
-                Span::styled(elapsed_part, Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<8}", task.command), theme::command_text()),
+                Span::styled(elapsed_part, theme::dim()),
             ];
 
             if let Some(plan) = ready_plan {
-                spans.push(Span::styled(
-                    format!("  P:{}", plan.age_str()),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::styled(format!("  P:{}", plan.age_str()), theme::plan_marker()));
             }
 
             if let Some(counts) = &task.resource_counts {
@@ -89,9 +69,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let line = Line::from(spans);
 
             let row_style = if is_selected {
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD)
+                theme::selected_task_row()
             } else {
                 Style::default()
             };
@@ -100,7 +78,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let title = format!(" Tasks ({}) ", app.tasks.len());
+    let title = format!(" Tasks ({}) ", app.engine.tasks.len());
     let list = List::new(items).block(
         Block::default()
             .title(title)
@@ -135,18 +113,18 @@ fn count_spans(counts: &ResourceCounts) -> Vec<Span<'static>> {
     if counts.no_changes || counts.all_zero() {
         return vec![Span::styled(
             "  =".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::COUNT_NONE),
         )];
     }
 
     let mut spans = Vec::new();
 
     let entries: &[(u32, &str, &str, Color)] = &[
-        (counts.add, "+", "add", Color::Green),
-        (counts.change, "~", "change", Color::Yellow),
-        (counts.destroy, "-", "destroy", Color::Red),
-        (counts.import, "i", "import", Color::Cyan),
-        (counts.forget, "f", "forget", Color::DarkGray),
+        (counts.add, "+", "add", theme::COUNT_ADD),
+        (counts.change, "~", "change", theme::COUNT_CHANGE),
+        (counts.destroy, "-", "destroy", theme::COUNT_DESTROY),
+        (counts.import, "i", "import", theme::COUNT_IMPORT),
+        (counts.forget, "f", "forget", theme::COUNT_FORGET),
     ];
 
     for &(n, sym, label, color) in entries {

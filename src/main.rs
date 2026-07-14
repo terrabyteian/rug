@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod discovery;
+mod engine;
 mod lock;
 mod module;
 mod plan_cache;
@@ -8,6 +9,7 @@ mod runner;
 mod state;
 mod task;
 mod ui;
+mod util;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -87,23 +89,22 @@ struct ExecArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut config = Config::load().context("loading config")?;
+    let root = cli.dir.canonicalize().unwrap_or(cli.dir.clone());
+
+    let mut config = Config::load(&root).context("loading config")?;
     config.show_library_modules = cli.show_library;
 
-    let root = cli.dir.canonicalize().unwrap_or(cli.dir.clone());
     let all_modules = discovery::discover(&root, &config).context("discovering modules")?;
 
     match cli.command {
         None => {
             // TUI mode.
             if all_modules.is_empty() {
-                eprintln!("No terraform root modules found under {}", root.display());
-                std::process::exit(1);
+                anyhow::bail!("No terraform root modules found under {}", root.display());
             }
             let root_modules: Vec<_> = all_modules.into_iter().filter(|m| m.is_root()).collect();
             if root_modules.is_empty() {
-                eprintln!("No terraform root modules found under {}", root.display());
-                std::process::exit(1);
+                anyhow::bail!("No terraform root modules found under {}", root.display());
             }
             let mut app = App::new(config, root.clone(), root_modules)
                 .context("creating secure plan cache")?;
@@ -178,8 +179,7 @@ async fn run_headless_cmd(
         .collect();
 
     if modules.is_empty() {
-        eprintln!("No matching root modules found.");
-        std::process::exit(1);
+        anyhow::bail!("no matching root modules found");
     }
 
     if needs_confirm && !run_args.yes {
@@ -190,7 +190,7 @@ async fn run_headless_cmd(
 }
 
 /// Print a confirmation prompt to stderr and read a response from stdin.
-/// Returns Ok(()) if the user confirmed, exits the process if they declined.
+/// Returns Ok(()) if the user confirmed, `Err` if they declined.
 fn confirm_headless(command: &str, modules: &[&module::Module]) -> Result<()> {
     use std::io::{self, BufRead, Write};
 
@@ -210,76 +210,83 @@ fn confirm_headless(command: &str, modules: &[&module::Module]) -> Result<()> {
     let answer = line.trim().to_lowercase();
 
     if answer != "y" && answer != "yes" {
-        eprintln!("Aborted.");
-        std::process::exit(1);
+        anyhow::bail!("aborted by user");
     }
 
     Ok(())
 }
 
+/// Run `command` on every module in `modules`, streaming output to stdout,
+/// via the same `TaskEngine` the TUI uses.
+///
+/// Accepted trade-offs versus the old hand-rolled channel/semaphore loop
+/// (Plan A step 7):
+/// - Termination is driven by `engine.has_active_tasks()` rather than the
+///   event channel closing — the engine holds its own sender for the whole
+///   run, so the channel never closes on its own.
+/// - Output lines are now also buffered in `Task.output_lines` (previously
+///   headless mode only ever printed them and threw them away); harmless,
+///   just a bit more memory retained for very chatty commands.
+/// - Failures now propagate through `anyhow::bail!` instead of an immediate
+///   forced-exit call, so a failure prints as `Error: ...` and the process
+///   exits 1 via `main`'s `Result` return path.
+/// - `TaskEngine`'s per-module run/queue bookkeeping never actually engages
+///   here, because every module in `modules` has a distinct path, so at most
+///   one task per module is ever pushed — semantics match the old
+///   implementation, which had no queueing at all.
 async fn run_headless(
     config: &Config,
     modules: &[&module::Module],
     command: &str,
     extra_args: &[String],
 ) -> Result<()> {
-    use std::sync::Arc;
-    use task::{TaskEvent, TaskStatus};
-    use tokio::sync::{mpsc, Semaphore};
+    use engine::{EngineUpdate, TaskEngine, TaskSpec};
+    use task::TaskStatus;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<TaskEvent>();
-    let semaphore = Arc::new(Semaphore::new(config.parallelism));
+    let mut engine = TaskEngine::new(config.binary.clone(), config.parallelism)?;
 
-    let task_names: Vec<String> = modules.iter().map(|m| m.display_name.clone()).collect();
-
-    // Keep handles alive for the duration of the run — dropping them early would
-    // close the oneshot senders and immediately fire the cancel branch in the runner.
-    let _handles: Vec<_> = modules
+    let task_ids: Vec<usize> = modules
         .iter()
-        .enumerate()
-        .map(|(i, module)| {
-            runner::spawn_task(
-                i,
-                module.path.clone(),
-                module.display_name.clone(),
-                config.binary.clone(),
-                command.to_string(),
-                extra_args.to_vec(),
-                tx.clone(),
-                semaphore.clone(),
-            )
+        .map(|module| {
+            engine.push_task(TaskSpec {
+                module_path: module.path.clone(),
+                module_name: module.display_name.clone(),
+                command: command.to_string(),
+                args: extra_args.to_vec(),
+                plan_output_path: None,
+                cleanup_plan_path: None,
+            })
         })
         .collect();
 
-    let mut statuses: Vec<TaskStatus> = (0..modules.len()).map(|_| TaskStatus::Pending).collect();
-    let mut done_count = 0;
-
-    // Drop original tx so the channel closes when all spawned tasks finish.
-    drop(tx);
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            TaskEvent::Started { .. } => {}
-            TaskEvent::Line { task_id, line } => {
-                let name = &task_names[task_id];
-                println!("[{name}] {line}");
-            }
-            TaskEvent::Finished { task_id, success } => {
-                statuses[task_id] = if success {
-                    TaskStatus::Success
-                } else {
-                    TaskStatus::Failed
-                };
-                done_count += 1;
-                if done_count == modules.len() {
-                    break;
+    while engine.has_active_tasks() {
+        match engine.next_update().await {
+            Some(EngineUpdate::Line { task_id }) => {
+                if let Some(task) = engine.task(task_id) {
+                    if let Some(line) = task.output_lines.last() {
+                        println!("[{}] {}", task.module_name, line);
+                    }
                 }
             }
+            Some(EngineUpdate::Started { .. }) | Some(EngineUpdate::Finished { .. }) => {}
+            // Channel closed unexpectedly (shouldn't happen — the engine
+            // holds its own sender for as long as it's alive).
+            None => break,
         }
     }
 
-    if statuses.iter().any(|s| *s == TaskStatus::Failed) {
-        std::process::exit(1);
+    let failed = task_ids
+        .iter()
+        .filter(|&&id| {
+            engine
+                .task(id)
+                .map(|t| t.status == TaskStatus::Failed)
+                .unwrap_or(false)
+        })
+        .count();
+
+    if failed > 0 {
+        anyhow::bail!("{failed} task(s) failed");
     }
     Ok(())
 }

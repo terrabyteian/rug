@@ -1,22 +1,19 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 
 use crate::app::{App, Focus};
+use crate::ui::theme;
 use crate::ui::wrap::wrap_line;
 
 /// Render the module tree pane.
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Modules;
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
+    let border_style = theme::pane_border(focused);
 
     let inner_width = area.width.saturating_sub(2);
     let max_item_lines = area.height.saturating_sub(2).max(1) as usize;
@@ -28,31 +25,26 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             let module = &app.modules[real_idx];
             let is_selected = display_pos == app.selected_module;
             let is_multi = app.multi_select.contains(&real_idx);
-            let plan_age = app.plan_cache.get(&module.path).map(|plan| plan.age_str());
+            let plan_age = app
+                .engine
+                .plan_cache
+                .get(&module.path)
+                .map(|plan| plan.age_str());
 
             let prefix = if is_multi { "● " } else { "  " };
             let name = &module.display_name;
 
             let style = if is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                theme::selected_row()
             } else if is_multi {
-                Style::default().fg(Color::Yellow)
+                theme::multi_select_item()
             } else {
                 Style::default()
             };
 
             let mut spans = vec![Span::styled(format!("{prefix}{name}"), style)];
             if let Some(age) = plan_age {
-                let plan_style = if is_selected {
-                    style
-                } else {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                };
+                let plan_style = if is_selected { style } else { theme::plan_marker() };
                 spans.push(Span::styled(format!("  P:{age}"), plan_style));
             }
 

@@ -1,4 +1,5 @@
 use crate::state::resolve_state_path;
+use crate::util::strip_ansi;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -72,20 +73,63 @@ fn strip_border(s: &str) -> String {
         .to_string()
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(ch);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
     }
-    out
+
+    #[test]
+    fn full_block_parses_id_and_who() {
+        let out = lines(&[
+            "│ Error: Error acquiring the state lock",
+            "│",
+            "│ Lock Info:",
+            "│   ID:        abc-123",
+            "│   Path:      terraform.tfstate",
+            "│   Operation: OperationTypePlan",
+            "│   Who:       user@host",
+        ]);
+        let info = parse_lock_from_output(&out).unwrap();
+        assert_eq!(info.id, "abc-123");
+        assert_eq!(info.who, "user@host");
+        assert_eq!(info.operation, "OperationTypePlan");
+    }
+
+    #[test]
+    fn no_lock_block_returns_none() {
+        let out = lines(&["Apply complete!", "Resources: 1 added, 0 changed, 0 destroyed."]);
+        assert!(parse_lock_from_output(&out).is_none());
+    }
+
+    #[test]
+    fn missing_id_returns_none() {
+        let out = lines(&[
+            "│ Lock Info:",
+            "│   Who:       user@host",
+            "│   Operation: OperationTypePlan",
+        ]);
+        assert!(parse_lock_from_output(&out).is_none());
+    }
+
+    #[test]
+    fn last_block_wins() {
+        let out = lines(&[
+            "│ Lock Info:",
+            "│   ID:        first-id",
+            "│   Who:       first@host",
+            "│   Operation: OperationTypePlan",
+            "some unrelated retry output",
+            "│ Lock Info:",
+            "│   ID:        second-id",
+            "│   Who:       second@host",
+            "│   Operation: OperationTypeApply",
+        ]);
+        let info = parse_lock_from_output(&out).unwrap();
+        assert_eq!(info.id, "second-id");
+        assert_eq!(info.who, "second@host");
+    }
 }
+

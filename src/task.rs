@@ -1,7 +1,8 @@
-#![allow(dead_code)]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+use crate::util::strip_ansi;
 
 /// Status of a task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,17 +17,6 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub fn icon(&self) -> &'static str {
-        match self {
-            Self::Pending => "○",
-            Self::Running => "⟳",
-            Self::Cancelling => "◐", // overridden with animated frames in tasks.rs
-            Self::Success => "✓",
-            Self::Failed => "✗",
-            Self::Cancelled => "⊘",
-        }
-    }
-
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Success | Self::Failed | Self::Cancelled)
     }
@@ -149,27 +139,6 @@ fn parse_segment(text: &str, sep: &str) -> ResourceCounts {
     counts
 }
 
-/// Strip ANSI escape sequences from a string.
-/// Terraform and tofu emit ANSI colours even when piped on some configurations.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-                          // consume until we hit the final byte (an ASCII letter)
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 /// Handle for cancelling a spawned task.
 ///
 /// First call to `cancel()` sends SIGINT (graceful shutdown — same as Ctrl+C).
@@ -212,7 +181,6 @@ pub struct Task {
     pub module_path: PathBuf,
     pub module_name: String,
     pub command: String,
-    pub args: Vec<String>,
     pub status: TaskStatus,
     pub output_lines: Vec<String>,
     pub started_at: Option<Instant>,
@@ -258,3 +226,73 @@ pub enum TaskEvent {
 
 pub type TaskEventSender = mpsc::UnboundedSender<TaskEvent>;
 pub type TaskEventReceiver = mpsc::UnboundedReceiver<TaskEvent>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_plan_summary_line() {
+        let counts = parse_counts_from_line("Plan: 2 to add, 1 to change, 3 to destroy.").unwrap();
+        assert_eq!(counts.add, 2);
+        assert_eq!(counts.change, 1);
+        assert_eq!(counts.destroy, 3);
+        assert!(counts.has_summary);
+        assert!(!counts.no_changes);
+    }
+
+    #[test]
+    fn parses_import_and_forget_counts() {
+        let counts = parse_counts_from_line(
+            "Plan: 1 to add, 0 to change, 0 to destroy, 1 to import, 2 to forget.",
+        )
+        .unwrap();
+        assert_eq!(counts.add, 1);
+        assert_eq!(counts.import, 1);
+        assert_eq!(counts.forget, 2);
+    }
+
+    #[test]
+    fn parses_apply_complete_line() {
+        let counts =
+            parse_counts_from_line("Apply complete! Resources: 2 added, 1 changed, 0 destroyed.")
+                .unwrap();
+        assert_eq!(counts.add, 2);
+        assert_eq!(counts.change, 1);
+        assert_eq!(counts.destroy, 0);
+        assert!(counts.has_summary);
+    }
+
+    #[test]
+    fn parses_destroy_complete_line() {
+        let counts =
+            parse_counts_from_line("Destroy complete! Resources: 3 destroyed.").unwrap();
+        assert_eq!(counts.destroy, 3);
+        assert!(counts.has_summary);
+    }
+
+    #[test]
+    fn parses_no_changes_line() {
+        let counts =
+            parse_counts_from_line("No changes. Your infrastructure matches the configuration.")
+                .unwrap();
+        assert!(counts.no_changes);
+        assert!(counts.has_summary);
+        assert!(counts.all_zero());
+    }
+
+    #[test]
+    fn parses_ansi_wrapped_summary_line() {
+        let counts =
+            parse_counts_from_line("\x1b[1mPlan: 1 to add, 0 to change, 0 to destroy.\x1b[0m")
+                .unwrap();
+        assert_eq!(counts.add, 1);
+        assert!(counts.has_summary);
+    }
+
+    #[test]
+    fn ordinary_line_returns_none() {
+        assert!(parse_counts_from_line("Terraform will perform the following actions:")
+            .is_none());
+    }
+}
