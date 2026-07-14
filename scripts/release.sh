@@ -2,35 +2,77 @@
 set -euo pipefail
 
 DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=true
+ASSETS_ONLY=false
+TAG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --assets-only)
+      ASSETS_ONLY=true
+      TAG="${2:-}"
+      if [[ -z "$TAG" ]]; then
+        echo "ERROR: --assets-only requires a tag argument, e.g. --assets-only v0.8.0" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    *)
+      echo "ERROR: unknown argument '$1'" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if $DRY_RUN; then
   echo "==> Dry-run mode: builds will run but no tag/push/release will happen"
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Parse version from Cargo.toml
+# 1. Determine version/tag
 # ---------------------------------------------------------------------------
-VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-TAG="v${VERSION}"
-echo "==> Version: ${VERSION}  Tag: ${TAG}"
-
-# ---------------------------------------------------------------------------
-# 2. Guard: must be on master with a clean tree
-# ---------------------------------------------------------------------------
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$BRANCH" != "master" ]]; then
-  echo "ERROR: must be on master branch (currently on '${BRANCH}')" >&2
-  exit 1
+if $ASSETS_ONLY; then
+  echo "==> Assets-only mode: rebuilding archives for existing tag ${TAG}"
+else
+  VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+  TAG="v${VERSION}"
+  echo "==> Version: ${VERSION}  Tag: ${TAG}"
 fi
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "ERROR: working tree is not clean — commit or stash changes first" >&2
-  exit 1
-fi
+# ---------------------------------------------------------------------------
+# 2. Guard
+# ---------------------------------------------------------------------------
+if $ASSETS_ONLY; then
+  # Re-publishing assets only applies to a release that already exists.
+  if ! git rev-parse "$TAG" &>/dev/null; then
+    echo "ERROR: tag ${TAG} does not exist — --assets-only requires an existing tag" >&2
+    exit 1
+  fi
 
-if ! $DRY_RUN && git rev-parse "$TAG" &>/dev/null; then
-  echo "ERROR: tag ${TAG} already exists" >&2
-  exit 1
+  if ! gh release view "$TAG" &>/dev/null; then
+    echo "ERROR: no GitHub release found for tag ${TAG}" >&2
+    exit 1
+  fi
+else
+  # Guard: must be on master with a clean tree
+  BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  if [[ "$BRANCH" != "master" ]]; then
+    echo "ERROR: must be on master branch (currently on '${BRANCH}')" >&2
+    exit 1
+  fi
+
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "ERROR: working tree is not clean — commit or stash changes first" >&2
+    exit 1
+  fi
+
+  if ! $DRY_RUN && git rev-parse "$TAG" &>/dev/null; then
+    echo "ERROR: tag ${TAG} already exists" >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -92,6 +134,17 @@ package "aarch64-unknown-linux-gnu"  "rug-${TAG}-linux-arm64.tar.gz"
 if $DRY_RUN; then
   echo "==> Dry-run complete. Archives in ${DIST}/:"
   ls -lh "$DIST/"
+  exit 0
+fi
+
+if $ASSETS_ONLY; then
+  # -------------------------------------------------------------------------
+  # 6. Upload archives to the existing release (no tag/push/create)
+  # -------------------------------------------------------------------------
+  echo "==> Uploading assets to existing release ${TAG}"
+  gh release upload "$TAG" "${DIST}"/*.tar.gz --clobber
+
+  echo "==> Done! https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/${TAG}"
   exit 0
 fi
 

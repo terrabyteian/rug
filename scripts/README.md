@@ -34,6 +34,26 @@ bash scripts/release.sh --dry-run
 Runs all three builds and creates the archives in `dist/`, but skips tagging,
 pushing, and creating the GitHub Release.
 
+## Re-publishing assets for an existing tag
+
+If a release was published without its binary assets (e.g. the upload step
+failed or was skipped), use `--assets-only` to rebuild and re-attach the
+archives without creating a new tag or release:
+
+```bash
+bash scripts/release.sh --assets-only v0.8.0
+```
+
+This rebuilds the three archives for the given tag and uploads them to the
+*existing* GitHub Release for that tag with `gh release upload --clobber`. It
+does not touch git (no tag, no push) and does not create a release — the tag
+and release must already exist. Combine with `--dry-run` (in either order) to
+just rebuild the archives into `dist/` without uploading:
+
+```bash
+bash scripts/release.sh --assets-only v0.8.0 --dry-run
+```
+
 ## Artifact naming
 
 | File | Target |
