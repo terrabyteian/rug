@@ -107,11 +107,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
                         ));
                     }
                 }
-                // Cached-plan age.
+                // Cached-plan age (with a targeted marker for partial plans).
                 if show_age {
-                    if let Some(age) = app.engine.plan_cache.get(&module.path).map(|e| e.age_str())
-                    {
-                        spans.push(Span::styled(format!("  P:{age}"), theme::plan_marker()));
+                    if let Some(entry) = app.engine.plan_cache.get(&module.path) {
+                        let age = entry.age_str();
+                        if entry.is_targeted() {
+                            spans.push(Span::styled(
+                                format!("  P:{age}·T{}", entry.targets.len()),
+                                theme::plan_marker_targeted(),
+                            ));
+                        } else {
+                            spans.push(Span::styled(format!("  P:{age}"), theme::plan_marker()));
+                        }
                     }
                 }
                 // Last-plan resource counts.

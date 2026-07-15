@@ -7,9 +7,17 @@ pub struct PlanEntry {
     pub path: PathBuf,
     pub task_id: usize,
     pub created_at: Instant,
+    /// Resource addresses this plan was scoped to via `-target=`. Empty for a
+    /// full (non-targeted) plan.
+    pub targets: Vec<String>,
 }
 
 impl PlanEntry {
+    /// True if this plan was produced with `-target=` flags (partial plan).
+    pub fn is_targeted(&self) -> bool {
+        !self.targets.is_empty()
+    }
+
     pub fn age_str(&self) -> String {
         let secs = self.created_at.elapsed().as_secs();
         if secs < 60 {
@@ -57,13 +65,20 @@ impl PlanCache {
         self.dir.path().join(format!("{sanitized}.tfplan"))
     }
 
-    pub fn register(&mut self, module_path: PathBuf, plan_path: PathBuf, task_id: usize) {
+    pub fn register(
+        &mut self,
+        module_path: PathBuf,
+        plan_path: PathBuf,
+        task_id: usize,
+        targets: Vec<String>,
+    ) {
         self.entries.insert(
             module_path,
             PlanEntry {
                 path: plan_path,
                 task_id,
                 created_at: Instant::now(),
+                targets,
             },
         );
     }
@@ -94,5 +109,35 @@ impl PlanCache {
         for (_, entry) in self.entries.drain() {
             Self::remove_file(&entry.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_stores_targets_and_reports_targeted() {
+        let mut cache = PlanCache::new().unwrap();
+        let module = PathBuf::from("/tmp/mod");
+        let plan = cache.plan_path_for(&module);
+
+        // Full plan: empty targets → not targeted.
+        cache.register(module.clone(), plan.clone(), 1, Vec::new());
+        let entry = cache.get(&module).unwrap();
+        assert!(entry.targets.is_empty());
+        assert!(!entry.is_targeted());
+
+        // Targeted plan: non-empty targets → targeted, stored verbatim.
+        cache.register(
+            module.clone(),
+            plan,
+            2,
+            vec!["module.net".to_string(), "null_resource.a".to_string()],
+        );
+        let entry = cache.get(&module).unwrap();
+        assert!(entry.is_targeted());
+        assert_eq!(entry.targets.len(), 2);
+        assert_eq!(entry.targets[0], "module.net");
     }
 }

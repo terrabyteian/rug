@@ -188,6 +188,11 @@ pub struct Task {
     /// For plan tasks: the path where the plan file is being written.
     /// Registered in PlanCache on successful completion.
     pub plan_output_path: Option<PathBuf>,
+    /// The `-target=` addresses this task was scoped to (plan, apply, destroy,
+    /// taint, state rm). Empty = untargeted (full) operation. Used for display;
+    /// for plan tasks it is also registered into the plan cache alongside
+    /// `plan_output_path`.
+    pub targets: Vec<String>,
     /// For apply tasks created from a cached plan: delete this plan after the
     /// apply task exits or is cancelled before it starts.
     pub cleanup_plan_path: Option<PathBuf>,

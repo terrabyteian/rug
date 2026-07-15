@@ -267,10 +267,20 @@ fn board_row(
     let show_counts = matches!(w, WidthTier::W1 | WidthTier::W2);
     let show_extras = matches!(w, WidthTier::W1); // P:{age}, ·prev
 
-    // Command.
+    // Command (+ target chip: describes the task itself, shown while running
+    // and in the finished result row — distinct from the CACHED-PLAN P:{age}·T
+    // badge below, which describes the plan-cache entry).
     if show_command {
         let cmd = task.map(|t| t.command.clone()).unwrap_or_else(|| "—".to_string());
         spans.push(Span::styled(format!("  {cmd}"), theme::command_text()));
+        if let Some(t) = task {
+            if !t.targets.is_empty() {
+                spans.push(Span::styled(
+                    format!("·T{}", t.targets.len()),
+                    theme::plan_marker_targeted(),
+                ));
+            }
+        }
     }
 
     // Status icon (+ word).
@@ -301,8 +311,16 @@ fn board_row(
 
     // Cached-plan age + prev tag.
     if show_extras {
-        if let Some(age) = app.engine.plan_cache.get(&sm.path).map(|e| e.age_str()) {
-            spans.push(Span::styled(format!("  P:{age}"), theme::plan_marker()));
+        if let Some(entry) = app.engine.plan_cache.get(&sm.path) {
+            let age = entry.age_str();
+            if entry.is_targeted() {
+                spans.push(Span::styled(
+                    format!("  P:{age}·T{}", entry.targets.len()),
+                    theme::plan_marker_targeted(),
+                ));
+            } else {
+                spans.push(Span::styled(format!("  P:{age}"), theme::plan_marker()));
+            }
         }
         if is_prev {
             spans.push(Span::styled("  ·prev", theme::dim()));
@@ -341,7 +359,7 @@ fn render_separator(f: &mut Frame, area: Rect, app: &App) {
                 .map(|m| m.name.clone())
                 .unwrap_or_default();
             let (cmd, status) = match app.display_task_for(&p) {
-                Some((t, _)) => (t.command.clone(), status_word(&t.status).to_string()),
+                Some((t, _)) => (cmd_label(t), status_word(&t.status).to_string()),
                 None => ("—".to_string(), "idle".to_string()),
             };
             format!(" {name} · {cmd} · {status} ")
@@ -354,6 +372,16 @@ fn render_separator(f: &mut Frame, area: Rect, app: &App) {
             .title(Span::styled(title, theme::dim())),
         area,
     );
+}
+
+/// A task's command with its target-count suffix (`apply·T2`), for the plain
+/// (unstyled) titles in the separator and fullscreen headers.
+fn cmd_label(t: &Task) -> String {
+    if t.targets.is_empty() {
+        t.command.clone()
+    } else {
+        format!("{}·T{}", t.command, t.targets.len())
+    }
 }
 
 fn status_word(status: &TaskStatus) -> &'static str {
@@ -397,7 +425,7 @@ pub fn render_fullscreen_output(f: &mut Frame, area: Rect, app: &mut App) {
                 .as_ref()
                 .and_then(|s| s.modules.iter().find(|m| m.path == p))
                 .map(|m| m.name.clone());
-            let cmd = app.display_task_for(&p).map(|(t, _)| t.command.clone());
+            let cmd = app.display_task_for(&p).map(|(t, _)| cmd_label(t));
             name.map(|n| format!(" {n} · {} ", cmd.unwrap_or_else(|| "—".to_string())))
         })
         .unwrap_or_else(|| " output ".to_string());

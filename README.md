@@ -128,10 +128,48 @@ apply consumes that cached plan file automatically.
 | `?` | Help |
 | `q` / `Ctrl-C` | Quit |
 
+**State explorer**
+
+Press `s` on either screen to browse the highlighted module's state. Resources are
+grouped by child module: a header row like `▸ module.net (3)` sits above its indented
+member resources. Pressing `Space` on a header selects the whole module as a single
+`-target=module.net`; pressing it on a resource selects that resource individually.
+Targeted operations act on the current selection (or the highlighted row if nothing
+is selected).
+
+| Key | Action |
+|---|---|
+| `j` / `k` / `↑` / `↓` | Move cursor |
+| `Enter` | Inspect resource attributes (no-op on header rows) |
+| `Space` | Select resource — or the whole module on a header row |
+| `c` | Clear selection |
+| `/` | Filter resources by address |
+| `p` | Targeted plan (`plan -target=…`) |
+| `a` | Targeted apply (`apply -target=…`, with confirmation) |
+| `d` | Targeted destroy (`destroy -target=…`, with confirmation) |
+| `t` | Taint (module selections expand to member resources; data sources skipped) |
+| `D` | Remove from state (`state rm`, accepts module addresses) |
+| `r` | Refresh state |
+| `Esc` / `q` | Close |
+
+Every operation launched from the state explorer — targeted plan, apply, destroy,
+taint, and state rm — appears on the Run screen task board. If you have no active
+Run session a fresh one is created automatically (containing the module you acted
+on); if a session already exists, the module is added to it. You stay in the state
+explorer either way, and reach the board with `Tab` or `Enter` as usual. A targeted
+task shows a `·T{n}` count next to its command (e.g. `apply·T2`) while it runs and in
+its finished result row, where `n` is the number of `-target=` addresses.
+
 Apply and destroy prompt for confirmation. `apply` consumes a cached plan (`P:{age}`)
-per module when one is available. The state explorer opens with `s` on either screen —
-`Enter` no longer opens it. Pane dragging has been removed. The minimum usable terminal
-size is 40×10; below that the TUI shows a resize prompt.
+per module when one is available. A **targeted** plan (made with `p` in the state
+explorer) marks the module's plan badge with a `T{n}` suffix — `P:{age}·T{n}` — where
+`n` is the number of `-target=` addresses. (This plan-cache badge is distinct from the
+per-task `·T{n}` count above.) Applying a targeted cached plan warns you
+in the confirm dialog and lists exactly which addresses the apply covers. Targeted
+apply and destroy from the state explorer run `apply`/`destroy -target=…` directly
+and never consume the cached plan. The state explorer opens with `s` on either
+screen — `Enter` no longer opens it. Pane dragging has been removed. The minimum
+usable terminal size is 40×10; below that the TUI shows a resize prompt.
 
 ## Configuration
 

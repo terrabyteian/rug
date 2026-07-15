@@ -75,8 +75,16 @@ pub fn multi_select_marker() -> Style {
 pub fn multi_select_item() -> Style {
     Style::default().fg(Color::Yellow)
 }
+/// Marker for a resource implicitly covered by a selected module prefix.
+pub fn covered_marker() -> Style {
+    Style::default().fg(MUTED)
+}
 pub fn plan_marker() -> Style {
     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+}
+/// Marker for a cached plan that was scoped with `-target=` (partial plan).
+pub fn plan_marker_targeted() -> Style {
+    Style::default().fg(MARK).add_modifier(Modifier::BOLD)
 }
 pub fn command_text() -> Style {
     Style::default().fg(Color::Blue)

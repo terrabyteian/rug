@@ -254,6 +254,7 @@ async fn run_headless(
                 command: command.to_string(),
                 args: extra_args.to_vec(),
                 plan_output_path: None,
+                targets: Vec::new(),
                 cleanup_plan_path: None,
             })
         })

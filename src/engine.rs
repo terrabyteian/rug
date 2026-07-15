@@ -30,6 +30,10 @@ pub struct TaskSpec {
     pub args: Vec<String>,
     /// For plan tasks: the path where the plan file is being written.
     pub plan_output_path: Option<PathBuf>,
+    /// The `-target=` addresses this task was scoped to (any command). Empty =
+    /// untargeted. For plan tasks it is also registered into the plan cache
+    /// alongside `plan_output_path`.
+    pub targets: Vec<String>,
     /// For apply tasks created from a cached plan: delete this plan after the
     /// task exits or is cancelled before it starts.
     pub cleanup_plan_path: Option<PathBuf>,
@@ -104,6 +108,7 @@ impl TaskEngine {
             started_at: None,
             finished_at: None,
             plan_output_path: spec.plan_output_path,
+            targets: spec.targets,
             cleanup_plan_path: spec.cleanup_plan_path,
             resource_counts: None,
             cancel_handle: None,
@@ -223,9 +228,9 @@ impl TaskEngine {
                 let (plan_info, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
                     Some(t) => {
                         let plan = if success && !is_cancelling {
-                            t.plan_output_path
-                                .as_ref()
-                                .map(|p| (t.module_path.clone(), p.clone(), t.id))
+                            t.plan_output_path.as_ref().map(|p| {
+                                (t.module_path.clone(), p.clone(), t.id, t.targets.clone())
+                            })
                         } else {
                             None
                         };
@@ -249,8 +254,9 @@ impl TaskEngine {
                 }
 
                 // Register the plan file now that the mutable borrow is released.
-                if let Some((mp, plan_path, plan_task_id)) = plan_info {
-                    self.plan_cache.register(mp, plan_path, plan_task_id);
+                if let Some((mp, plan_path, plan_task_id, plan_targets)) = plan_info {
+                    self.plan_cache
+                        .register(mp, plan_path, plan_task_id, plan_targets);
                 }
 
                 if let Some(path) = cleanup_plan_path {
@@ -368,6 +374,7 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             plan_output_path: None,
+            targets: Vec::new(),
             cleanup_plan_path: None,
         };
 

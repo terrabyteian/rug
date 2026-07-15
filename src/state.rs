@@ -23,6 +23,81 @@ impl StateResource {
     }
 }
 
+// ── Address helpers ─────────────────────────────────────────────────────────
+
+/// Split `addr` into top-level `.`-separated segments, ignoring `.`s that are
+/// inside a `[...]` index (which can itself hold a quoted string with dots and
+/// backslash escapes, e.g. `module.net["us.east"].aws_vpc.x`).
+fn split_top_segments(addr: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in addr.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '[' if !in_string => depth += 1,
+            ']' if !in_string => depth -= 1,
+            '.' if depth == 0 && !in_string => {
+                segments.push(&addr[start..i]);
+                start = i + 1; // '.' is one byte
+            }
+            _ => {}
+        }
+    }
+    segments.push(&addr[start..]);
+    segments
+}
+
+/// The full module prefix of a resource address, or `None` for a root resource.
+///
+/// Consumes leading (`module`, name) segment pairs while the segment is
+/// `module` and at least two segments remain after the pair (the leaf, which is
+/// `type.name` for a managed resource or `data.type.name` for a data source).
+/// Bracketed indices ride along with the name segment because the splitter is
+/// bracket-aware.
+pub fn module_prefix(addr: &str) -> Option<String> {
+    let segments = split_top_segments(addr);
+    let mut consumed = 0;
+    // Pair (2 segments) + leaf (>= 2 segments) ⇒ need >= consumed + 4 total.
+    while segments.get(consumed) == Some(&"module") && segments.len() >= consumed + 4 {
+        consumed += 2;
+    }
+    if consumed == 0 {
+        None
+    } else {
+        Some(segments[..consumed].join("."))
+    }
+}
+
+/// True if `addr` is `prefix` itself, or a descendant of it (`prefix` followed
+/// by `.` or `[`). So `module.net` does NOT cover `module.net2.x`, but it DOES
+/// cover `module.net["a"].x` (a keyed instance of the same module call).
+pub fn is_covered_by(addr: &str, prefix: &str) -> bool {
+    if addr == prefix {
+        return true;
+    }
+    match addr.strip_prefix(prefix) {
+        Some(rest) => rest.starts_with('.') || rest.starts_with('['),
+        None => false,
+    }
+}
+
+/// True if the leaf part (after any module prefix) names a data source.
+pub fn is_data_address(addr: &str) -> bool {
+    let leaf = match module_prefix(addr) {
+        Some(prefix) => addr[prefix.len()..].trim_start_matches('.'),
+        None => addr,
+    };
+    leaf.starts_with("data.")
+}
+
 /// The result of reading a module's terraform state.
 #[derive(Debug, Clone)]
 pub enum StateContent {
@@ -342,6 +417,61 @@ mod tests {
         };
         let addrs: Vec<String> = expand_resource(data).into_iter().map(|s| s.address).collect();
         assert_eq!(addrs, vec!["module.net.data.aws_ami.ubuntu"]);
+    }
+
+    #[test]
+    fn module_prefix_root_and_data_are_none() {
+        assert_eq!(module_prefix("aws_vpc.main"), None);
+        assert_eq!(module_prefix("data.aws_ami.u"), None);
+    }
+
+    #[test]
+    fn module_prefix_single_and_nested() {
+        assert_eq!(
+            module_prefix("module.net.null_resource.a[0]"),
+            Some("module.net".to_string())
+        );
+        assert_eq!(
+            module_prefix("module.a.module.b.res.x"),
+            Some("module.a.module.b".to_string())
+        );
+    }
+
+    #[test]
+    fn module_prefix_indexed_and_dotted_key() {
+        assert_eq!(
+            module_prefix(r#"module.net["a"].res.x"#),
+            Some(r#"module.net["a"]"#.to_string())
+        );
+        assert_eq!(
+            module_prefix(r#"module.net["us.east"].aws_vpc.x"#),
+            Some(r#"module.net["us.east"]"#.to_string())
+        );
+    }
+
+    #[test]
+    fn module_prefix_stops_before_data_leaf() {
+        assert_eq!(
+            module_prefix("module.net.data.aws_ami.u"),
+            Some("module.net".to_string())
+        );
+    }
+
+    #[test]
+    fn is_covered_by_boundaries() {
+        assert!(is_covered_by("module.net", "module.net"));
+        assert!(is_covered_by("module.net.res.x", "module.net"));
+        assert!(is_covered_by(r#"module.net["a"].res.x"#, "module.net"));
+        // Sibling with a shared string prefix is not covered.
+        assert!(!is_covered_by("module.net2.res.x", "module.net"));
+    }
+
+    #[test]
+    fn is_data_address_leaf_check() {
+        assert!(is_data_address("data.aws_ami.u"));
+        assert!(is_data_address("module.net.data.aws_ami.u"));
+        assert!(!is_data_address("module.net.null_resource.a"));
+        assert!(!is_data_address("aws_vpc.main"));
     }
 
     #[test]

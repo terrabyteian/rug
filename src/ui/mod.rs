@@ -436,6 +436,9 @@ fn event_loop<B: ratatui::backend::Backend>(
                                 KeyCode::Char('p') => {
                                     app.enqueue_targeted_plan();
                                 }
+                                KeyCode::Char('a') => {
+                                    app.request_op_confirm(ExplorerOpKind::TargetedApply);
+                                }
                                 KeyCode::Char('d') => {
                                     app.request_op_confirm(ExplorerOpKind::TargetedDestroy);
                                 }
@@ -720,6 +723,9 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
             .targets
             .iter()
             .map(|t| match &t.plan_age {
+                Some(age) if !t.plan_targets.is_empty() => {
+                    format!("  plan from {} · TARGETED ({})", age, t.plan_targets.len()).len()
+                }
                 Some(age) => format!("  plan from {}", age).len(),
                 None => "  no prior plan".len(),
             })
@@ -745,9 +751,33 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
             .unwrap_or(0),
         _ => 0,
     };
+    // Union of `-target=` addresses across all Apply targets whose cached plan
+    // is targeted (deduped, order-preserving). Drives the warning block below.
+    let mut apply_targeted_addrs: Vec<String> = Vec::new();
+    if confirm.kind == ConfirmKind::Apply {
+        for t in &confirm.targets {
+            for addr in &t.plan_targets {
+                if !apply_targeted_addrs.contains(addr) {
+                    apply_targeted_addrs.push(addr.clone());
+                }
+            }
+        }
+    }
+    let targeted_warn_w = if apply_targeted_addrs.is_empty() {
+        0
+    } else {
+        apply_targeted_addrs
+            .iter()
+            .map(|a| format!("      • {}", a).len())
+            .max()
+            .unwrap_or(0)
+            .max("  \u{26a0} Cached plan is TARGETED — apply covers ONLY:".len())
+    };
+
     // 6 = "    • "; min 36 covers footer and ForceUnlock warning line.
     let content_w = (6 + name_width + extra_width)
         .max(format!("  Run {} on {} {}:", label, n, noun).len())
+        .max(targeted_warn_w)
         .max(36);
 
     let mut lines: Vec<Line> = vec![
@@ -767,6 +797,10 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
 
         let plan_span = match &confirm.kind {
             ConfirmKind::Apply => match &target.plan_age {
+                Some(age) if !target.plan_targets.is_empty() => Span::styled(
+                    format!("  plan from {age} · TARGETED ({})", target.plan_targets.len()),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Some(age) => Span::styled(
                     format!("  plan from {age}"),
                     Style::default().fg(Color::Green),
@@ -803,6 +837,29 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
             "  \u{26a0} Force-removes the state lock",
             Style::default().fg(Color::Red),
         )));
+    }
+
+    // Targeted-plan warning: at least one cached plan is partial, so the apply
+    // will only touch those addresses. Cap the whole block at ~6 lines.
+    if !apply_targeted_addrs.is_empty() {
+        let warn = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  \u{26a0} Cached plan is TARGETED — apply covers ONLY:",
+            warn,
+        )));
+        // Header + up to 4 bullets + optional "… and N more" = 6 lines.
+        let shown = apply_targeted_addrs.len().min(4);
+        for addr in &apply_targeted_addrs[..shown] {
+            lines.push(Line::from(Span::styled(format!("      • {addr}"), warn)));
+        }
+        let extra = apply_targeted_addrs.len() - shown;
+        if extra > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("      … and {extra} more"),
+                warn,
+            )));
+        }
     }
 
     lines.push(Line::from(""));
@@ -1169,7 +1226,7 @@ fn render_state_explorer(
         return;
     }
 
-    use crate::state::{StateContent, StateResource};
+    use crate::state::StateContent;
     use ratatui::{
         layout::Alignment,
         style::{Color, Modifier, Style},
@@ -1221,22 +1278,19 @@ fn render_state_explorer(
             )));
         }
         StateContent::Resources(resources) => {
-            // Apply filter, carrying unfiltered indices.
+            use crate::app::ExplorerRow;
             let filter_lower = explorer.filter.to_lowercase();
-            let filtered: Vec<(usize, &StateResource)> = if explorer.filter.is_empty() {
-                resources.iter().enumerate().collect()
-            } else {
-                resources
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| r.address.to_lowercase().contains(&filter_lower))
-                    .collect()
-            };
+            let rows = explorer.rows();
 
             let total = resources.len();
-            let visible_count = filtered.len();
+            let visible_count = rows.len();
+            // The "N / M" counter counts resource rows only (headers excluded).
+            let visible_resource_count = rows
+                .iter()
+                .filter(|r| matches!(r, ExplorerRow::Resource { .. }))
+                .count();
 
-            if filtered.is_empty() {
+            if rows.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("  No resources match \"{}\"", explorer.filter),
                     theme::dim(),
@@ -1255,63 +1309,106 @@ fn render_state_explorer(
                     )));
                 }
 
-                for (vi, (real_idx, resource)) in filtered
+                for (vi, row) in rows
                     .iter()
                     .enumerate()
                     .skip(scroll_start)
                     .take(max_resource_rows)
                 {
                     let is_selected = vi == explorer.selected;
-                    let is_multi = explorer.multi_select.contains(real_idx);
-                    let tainted = resource.is_tainted();
+                    match row {
+                        ExplorerRow::ModuleHeader { prefix, count } => {
+                            let marked = explorer.module_select.contains(prefix);
+                            let marker = if marked { "●" } else { " " };
+                            if is_selected {
+                                lines.push(Line::from(Span::styled(
+                                    format!(" {} ▸ {} ({})", marker, prefix, count),
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
+                                )));
+                            } else {
+                                let marker_style = if marked {
+                                    theme::multi_select_marker()
+                                } else {
+                                    theme::title()
+                                };
+                                lines.push(Line::from(vec![
+                                    Span::styled(format!(" {} ", marker), marker_style),
+                                    Span::styled(
+                                        format!("▸ {} ({})", prefix, count),
+                                        theme::title(),
+                                    ),
+                                ]));
+                            }
+                        }
+                        ExplorerRow::Resource { res_idx, indent } => {
+                            let resource = &resources[*res_idx];
+                            let indent_str = if *indent { "  " } else { "" };
+                            let is_multi = explorer.multi_select.contains(res_idx);
+                            let covered = !is_multi
+                                && explorer
+                                    .module_select
+                                    .iter()
+                                    .any(|p| crate::state::is_covered_by(&resource.address, p));
+                            let tainted = resource.is_tainted();
 
-                    if is_selected {
-                        let prefix = if is_multi { "●" } else { " " };
-                        let taint_tag = if tainted { " [tainted]" } else { "" };
-                        let full = format!(" {} {}{}", prefix, resource.address, taint_tag);
-                        lines.push(Line::from(Span::styled(
-                            full,
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        )));
-                    } else if is_multi {
-                        let mut spans = vec![
-                            Span::styled(
-                                " ● ".to_string(),
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(resource.address.clone()),
-                        ];
-                        if tainted {
-                            spans.push(Span::styled(
-                                " [tainted]".to_string(),
-                                Style::default().fg(Color::Red),
-                            ));
+                            if is_selected {
+                                let marker = if is_multi || covered { "●" } else { " " };
+                                let taint_tag = if tainted { " [tainted]" } else { "" };
+                                let full = format!(
+                                    " {} {}{}{}",
+                                    marker, indent_str, resource.address, taint_tag
+                                );
+                                lines.push(Line::from(Span::styled(
+                                    full,
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
+                                )));
+                            } else if is_multi || covered {
+                                let marker_style = if is_multi {
+                                    theme::multi_select_marker()
+                                } else {
+                                    theme::covered_marker()
+                                };
+                                let mut spans = vec![
+                                    Span::styled(" ● ".to_string(), marker_style),
+                                    Span::raw(format!("{}{}", indent_str, resource.address)),
+                                ];
+                                if tainted {
+                                    spans.push(Span::styled(
+                                        " [tainted]".to_string(),
+                                        Style::default().fg(Color::Red),
+                                    ));
+                                }
+                                lines.push(Line::from(spans));
+                            } else if !explorer.filter.is_empty() {
+                                let addr = format!("   {}{}", indent_str, resource.address);
+                                let mut line = highlight_filter_match(addr, &filter_lower);
+                                if tainted {
+                                    line.spans.push(Span::styled(
+                                        " [tainted]".to_string(),
+                                        Style::default().fg(Color::Red),
+                                    ));
+                                }
+                                lines.push(line);
+                            } else {
+                                let mut spans = vec![Span::raw(format!(
+                                    "   {}{}",
+                                    indent_str, resource.address
+                                ))];
+                                if tainted {
+                                    spans.push(Span::styled(
+                                        " [tainted]".to_string(),
+                                        Style::default().fg(Color::Red),
+                                    ));
+                                }
+                                lines.push(Line::from(spans));
+                            }
                         }
-                        lines.push(Line::from(spans));
-                    } else if !explorer.filter.is_empty() {
-                        let addr = format!("   {}", resource.address);
-                        let mut line = highlight_filter_match(addr, &filter_lower);
-                        if tainted {
-                            line.spans.push(Span::styled(
-                                " [tainted]".to_string(),
-                                Style::default().fg(Color::Red),
-                            ));
-                        }
-                        lines.push(line);
-                    } else {
-                        let mut spans = vec![Span::raw(format!("   {}", resource.address))];
-                        if tainted {
-                            spans.push(Span::styled(
-                                " [tainted]".to_string(),
-                                Style::default().fg(Color::Red),
-                            ));
-                        }
-                        lines.push(Line::from(spans));
                     }
                 }
 
@@ -1328,7 +1425,7 @@ fn render_state_explorer(
             lines.push(Line::from(""));
             if !explorer.filter.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    format!("  {} / {} resources", visible_count, total),
+                    format!("  {} / {} resources", visible_resource_count, total),
                     theme::dim(),
                 )));
             }
@@ -1371,6 +1468,8 @@ fn render_state_explorer(
             Span::raw("  "),
             Span::styled("[p] Plan", theme::dim()),
             Span::raw("  "),
+            Span::styled("[a] Apply", theme::dim()),
+            Span::raw("  "),
             Span::styled("[d] Destroy", theme::dim()),
             Span::raw("  "),
             Span::styled("[Enter] Inspect", theme::dim()),
@@ -1388,7 +1487,7 @@ fn render_state_explorer(
     // Title: show resource count and selection count.
     let title_suffix = if let StateContent::Resources(r) = &explorer.content {
         let n = r.len();
-        let sel = explorer.multi_select.len();
+        let sel = explorer.multi_select.len() + explorer.module_select.len();
         if sel > 0 {
             format!(
                 " — {} resource{} ({} selected)",
@@ -1653,13 +1752,13 @@ fn render_op_confirm(
 
     // Dynamic width: fit the longest resource address.
     let addr_width = targets.iter().map(|a| a.len()).max().unwrap_or(0);
-    // 6 = "    • "; 46 = TargetedDestroy warning; 28 = footer.
+    // 6 = "    • "; 46/55 = targeted destroy/apply warning; 28 = footer.
     let content_w = (6 + addr_width)
         .max(format!("  {} {} {}:", kind.confirm_verb(), n, noun).len())
-        .max(if kind == ExplorerOpKind::TargetedDestroy {
-            46
-        } else {
-            28
+        .max(match kind {
+            ExplorerOpKind::TargetedDestroy => 46,
+            ExplorerOpKind::TargetedApply => 55,
+            _ => 28,
         });
 
     let mut lines: Vec<Line> = vec![
@@ -1680,6 +1779,12 @@ fn render_op_confirm(
     if kind == ExplorerOpKind::TargetedDestroy {
         lines.push(Line::from(Span::styled(
             "  ⚠  This will DESTROY real infrastructure.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    } else if kind == ExplorerOpKind::TargetedApply {
+        lines.push(Line::from(Span::styled(
+            "  ⚠  This will APPLY changes to real infrastructure.",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
@@ -1877,8 +1982,10 @@ mod tests {
     use crate::app::{RunSession, SessionModule};
     use crate::config::Config;
     use crate::module::{Module, ModuleKind};
+    use crate::task::{Task, TaskStatus};
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     /// Sizes spanning every width/height tier plus the two responsiveness-pass
     /// checkpoints (45×12, 40×10) and the mockup targets (120×35, 80×24).
@@ -1989,6 +2096,44 @@ mod tests {
         }
     }
 
+    /// A targeted task's `·T{n}` chip is drawn on the board row both while the
+    /// task is Running and after it finishes (Success).
+    #[test]
+    fn board_shows_target_chip_running_and_finished() {
+        for status in [TaskStatus::Running, TaskStatus::Success] {
+            let mut app = demo_app(1);
+            make_session(&mut app);
+            let path = app.modules[0].path.clone();
+            let terminal = status.is_terminal();
+            app.engine.tasks.push(Task {
+                id: 0,
+                module_path: path.clone(),
+                module_name: "mod0".to_string(),
+                command: "apply".to_string(),
+                status,
+                output_lines: Vec::new(),
+                started_at: Some(Instant::now()),
+                finished_at: terminal.then(Instant::now),
+                plan_output_path: None,
+                targets: vec!["null_resource.a".to_string(), "null_resource.b".to_string()],
+                cleanup_plan_path: None,
+                resource_counts: None,
+                cancel_handle: None,
+            });
+            app.session.as_mut().unwrap().latest_task.insert(path, 0);
+
+            let s = render_to_string(&mut app, 120, 30);
+            assert!(
+                s.contains("apply"),
+                "command missing (terminal={terminal})"
+            );
+            assert!(
+                s.contains("·T2"),
+                "target chip missing (terminal={terminal})"
+            );
+        }
+    }
+
     #[test]
     fn help_is_screen_aware() {
         // Select help mentions Select-only keys (filter/depth); Run help
@@ -2056,5 +2201,155 @@ mod tests {
         for &(w, h) in &[(38u16, 9u16), (20, 8), (2, 2), (1, 1)] {
             draw_at(&mut app, w, h);
         }
+    }
+
+    /// App with an open state explorer holding a `module.net` group (2 members)
+    /// and a root resource.
+    fn demo_explorer_app() -> App {
+        use crate::state::{StateContent, StateResource};
+        let mut app = demo_app(1);
+        let resources = ["aws_vpc.main", "module.net.null_resource.a", "module.net.null_resource.b"]
+            .iter()
+            .map(|a| StateResource {
+                address: a.to_string(),
+                instance: serde_json::json!({}),
+            })
+            .collect();
+        app.state_explorer = Some(crate::app::StateExplorer {
+            module_idx: 0,
+            module_name: "mod0".to_string(),
+            content: StateContent::Resources(resources),
+            selected: 0,
+            filter: String::new(),
+            filter_active: false,
+            detail_view: None,
+            multi_select: Vec::new(),
+            module_select: Vec::new(),
+            op_confirm: None,
+            op_targets: Vec::new(),
+            pending_op: None,
+            op_result: None,
+            plan_queued_notice: false,
+            load_rx: None,
+        });
+        app
+    }
+
+    #[test]
+    fn explorer_renders_module_header_and_indented_member() {
+        let mut app = demo_explorer_app();
+        for &(w, h) in &[(120u16, 35u16), (80, 24)] {
+            let s = render_to_string(&mut app, w, h);
+            assert!(
+                s.contains("▸ module.net (2)"),
+                "explorer header missing at {w}×{h}"
+            );
+            // Indented member row: 2-space group indent before the address.
+            assert!(
+                s.contains("  module.net.null_resource.a"),
+                "indented member missing at {w}×{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn explorer_renders_at_all_sizes() {
+        let mut app = demo_explorer_app();
+        for &(w, h) in SIZES {
+            draw_at(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn explorer_targeted_apply_confirm_renders() {
+        let mut app = demo_explorer_app();
+        {
+            let ex = app.state_explorer.as_mut().unwrap();
+            ex.op_confirm = Some(ExplorerOpKind::TargetedApply);
+            ex.op_targets = vec![
+                "module.net".to_string(),
+                "null_resource.standalone".to_string(),
+            ];
+        }
+        for &(w, h) in &[(120u16, 35u16), (80, 24)] {
+            let s = render_to_string(&mut app, w, h);
+            assert!(
+                s.contains("Targeted Apply"),
+                "confirm title missing at {w}×{h}"
+            );
+            assert!(
+                s.contains("This will APPLY changes to real infrastructure."),
+                "apply danger warning missing at {w}×{h}"
+            );
+            assert!(
+                s.contains("module.net"),
+                "module.net target missing at {w}×{h}"
+            );
+            assert!(
+                s.contains("null_resource.standalone"),
+                "null_resource.standalone target missing at {w}×{h}"
+            );
+        }
+        // Panic safety across every tier, including sizes too small to fit
+        // the popup content comfortably.
+        for &(w, h) in SIZES {
+            draw_at(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn run_board_shows_targeted_plan_badge() {
+        let mut app = demo_app(3);
+        make_session(&mut app);
+        let module_path = app.modules[0].path.clone();
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        app.engine
+            .plan_cache
+            .register(module_path, plan_path, 1, vec!["module.net".to_string()]);
+
+        // The `P:{age}·T{n}` badge is a wide-tier-only extra (`show_extras`).
+        let s = render_to_string(&mut app, 120, 35);
+        assert!(
+            s.contains("\u{b7}T1"),
+            "run board missing targeted plan badge"
+        );
+    }
+
+    #[test]
+    fn select_list_shows_targeted_plan_badge() {
+        let mut app = demo_app(3);
+        let module_path = app.modules[0].path.clone();
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        app.engine
+            .plan_cache
+            .register(module_path, plan_path, 1, vec!["module.net".to_string()]);
+
+        // The `P:{age}·T{n}` badge only renders once the list is wide enough
+        // (`show_age`, width ≥ 80); use 120×35 to be safely inside that tier.
+        let s = render_to_string(&mut app, 120, 35);
+        assert!(
+            s.contains("\u{b7}T1"),
+            "select list missing targeted plan badge"
+        );
+    }
+
+    #[test]
+    fn apply_confirm_shows_targeted_warning() {
+        let mut app = demo_app(3);
+        let module_path = app.modules[0].path.clone();
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        app.engine.plan_cache.register(
+            module_path,
+            plan_path,
+            1,
+            vec!["module.net".to_string(), "null_resource.a".to_string()],
+        );
+
+        app.request_apply_confirm(&[0]);
+        let s = render_to_string(&mut app, 120, 35);
+        assert!(
+            s.contains("TARGETED"),
+            "apply confirm missing TARGETED warning"
+        );
     }
 }

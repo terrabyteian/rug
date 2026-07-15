@@ -71,6 +71,8 @@ pub struct ConfirmTarget {
     pub module_name: String,
     /// Human-readable plan age ("2m ago") or None if no prior plan.
     pub plan_age: Option<String>,
+    /// For Apply: `-target=` addresses of the cached plan (empty = full plan).
+    pub plan_targets: Vec<String>,
     /// Lock ID (for ForceUnlock confirmations).
     pub lock_id: Option<String>,
     /// Lock holder (for ForceUnlock confirmations).
@@ -132,6 +134,8 @@ pub enum ExplorerOpKind {
     StateRm,
     /// Targeted destroy: single command with all -target flags, not sequential.
     TargetedDestroy,
+    /// Targeted apply: single `apply -auto-approve` with all -target flags.
+    TargetedApply,
 }
 
 impl ExplorerOpKind {
@@ -141,6 +145,7 @@ impl ExplorerOpKind {
             Self::Taint => "taint",
             Self::StateRm => "state",
             Self::TargetedDestroy => "destroy",
+            Self::TargetedApply => "apply",
         }
     }
 
@@ -150,6 +155,7 @@ impl ExplorerOpKind {
             Self::Taint => &[],
             Self::StateRm => &["rm"],
             Self::TargetedDestroy => &[],
+            Self::TargetedApply => &[],
         }
     }
 
@@ -158,6 +164,7 @@ impl ExplorerOpKind {
             Self::Taint => " Confirm Taint ",
             Self::StateRm => " Confirm Remove from State ",
             Self::TargetedDestroy => " ⚠  Confirm Targeted Destroy ",
+            Self::TargetedApply => " ⚠  Confirm Targeted Apply ",
         }
     }
 
@@ -166,6 +173,7 @@ impl ExplorerOpKind {
             Self::Taint => "Taint",
             Self::StateRm => "Remove from state",
             Self::TargetedDestroy => "DESTROY (targeted)",
+            Self::TargetedApply => "APPLY (targeted)",
         }
     }
 
@@ -174,6 +182,7 @@ impl ExplorerOpKind {
             Self::Taint => " Taint Progress ",
             Self::StateRm => " State Remove Progress ",
             Self::TargetedDestroy => " Targeted Destroy ",
+            Self::TargetedApply => " Targeted Apply ",
         }
     }
 
@@ -185,6 +194,8 @@ impl ExplorerOpKind {
             (Self::StateRm, false) => " State Remove — Some Failed ",
             (Self::TargetedDestroy, true) => " Targeted Destroy Complete ",
             (Self::TargetedDestroy, false) => " Targeted Destroy Failed ",
+            (Self::TargetedApply, true) => " Targeted Apply Complete ",
+            (Self::TargetedApply, false) => " Targeted Apply Failed ",
         }
     }
 }
@@ -230,12 +241,80 @@ pub struct ViewportHeights {
     pub output_top: u16,
 }
 
+/// One rendered row of the state explorer's grouped list: either a selectable
+/// module header, or a resource line (indented when it belongs to a group).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplorerRow {
+    ModuleHeader { prefix: String, count: usize },
+    /// `res_idx` is the UNFILTERED index into `StateContent::Resources`.
+    Resource { res_idx: usize, indent: bool },
+}
+
+/// Build the grouped explorer row list from `resources` under `filter`.
+///
+/// Root resources (no module prefix) come first in original order, then one
+/// group per distinct module prefix (sorted lexicographically) with its
+/// members in original order. A group header is emitted only when at least one
+/// member survives the (case-insensitive substring) filter; `count` is the
+/// number of surviving members.
+pub fn build_explorer_rows(resources: &[crate::state::StateResource], filter: &str) -> Vec<ExplorerRow> {
+    let filter_lower = filter.to_lowercase();
+    let matches = |addr: &str| filter.is_empty() || addr.to_lowercase().contains(&filter_lower);
+
+    let mut rows = Vec::new();
+
+    // Root resources first, in original order.
+    for (idx, r) in resources.iter().enumerate() {
+        if crate::state::module_prefix(&r.address).is_none() && matches(&r.address) {
+            rows.push(ExplorerRow::Resource {
+                res_idx: idx,
+                indent: false,
+            });
+        }
+    }
+
+    // Distinct module prefixes, sorted lexicographically.
+    let mut prefixes: Vec<String> = resources
+        .iter()
+        .filter_map(|r| crate::state::module_prefix(&r.address))
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+
+    for prefix in prefixes {
+        let members: Vec<usize> = resources
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                crate::state::module_prefix(&r.address).as_deref() == Some(prefix.as_str())
+                    && matches(&r.address)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        rows.push(ExplorerRow::ModuleHeader {
+            prefix,
+            count: members.len(),
+        });
+        for idx in members {
+            rows.push(ExplorerRow::Resource {
+                res_idx: idx,
+                indent: true,
+            });
+        }
+    }
+
+    rows
+}
+
 /// State shown in the state-explorer for a single module.
 pub struct StateExplorer {
     pub module_idx: usize,
     pub module_name: String,
     pub content: StateContent,
-    /// Index into the *filtered* resource list that is currently highlighted.
+    /// Index into the grouped row list (`rows()`) that is currently highlighted.
     pub selected: usize,
     /// Current filter string (case-insensitive substring match against addresses).
     pub filter: String,
@@ -245,6 +324,8 @@ pub struct StateExplorer {
     pub detail_view: Option<ResourceDetail>,
     /// Unfiltered resource indices that are multi-selected.
     pub multi_select: Vec<usize>,
+    /// Whole module prefixes that are selected (targets the module as a unit).
+    pub module_select: Vec<String>,
     /// When `Some`, a confirmation dialog is shown for the given operation.
     pub op_confirm: Option<ExplorerOpKind>,
     /// Addresses staged for the pending confirmation.
@@ -269,54 +350,103 @@ impl StateExplorer {
         }
     }
 
-    /// Indices into `resources()` that match the current filter (all, if the
-    /// filter is empty).
-    pub fn filtered_indices(&self) -> Vec<usize> {
-        let Some(resources) = self.resources() else {
-            return Vec::new();
-        };
-        if self.filter.is_empty() {
-            (0..resources.len()).collect()
-        } else {
-            let fl = self.filter.to_lowercase();
-            resources
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.address.to_lowercase().contains(&fl))
-                .map(|(i, _)| i)
-                .collect()
+    /// The grouped row list under the current filter (empty unless resources
+    /// are loaded).
+    pub fn rows(&self) -> Vec<ExplorerRow> {
+        match self.resources() {
+            Some(resources) => build_explorer_rows(resources, &self.filter),
+            None => Vec::new(),
         }
     }
 
-    /// Number of resources currently visible under the filter.
-    pub fn filtered_count(&self) -> usize {
-        self.filtered_indices().len()
+    /// Number of rows currently visible (headers included).
+    pub fn row_count(&self) -> usize {
+        self.rows().len()
     }
 
-    /// Real (unfiltered) resource index for the currently highlighted filtered row.
-    pub fn selected_real_index(&self) -> Option<usize> {
-        self.filtered_indices().get(self.selected).copied()
+    /// The currently highlighted row, if any.
+    pub fn selected_row(&self) -> Option<ExplorerRow> {
+        self.rows().into_iter().nth(self.selected)
     }
 
-    /// Addresses an operation should target: the multi-selected set
-    /// (unfiltered — this ignores the active filter) if non-empty, otherwise
-    /// just the currently highlighted filtered row.
+    /// Addresses an operation should target (`-target=` / `state rm` accept
+    /// module addresses too). If anything is selected: the deduped selected
+    /// module prefixes (a prefix covered by another selected prefix is dropped),
+    /// sorted, followed by every multi-selected resource address NOT already
+    /// covered by a selected prefix. Otherwise: the highlighted row — a header
+    /// yields its prefix, a resource its address.
     pub fn target_addresses(&self) -> Vec<String> {
         let Some(resources) = self.resources() else {
             return Vec::new();
         };
-        if !self.multi_select.is_empty() {
-            self.multi_select
+        if !self.module_select.is_empty() || !self.multi_select.is_empty() {
+            let mut prefixes: Vec<String> = self
+                .module_select
                 .iter()
-                .filter_map(|&i| resources.get(i))
-                .map(|r| r.address.clone())
-                .collect()
+                .filter(|p| {
+                    !self.module_select.iter().any(|other| {
+                        other.as_str() != p.as_str() && crate::state::is_covered_by(p, other)
+                    })
+                })
+                .cloned()
+                .collect();
+            prefixes.sort();
+            prefixes.dedup();
+
+            let mut out = prefixes.clone();
+            for &i in &self.multi_select {
+                if let Some(r) = resources.get(i) {
+                    if !prefixes
+                        .iter()
+                        .any(|p| crate::state::is_covered_by(&r.address, p))
+                    {
+                        out.push(r.address.clone());
+                    }
+                }
+            }
+            out
         } else {
-            self.selected_real_index()
-                .and_then(|i| resources.get(i))
-                .map(|r| r.address.clone())
-                .into_iter()
-                .collect()
+            match self.selected_row() {
+                Some(ExplorerRow::ModuleHeader { prefix, .. }) => vec![prefix],
+                Some(ExplorerRow::Resource { res_idx, .. }) => resources
+                    .get(res_idx)
+                    .map(|r| r.address.clone())
+                    .into_iter()
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
+    }
+
+    /// Addresses to pass to an operation of `kind`. For `Taint` (which accepts
+    /// only single resource addresses) each selected module prefix is expanded
+    /// into its managed member addresses, skipping data sources. For every
+    /// other kind, module addresses are valid so `target_addresses()` is used
+    /// verbatim.
+    pub fn op_targets_for(&self, kind: ExplorerOpKind) -> Vec<String> {
+        match kind {
+            ExplorerOpKind::Taint => {
+                let Some(resources) = self.resources() else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                for addr in self.target_addresses() {
+                    // A module prefix is never itself a full resource address.
+                    if resources.iter().any(|r| r.address == addr) {
+                        out.push(addr);
+                    } else {
+                        for r in resources {
+                            if crate::state::is_covered_by(&r.address, &addr)
+                                && !crate::state::is_data_address(&r.address)
+                            {
+                                out.push(r.address.clone());
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            _ => self.target_addresses(),
         }
     }
 }
@@ -801,6 +931,45 @@ impl App {
         }
     }
 
+    /// Make an explorer-launched task first-class on the Run board: ensure the
+    /// module is part of a session and record the task as its latest.
+    ///
+    /// If no session exists one is created containing just this module WITHOUT
+    /// switching screens (the user stays where they are; Tab/Enter reach it as
+    /// usual). If a session exists but doesn't include the module, the module is
+    /// appended (a push keeps existing cursor/selected indices — which point at
+    /// earlier positions — valid). Either way `latest_task` is updated so the
+    /// board row shows the task.
+    fn record_explorer_task(&mut self, module_idx: usize, task_id: usize) {
+        let Some(module) = self.modules.get(module_idx) else {
+            return;
+        };
+        let path = module.path.clone();
+        let name = module.display_name.clone();
+
+        match self.session.as_mut() {
+            Some(session) => {
+                if !session.modules.iter().any(|m| m.path == path) {
+                    session.modules.push(SessionModule {
+                        module_idx,
+                        path: path.clone(),
+                        name,
+                    });
+                }
+                session.latest_task.insert(path, task_id);
+            }
+            None => {
+                let mut session = RunSession::new(vec![SessionModule {
+                    module_idx,
+                    path: path.clone(),
+                    name,
+                }]);
+                session.latest_task.insert(path, task_id);
+                self.session = Some(session);
+            }
+        }
+    }
+
     /// Re-resolve the session against the current module list after a refresh:
     /// remap `module_idx` by path, drop missing modules, clamp cursor and
     /// selection. Drops the session entirely (and leaves the Run screen) if no
@@ -882,7 +1051,7 @@ impl App {
         for &idx in targets {
             let plan_path = self.engine.plan_cache.plan_path_for(&self.modules[idx].path);
             let args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
-            ids.push(self.push_task_for(idx, "plan", args, Some(plan_path), None));
+            ids.push(self.push_task_for(idx, "plan", args, Some(plan_path), Vec::new(), None));
         }
         ids
     }
@@ -896,7 +1065,7 @@ impl App {
     ) -> Vec<usize> {
         let mut ids = Vec::new();
         for &idx in targets {
-            ids.push(self.push_task_for(idx, command, extra_args.clone(), None, None));
+            ids.push(self.push_task_for(idx, command, extra_args.clone(), None, Vec::new(), None));
         }
         ids
     }
@@ -921,7 +1090,7 @@ impl App {
                 } else {
                     (vec!["-auto-approve".to_string()], None)
                 };
-            ids.push(self.push_task_for(idx, "apply", args, None, cleanup_plan_path));
+            ids.push(self.push_task_for(idx, "apply", args, None, Vec::new(), cleanup_plan_path));
         }
 
         ids
@@ -936,6 +1105,7 @@ impl App {
                 "destroy",
                 vec!["-auto-approve".to_string()],
                 None,
+                Vec::new(),
                 None,
             ));
         }
@@ -950,6 +1120,7 @@ impl App {
         command: &str,
         args: Vec<String>,
         plan_output_path: Option<PathBuf>,
+        targets: Vec<String>,
         cleanup_plan_path: Option<PathBuf>,
     ) -> usize {
         let module = &self.modules[module_idx];
@@ -959,6 +1130,7 @@ impl App {
             command: command.to_string(),
             args,
             plan_output_path,
+            targets,
             cleanup_plan_path,
         })
     }
@@ -1003,17 +1175,22 @@ impl App {
         m: &Module,
     ) -> Option<ConfirmTarget> {
         match kind {
-            ConfirmKind::Apply => Some(ConfirmTarget {
-                module_idx: idx,
-                module_name: m.display_name.clone(),
-                plan_age: self.engine.plan_cache.get(&m.path).map(|e| e.age_str()),
-                lock_id: None,
-                lock_who: None,
-            }),
+            ConfirmKind::Apply => {
+                let entry = self.engine.plan_cache.get(&m.path);
+                Some(ConfirmTarget {
+                    module_idx: idx,
+                    module_name: m.display_name.clone(),
+                    plan_age: entry.map(|e| e.age_str()),
+                    plan_targets: entry.map(|e| e.targets.clone()).unwrap_or_default(),
+                    lock_id: None,
+                    lock_who: None,
+                })
+            }
             ConfirmKind::Destroy | ConfirmKind::InitUpgrade => Some(ConfirmTarget {
                 module_idx: idx,
                 module_name: m.display_name.clone(),
                 plan_age: None,
+                plan_targets: Vec::new(),
                 lock_id: None,
                 lock_who: None,
             }),
@@ -1023,6 +1200,7 @@ impl App {
                     module_idx: idx,
                     module_name: m.display_name.clone(),
                     plan_age: None,
+                    plan_targets: Vec::new(),
                     lock_id: Some(lock.id),
                     lock_who: Some(lock.who),
                 })
@@ -1097,7 +1275,7 @@ impl App {
     fn enqueue_init_upgrade_for(&mut self, targets: &[usize]) -> Vec<usize> {
         let mut ids = Vec::new();
         for &idx in targets {
-            ids.push(self.push_task_for(idx, "init", vec!["-upgrade".to_string()], None, None));
+            ids.push(self.push_task_for(idx, "init", vec!["-upgrade".to_string()], None, Vec::new(), None));
         }
         ids
     }
@@ -1141,6 +1319,7 @@ impl App {
                 "force-unlock",
                 vec!["-force".to_string(), lock_id.clone()],
                 None,
+                Vec::new(),
                 None,
             ));
         }
@@ -1261,6 +1440,7 @@ impl App {
             filter_active: false,
             detail_view: None,
             multi_select: Vec::new(),
+            module_select: Vec::new(),
             op_confirm: None,
             op_targets: Vec::new(),
             pending_op: None,
@@ -1281,7 +1461,7 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        let count = explorer.filtered_count();
+        let count = explorer.row_count();
         if count == 0 {
             return;
         }
@@ -1296,7 +1476,7 @@ impl App {
 
     pub fn state_explorer_go_last(&mut self) {
         if let Some(explorer) = &mut self.state_explorer {
-            let count = explorer.filtered_count();
+            let count = explorer.row_count();
             if count > 0 {
                 explorer.selected = count - 1;
             }
@@ -1345,7 +1525,7 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        let count = explorer.filtered_count();
+        let count = explorer.row_count();
         if count == 0 {
             explorer.selected = 0;
         } else if explorer.selected >= count {
@@ -1360,9 +1540,13 @@ impl App {
         // Gather data under an immutable borrow first.
         let result: Option<(String, Vec<String>)> = (|| {
             let explorer = self.state_explorer.as_ref()?;
+            // Headers have no detail view — only resource rows drill down.
+            let res_idx = match explorer.selected_row()? {
+                ExplorerRow::Resource { res_idx, .. } => res_idx,
+                ExplorerRow::ModuleHeader { .. } => return None,
+            };
             let resources = explorer.resources()?;
-            let real_idx = explorer.selected_real_index()?;
-            let resource = resources.get(real_idx)?;
+            let resource = resources.get(res_idx)?;
             let address = resource.address.clone();
             let json = serde_json::to_string_pretty(&resource.instance)
                 .unwrap_or_else(|_| "{}".to_string());
@@ -1419,25 +1603,52 @@ impl App {
 
     // ── State explorer multi-select & taint ──────────────────────────────────
 
-    /// Toggle the currently highlighted resource in the multi-select set.
+    /// Toggle the currently highlighted row in the selection: a resource row
+    /// toggles its index in `multi_select`; a module header toggles its prefix
+    /// in `module_select`, and selecting a prefix drops any individually
+    /// selected member it now covers (redundancy rule).
     pub fn state_explorer_toggle_select(&mut self) {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        let Some(real_idx) = explorer.selected_real_index() else {
-            return;
-        };
-
-        if let Some(pos) = explorer.multi_select.iter().position(|&i| i == real_idx) {
-            explorer.multi_select.remove(pos);
-        } else {
-            explorer.multi_select.push(real_idx);
+        match explorer.selected_row() {
+            Some(ExplorerRow::Resource { res_idx, .. }) => {
+                if let Some(pos) = explorer.multi_select.iter().position(|&i| i == res_idx) {
+                    explorer.multi_select.remove(pos);
+                } else {
+                    explorer.multi_select.push(res_idx);
+                }
+            }
+            Some(ExplorerRow::ModuleHeader { prefix, .. }) => {
+                if let Some(pos) = explorer.module_select.iter().position(|p| p == &prefix) {
+                    explorer.module_select.remove(pos);
+                } else {
+                    // Compute covered members under an immutable borrow first.
+                    let covered: Vec<usize> = match &explorer.content {
+                        StateContent::Resources(rs) => explorer
+                            .multi_select
+                            .iter()
+                            .copied()
+                            .filter(|&i| {
+                                rs.get(i)
+                                    .map(|r| crate::state::is_covered_by(&r.address, &prefix))
+                                    .unwrap_or(false)
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    explorer.multi_select.retain(|i| !covered.contains(i));
+                    explorer.module_select.push(prefix);
+                }
+            }
+            None => {}
         }
     }
 
     pub fn state_explorer_clear_select(&mut self) {
         if let Some(explorer) = &mut self.state_explorer {
             explorer.multi_select.clear();
+            explorer.module_select.clear();
         }
     }
 
@@ -1462,7 +1673,15 @@ impl App {
         for addr in &targets {
             args.push(format!("-target={}", addr));
         }
-        self.push_task_for(module_idx, "plan", args, Some(plan_path), None);
+        let task_id = self.push_task_for(
+            module_idx,
+            "plan",
+            args,
+            Some(plan_path),
+            targets.clone(),
+            None,
+        );
+        self.record_explorer_task(module_idx, task_id);
         if let Some(explorer) = self.state_explorer.as_mut() {
             explorer.plan_queued_notice = true;
         }
@@ -1473,7 +1692,7 @@ impl App {
         let Some(explorer) = &mut self.state_explorer else {
             return;
         };
-        let targets = explorer.target_addresses();
+        let targets = explorer.op_targets_for(kind);
         if targets.is_empty() {
             return;
         }
@@ -1512,7 +1731,9 @@ impl App {
                 let remaining = targets;
                 let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
                 args.push(first.clone());
-                let task_id = self.push_task_for(module_idx, kind.command(), args, None, None);
+                let task_id =
+                    self.push_task_for(module_idx, kind.command(), args, None, vec![first.clone()], None);
+                self.record_explorer_task(module_idx, task_id);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {
                         kind,
@@ -1521,11 +1742,15 @@ impl App {
                         done: Vec::new(),
                     });
                     explorer.multi_select.clear();
+                    explorer.module_select.clear();
                 }
             }
-            ExplorerOpKind::TargetedDestroy => {
-                // Single batch: all -target flags in one command.
+            ExplorerOpKind::TargetedDestroy | ExplorerOpKind::TargetedApply => {
+                // Single batch: all -target flags in one command. Runs
+                // `<command> -auto-approve -target=…` directly; a targeted apply
+                // deliberately does NOT consume the module's cached plan entry.
                 let n = targets.len();
+                let task_targets = targets.clone();
                 let mut args = vec!["-auto-approve".to_string()];
                 for addr in &targets {
                     args.push(format!("-target={}", addr));
@@ -1535,7 +1760,9 @@ impl App {
                 } else {
                     format!("{} targeted resources", n)
                 };
-                let task_id = self.push_task_for(module_idx, "destroy", args, None, None);
+                let task_id =
+                    self.push_task_for(module_idx, kind.command(), args, None, task_targets, None);
+                self.record_explorer_task(module_idx, task_id);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {
                         kind,
@@ -1544,6 +1771,7 @@ impl App {
                         done: Vec::new(),
                     });
                     explorer.multi_select.clear();
+                    explorer.module_select.clear();
                 }
             }
         }
@@ -1601,7 +1829,15 @@ impl App {
             }) => {
                 let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
                 args.push(addr.clone());
-                let new_task_id = self.push_task_for(module_idx, kind.command(), args, None, None);
+                let new_task_id = self.push_task_for(
+                    module_idx,
+                    kind.command(),
+                    args,
+                    None,
+                    vec![addr.clone()],
+                    None,
+                );
+                self.record_explorer_task(module_idx, new_task_id);
                 if let Some(pt) = self
                     .state_explorer
                     .as_mut()
@@ -1688,7 +1924,8 @@ impl App {
         explorer.load_rx = None;
         explorer.content = content;
         explorer.multi_select.clear();
-        let count = explorer.filtered_count();
+        explorer.module_select.clear();
+        let count = explorer.row_count();
         if count == 0 {
             explorer.selected = 0;
         } else if explorer.selected >= count {
@@ -1766,6 +2003,7 @@ mod tests {
             started_at: Some(Instant::now()),
             finished_at: Some(Instant::now()),
             plan_output_path: Some(plan_path),
+            targets: Vec::new(),
             cleanup_plan_path: None,
             resource_counts: None,
             cancel_handle: None,
@@ -1830,9 +2068,423 @@ mod tests {
         push_plan_task(&mut app, 2, plan_path.clone());
         app.engine
             .plan_cache
-            .register(module_path, plan_path, app.engine.tasks[1].id);
+            .register(module_path, plan_path, app.engine.tasks[1].id, Vec::new());
 
         assert!(app.ready_plan_for_task(&app.engine.tasks[0]).is_none());
         assert!(app.ready_plan_for_task(&app.engine.tasks[1]).is_some());
+    }
+
+    // ── State explorer grouped rows & module targeting ───────────────────────
+
+    fn explorer_with(addrs: &[&str]) -> StateExplorer {
+        let resources = addrs
+            .iter()
+            .map(|a| crate::state::StateResource {
+                address: a.to_string(),
+                instance: serde_json::json!({}),
+            })
+            .collect();
+        StateExplorer {
+            module_idx: 0,
+            module_name: "app".to_string(),
+            content: StateContent::Resources(resources),
+            selected: 0,
+            filter: String::new(),
+            filter_active: false,
+            detail_view: None,
+            multi_select: Vec::new(),
+            module_select: Vec::new(),
+            op_confirm: None,
+            op_targets: Vec::new(),
+            pending_op: None,
+            op_result: None,
+            plan_queued_notice: false,
+            load_rx: None,
+        }
+    }
+
+    #[test]
+    fn build_explorer_rows_groups_root_first_and_sorts() {
+        let ex = explorer_with(&[
+            "aws_vpc.main",
+            "module.net.null_resource.a",
+            "module.app.null_resource.b",
+            "module.net.null_resource.c",
+        ]);
+        assert_eq!(
+            ex.rows(),
+            vec![
+                ExplorerRow::Resource {
+                    res_idx: 0,
+                    indent: false
+                },
+                ExplorerRow::ModuleHeader {
+                    prefix: "module.app".into(),
+                    count: 1
+                },
+                ExplorerRow::Resource {
+                    res_idx: 2,
+                    indent: true
+                },
+                ExplorerRow::ModuleHeader {
+                    prefix: "module.net".into(),
+                    count: 2
+                },
+                ExplorerRow::Resource {
+                    res_idx: 1,
+                    indent: true
+                },
+                ExplorerRow::Resource {
+                    res_idx: 3,
+                    indent: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_explorer_rows_filter_prunes_empty_groups_and_adjusts_count() {
+        let mut ex = explorer_with(&[
+            "module.net.null_resource.alpha",
+            "module.net.null_resource.beta",
+            "module.app.null_resource.c",
+        ]);
+        ex.filter = "alpha".to_string();
+        // module.app pruned; module.net count drops to the single match.
+        assert_eq!(
+            ex.rows(),
+            vec![
+                ExplorerRow::ModuleHeader {
+                    prefix: "module.net".into(),
+                    count: 1
+                },
+                ExplorerRow::Resource {
+                    res_idx: 0,
+                    indent: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn header_toggle_drops_covered_member() {
+        let mut app = test_app();
+        app.state_explorer = Some(explorer_with(&[
+            "module.net.null_resource.a",
+            "module.net.null_resource.b",
+        ]));
+        // rows: [Header, Res0, Res1]. Select member Res0 first.
+        app.state_explorer.as_mut().unwrap().selected = 1;
+        app.state_explorer_toggle_select();
+        assert_eq!(app.state_explorer.as_ref().unwrap().multi_select, vec![0]);
+        // Now select the header — the covered member is dropped.
+        app.state_explorer.as_mut().unwrap().selected = 0;
+        app.state_explorer_toggle_select();
+        let ex = app.state_explorer.as_ref().unwrap();
+        assert!(ex.multi_select.is_empty());
+        assert_eq!(ex.module_select, vec!["module.net".to_string()]);
+    }
+
+    #[test]
+    fn target_addresses_dedups_covered_prefixes_and_members() {
+        let mut ex = explorer_with(&[
+            "aws_vpc.main",
+            "module.a.null_resource.m",
+            "module.a.module.b.null_resource.n",
+        ]);
+        ex.module_select = vec!["module.a".into(), "module.a.module.b".into()];
+        ex.multi_select = vec![0, 1];
+        assert_eq!(
+            ex.target_addresses(),
+            vec!["module.a".to_string(), "aws_vpc.main".to_string()]
+        );
+    }
+
+    #[test]
+    fn op_targets_taint_expands_module_skipping_data() {
+        let mut ex = explorer_with(&[
+            "module.net.null_resource.a",
+            "module.net.data.aws_ami.u",
+            "module.net.null_resource.b",
+        ]);
+        ex.module_select = vec!["module.net".into()];
+        assert_eq!(
+            ex.op_targets_for(ExplorerOpKind::Taint),
+            vec![
+                "module.net.null_resource.a".to_string(),
+                "module.net.null_resource.b".to_string(),
+            ]
+        );
+        // Non-taint ops accept the module address itself.
+        assert_eq!(
+            ex.op_targets_for(ExplorerOpKind::StateRm),
+            vec!["module.net".to_string()]
+        );
+    }
+
+    #[test]
+    fn open_detail_noop_on_header() {
+        let mut app = test_app();
+        app.state_explorer = Some(explorer_with(&["module.net.null_resource.a"]));
+        // rows: [Header, Res0]. Cursor on the header → no detail opens.
+        app.state_explorer.as_mut().unwrap().selected = 0;
+        app.open_resource_detail();
+        assert!(app.state_explorer.as_ref().unwrap().detail_view.is_none());
+        // On the resource row it opens.
+        app.state_explorer.as_mut().unwrap().selected = 1;
+        app.open_resource_detail();
+        assert!(app.state_explorer.as_ref().unwrap().detail_view.is_some());
+    }
+
+    // ── Targeted plan/apply threading (Package 2) ─────────────────────────────
+
+    /// App whose engine spawns `echo` (in a real temp dir) instead of a real
+    /// binary. `echo` prints the command line back on stdout, so the `-target=`
+    /// args a task was spawned with surface in `Task::output_lines` — the only
+    /// way to observe them (`Task` doesn't retain `args`).
+    fn echo_app_at(dir: PathBuf) -> App {
+        let modules = vec![Module {
+            path: dir.clone(),
+            display_name: "app".to_string(),
+            kind: ModuleKind::Root,
+        }];
+        let config = Config {
+            binary: "echo".to_string(),
+            parallelism: 1,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+        };
+        App::new(config, dir, modules).unwrap()
+    }
+
+    /// Drive the engine to quiescence (like the engine's own queue test).
+    async fn drain_engine(app: &mut App) {
+        use std::time::Duration;
+        let drain = async {
+            while app.engine.has_active_tasks() {
+                app.engine.next_update().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("engine did not settle within 10s");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_plan_threads_target_args_and_plan_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = echo_app_at(tmp.path().to_path_buf());
+        // rows: [Header(module.net), Res0]; highlight the header → whole-module
+        // target.
+        app.state_explorer = Some(explorer_with(&["module.net.null_resource.a"]));
+        app.state_explorer.as_mut().unwrap().selected = 0;
+
+        app.enqueue_targeted_plan();
+
+        // Metadata (`targets`) is threaded synchronously at enqueue time.
+        let id = app.engine.tasks.iter().max_by_key(|t| t.id).unwrap().id;
+        assert_eq!(
+            app.engine.task(id).unwrap().targets,
+            vec!["module.net".to_string()]
+        );
+
+        // The `-target=` CLI arg is observable only via echoed output.
+        drain_engine(&mut app).await;
+        let task = app.engine.task(id).unwrap();
+        assert_eq!(task.command, "plan");
+        assert!(task
+            .output_lines
+            .iter()
+            .any(|l| l.contains("-target=module.net")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_apply_runs_batched_and_keeps_cached_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = echo_app_at(tmp.path().to_path_buf());
+        let module_path = app.modules[0].path.clone();
+
+        // Pre-register a cached plan entry; a targeted apply must NOT consume it.
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        app.engine.plan_cache.register(
+            module_path.clone(),
+            plan_path,
+            99,
+            vec!["null_resource.a".into()],
+        );
+        let before = app.engine.plan_cache.entry_count();
+
+        // Stage a targeted apply for a whole module.
+        let mut explorer = explorer_with(&["module.net.null_resource.a"]);
+        explorer.op_confirm = Some(ExplorerOpKind::TargetedApply);
+        explorer.op_targets = vec!["module.net".to_string()];
+        explorer.module_select = vec!["module.net".to_string()];
+        app.state_explorer = Some(explorer);
+
+        app.start_op();
+
+        // A single batched apply task; PendingOp is set and selection cleared.
+        let id = app.engine.tasks.iter().max_by_key(|t| t.id).unwrap().id;
+        assert_eq!(app.engine.task(id).unwrap().command, "apply");
+        let ex = app.state_explorer.as_ref().unwrap();
+        assert!(ex.pending_op.is_some());
+        assert!(ex.module_select.is_empty());
+
+        // The cached plan entry survives (apply ran -target directly, not from it).
+        assert_eq!(app.engine.plan_cache.entry_count(), before);
+
+        // Batched form: `-auto-approve -target=…`, in that order.
+        drain_engine(&mut app).await;
+        assert!(app
+            .engine
+            .task(id)
+            .unwrap()
+            .output_lines
+            .iter()
+            .any(|l| l.contains("-auto-approve -target=module.net")));
+    }
+
+    #[test]
+    fn apply_confirm_carries_plan_targets() {
+        let mut app = test_app();
+        let module_path = app.modules[0].path.clone();
+        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        app.engine.plan_cache.register(
+            module_path,
+            plan_path,
+            7,
+            vec!["module.net".into(), "null_resource.a".into()],
+        );
+
+        app.request_apply_confirm(&[0]);
+
+        let Some(Modal::Confirm(confirm)) = &app.modal else {
+            panic!("apply confirm not staged");
+        };
+        assert_eq!(confirm.kind, ConfirmKind::Apply);
+        assert_eq!(
+            confirm.targets[0].plan_targets,
+            vec!["module.net".to_string(), "null_resource.a".to_string()]
+        );
+    }
+
+    // ── Explorer tasks become first-class on the Run board (Package 3) ────────
+
+    /// Multi-module `echo` app; each module lives in a real subdir of `root`.
+    fn echo_multi_app(root: PathBuf, n: usize) -> App {
+        let modules: Vec<Module> = (0..n)
+            .map(|i| {
+                let path = root.join(format!("m{i}"));
+                std::fs::create_dir_all(&path).unwrap();
+                Module {
+                    path,
+                    display_name: format!("m{i}"),
+                    kind: ModuleKind::Root,
+                }
+            })
+            .collect();
+        let config = Config {
+            binary: "echo".to_string(),
+            parallelism: 1,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+        };
+        App::new(config, root, modules).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explorer_plan_creates_session_without_switching_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = echo_app_at(tmp.path().to_path_buf());
+        assert!(app.session.is_none());
+        assert_eq!(app.screen, Screen::Select);
+
+        app.state_explorer = Some(explorer_with(&["module.net.null_resource.a"]));
+        app.state_explorer.as_mut().unwrap().selected = 0;
+        app.enqueue_targeted_plan();
+
+        // A session was created holding just this module; screen unchanged.
+        assert_eq!(app.screen, Screen::Select);
+        let path = app.modules[0].path.clone();
+        let id = app.engine.tasks.iter().max_by_key(|t| t.id).unwrap().id;
+        let session = app.session.as_ref().expect("session created");
+        assert_eq!(session.modules.len(), 1);
+        assert_eq!(session.modules[0].path, path);
+        assert_eq!(session.latest_task.get(&path), Some(&id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explorer_apply_appends_module_and_records_latest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = echo_multi_app(tmp.path().to_path_buf(), 2);
+
+        // Existing session holding only module 0, with board state set.
+        let mut session = RunSession::new(vec![SessionModule {
+            module_idx: 0,
+            path: app.modules[0].path.clone(),
+            name: app.modules[0].display_name.clone(),
+        }]);
+        session.cursor = 0;
+        session.selected = vec![0];
+        app.session = Some(session);
+
+        // Targeted apply on module 1 via the explorer.
+        let stage_apply = |app: &mut App| {
+            let mut explorer = explorer_with(&["null_resource.a"]);
+            explorer.module_idx = 1;
+            explorer.op_confirm = Some(ExplorerOpKind::TargetedApply);
+            explorer.op_targets = vec!["null_resource.a".to_string()];
+            app.state_explorer = Some(explorer);
+            app.start_op();
+        };
+        stage_apply(&mut app);
+
+        let m1 = app.modules[1].path.clone();
+        let id = app.engine.tasks.iter().max_by_key(|t| t.id).unwrap().id;
+        {
+            let session = app.session.as_ref().unwrap();
+            assert_eq!(session.modules.len(), 2, "module 1 appended");
+            assert_eq!(session.modules[1].path, m1);
+            // Earlier cursor/selection indices remain valid after the append.
+            assert_eq!(session.cursor, 0);
+            assert_eq!(session.selected, vec![0]);
+            assert_eq!(session.latest_task.get(&m1), Some(&id));
+        }
+
+        // Running an op on a module already in the session: no duplicate row,
+        // latest_task updated to the newest task.
+        stage_apply(&mut app);
+        let id2 = app.engine.tasks.iter().max_by_key(|t| t.id).unwrap().id;
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(session.modules.len(), 2, "module 1 not duplicated");
+        assert_eq!(session.latest_task.get(&m1), Some(&id2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_ops_carry_targets_full_plan_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = echo_app_at(tmp.path().to_path_buf());
+
+        // Full (untargeted) plan carries an empty target list.
+        let ids = app.enqueue_plan(&[0]);
+        assert!(app.engine.task(ids[0]).unwrap().targets.is_empty());
+
+        // Targeted destroy via the explorer carries the `-target=` addresses.
+        let mut explorer = explorer_with(&["module.net.null_resource.a"]);
+        explorer.op_confirm = Some(ExplorerOpKind::TargetedDestroy);
+        explorer.op_targets = vec!["module.net".to_string()];
+        app.state_explorer = Some(explorer);
+        app.start_op();
+        let id = app.engine.tasks.iter().max_by_key(|t| t.id).unwrap().id;
+        assert_eq!(app.engine.task(id).unwrap().command, "destroy");
+        assert_eq!(
+            app.engine.task(id).unwrap().targets,
+            vec!["module.net".to_string()]
+        );
     }
 }
