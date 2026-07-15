@@ -6,3 +6,4 @@ fixtures/.state/
 **/.terraform/
 **/*.tfstate.backup
 **/*.tfstate.*.backup
+**/.terraform.tfstate.lock.info
