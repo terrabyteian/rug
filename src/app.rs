@@ -1986,6 +1986,7 @@ mod tests {
             parallelism: 1,
             ignore_dirs: Vec::new(),
             show_library_modules: false,
+            ..Default::default()
         };
 
         App::new(config, root, modules).unwrap()
@@ -2024,6 +2025,7 @@ mod tests {
             parallelism: 1,
             ignore_dirs: Vec::new(),
             show_library_modules: false,
+            ..Default::default()
         };
         App::new(config, root, modules).unwrap()
     }
@@ -2253,6 +2255,7 @@ mod tests {
             parallelism: 1,
             ignore_dirs: Vec::new(),
             show_library_modules: false,
+            ..Default::default()
         };
         App::new(config, dir, modules).unwrap()
     }
@@ -2390,6 +2393,7 @@ mod tests {
             parallelism: 1,
             ignore_dirs: Vec::new(),
             show_library_modules: false,
+            ..Default::default()
         };
         App::new(config, root, modules).unwrap()
     }

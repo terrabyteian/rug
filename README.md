@@ -173,7 +173,17 @@ usable terminal size is 40×10; below that the TUI shows a resize prompt.
 
 ## Configuration
 
-`rug.toml` in the working directory (all fields optional):
+rug reads `rug.toml` from the directory it starts in (`--dir`, defaulting to the
+current directory) and, failing that, each parent directory in turn — the nearest one
+wins. So a single `rug.toml` at the top of your repo applies no matter how deep you
+`cd` before running rug.
+
+The search stops at your repository root (the directory holding `.git`) or your home
+directory, whichever comes first, so a `rug.toml` belonging to an unrelated project
+further up the tree is never picked up. `rug list` prints which file was used. A
+`rug.toml` that exists but can't be parsed is an error rather than being ignored.
+
+All fields are optional:
 
 ```toml
 # Path to the terraform/tofu binary.

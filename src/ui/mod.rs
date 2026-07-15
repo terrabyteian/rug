@@ -2005,6 +2005,7 @@ mod tests {
             parallelism: 2,
             ignore_dirs: Vec::new(),
             show_library_modules: false,
+            ..Default::default()
         };
         App::new(config, root, modules).unwrap()
     }

@@ -112,6 +112,10 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::List) => {
+            match &config.source {
+                Some(path) => println!("config: {}", path.display()),
+                None => println!("config: (defaults)"),
+            }
             if all_modules.is_empty() {
                 println!("No modules found under {}", root.display());
             } else {
