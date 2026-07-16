@@ -1,8 +1,11 @@
 # rug — terraform/tofu multiplexer
 
-Run terraform/tofu commands across a directory tree of modules. Interactive TUI by default; headless CLI for scripting.
+**Run terraform/tofu across every module in your repo — in parallel, from one terminal.**
 
-![TUI demo](docs/demo-tui.gif)
+rug discovers the root modules under a directory tree and multiplexes commands
+across them: an interactive TUI by default, a headless CLI for scripts and CI.
+
+![Eighteen terraform modules planned in parallel on the rug status board](docs/demo-hero.gif)
 
 ## Install
 
@@ -22,23 +25,88 @@ curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh 
 cargo install --path .
 ```
 
-## What it does
-
-`rug` discovers terraform/tofu root modules under a directory tree and lets you run operations on them in parallel. In TUI mode you navigate modules, multi-select, and watch live output side by side. In headless mode you pipe it into CI scripts with `--all` or narrow the scope with `--filter`.
-
-## Usage
-
-### TUI
+Then point it at your infrastructure:
 
 ```sh
-rug                    # discover modules under current directory
+rug                    # discover modules under the current directory
 rug --dir infra/       # start from a specific root
-rug --show-library     # also show library modules (no backend/state signals)
 ```
 
-### Headless subcommands
+## Features
+
+Everything below is real output, recorded against the fixture tree in this repo.
+
+### Pick your modules fast
+
+Type `/` to narrow the list as you type, `Space` to mark modules, `*` to grab
+everything visible, and `[` / `]` to fold the tree by depth. Scope a run across
+a big monorepo in seconds — no cd-ing around.
+
+![Filtering the module list live, multi-selecting, and folding the tree by depth](docs/demo-select.gif)
+
+### Watch every run, live
+
+One board for the whole run: command, status, timing, and resource changes per
+module, with the highlighted module's output streaming underneath. `Enter`
+fullscreens the output. `C` cancels — an interrupt first, not a hard kill, so
+terraform shuts down gracefully and releases its state lock.
+
+![Three plans running in parallel with live output, fullscreen, and a clean cancel](docs/demo-run.gif)
+
+*Cancelling only the marked task: the other two run to completion.*
+
+### Apply the exact plan you reviewed
+
+A successful plan is saved per module and badged `P:{age}`. Apply consumes that
+saved plan file instead of re-planning, and the confirm dialog shows which plan
+it will use and how old it is. No drift between what you reviewed and what ships.
+
+![Planning a module, then applying the cached plan file it produced](docs/demo-cached-plan.gif)
+
+### Browse state without leaving the terminal
+
+Press `s` on any module to open the state explorer: resources grouped by child
+module, tainted resources flagged, `/` filtering by address, and `Enter` to
+inspect any resource's attributes as highlighted JSON.
+
+![Browsing 48 state resources grouped by module, filtering, and inspecting one](docs/demo-explorer.gif)
+
+### Target exactly what you mean
+
+In the explorer, `Space` on a module header selects the whole module as a single
+`-target=`. Targeted plans land on the task board like any other task, and
+applying a targeted cached plan warns you and lists precisely which addresses it
+covers — nothing sneaks in.
+
+![Selecting a whole child module in the explorer and running a targeted plan and apply](docs/demo-targeted.gif)
+
+*The `·T{n}` chip on a task counts its `-target=` addresses.*
+
+### Also in the box
+
+- **Force-unlock** — `U` reads the lock's holder and id from the module's state
+  lock and clears it after a confirm.
+- **Copy output anywhere** — drag to select in the output pane (auto-copies on
+  release), `y`/`Y` re-copy; OSC 52 means copying works over SSH and inside
+  tmux or zellij. See [key bindings](#tui-key-bindings).
+- **Output wrap** — `w` toggles character wrap in the output pane.
+- **Library modules** — `--show-library` also lists modules with no
+  backend/state signals.
+- **One config, any depth** — a single `rug.toml` at the repo root applies no
+  matter where you run from. See [Configuration](#configuration).
+- **Arbitrary subcommands** — `rug exec validate --all` runs anything the
+  binary supports.
+
+## Headless mode
+
+The same engine without the UI: output streams with a per-module prefix, and
+the exit code tells CI what happened.
+
+![rug list, then a filtered headless plan streaming per-module output](docs/demo-headless.gif)
 
 `--dir` must come **before** the subcommand.
+
+### Headless subcommands
 
 | Subcommand | What it runs | Notes |
 |---|---|---|
@@ -47,7 +115,7 @@ rug --show-library     # also show library modules (no backend/state signals)
 | `apply` | `terraform apply -auto-approve` | prompts for confirmation unless `-y` |
 | `destroy` | `terraform destroy -auto-approve` | prompts for confirmation unless `-y` |
 | `exec <cmd> [args...]` | arbitrary subcommand | |
-| `list` | prints discovered modules and exits | |
+| `list` | prints the config file in use and discovered modules, then exits | |
 
 **Common flags** (init/plan/apply/destroy/exec):
 
@@ -66,22 +134,51 @@ rug --dir infra/ exec validate --all
 rug --dir infra/ list
 ```
 
-![Headless plan demo](docs/demo-headless.gif)
+**Exit codes:** rug exits `0` when every task succeeds, and `1` when any task
+fails or no modules match the filter — a failed plan fails the pipeline.
+
+## Configuration
+
+rug reads `rug.toml` from the start directory (`--dir`, defaulting to the
+current directory) or the nearest ancestor that has one, stopping at the
+repository root (the directory holding `.git`) or your home directory — so one
+`rug.toml` at the top of the repo applies at any depth, and an unrelated
+project's config further up is never picked up. `rug list` prints which file
+was used; a `rug.toml` that exists but can't be parsed is an error rather than
+being ignored.
+
+All fields are optional:
+
+```toml
+# Path to the terraform/tofu binary.
+# Overridden by TF_BINARY env var; auto-detected if omitted.
+binary = "tofu"
+
+# Maximum number of concurrent terraform processes (default: 4).
+parallelism = 4
+
+# Directories to skip during module discovery.
+ignore_dirs = [".terraform", ".git", "node_modules", ".terragrunt-cache"]
+
+# Show library modules (no backend/lock signals) in the TUI (default: false).
+show_library_modules = false
+```
+
+**Binary detection priority:**
+
+1. `TF_BINARY` environment variable
+2. `binary` field in `rug.toml`
+3. `tofu` on PATH
+4. `terraform` on PATH
 
 ## TUI key bindings
 
-The TUI has two screens. The **Select** screen is a full-window module picker: use
-`/` to filter by name and `Space` to multi-select. Press `Enter` (or any action key)
-to move to the **Run** screen — a status board of the modules you brought over, with a
-live output pane for the highlighted module. Actions on the Run screen apply to the
-whole session (or a board subset you mark with `Space`); the `Shift` variant targets
-just the highlighted row. Press `Esc` to return to Select while tasks keep running,
-and `Tab` from Select to jump back into the running session.
-
-Modules with a successful cached plan ready to apply are marked `P:{age}`; a later
-apply consumes that cached plan file automatically.
-
-![Filter and select demo](docs/demo-filter.gif)
+The TUI has two screens. The **Select** screen is a full-window module picker;
+`Enter` (or any action key) moves to the **Run** screen — a status board with a
+live output pane for the highlighted module. Actions on the Run screen apply to
+the whole session or a marked subset; the `Shift` variant targets just the
+highlighted row. `Esc` returns to Select while tasks keep running; `Tab` jumps
+back into the running session. The minimum usable terminal size is 40×10.
 
 **Select screen**
 
@@ -131,16 +228,19 @@ apply consumes that cached plan file automatically.
 | `?` | Help |
 | `q` / `Ctrl-C` | Quit |
 
-Selected text is copied two ways at once: to the system clipboard, and as an OSC 52 escape so the copy also works over SSH and inside tmux (`set -g set-clipboard on`) or zellij, provided your terminal supports OSC 52. If you prefer the terminal emulator's native selection, hold `Shift` while dragging — this bypasses rug's selection handling. Output wrap (`w`) breaks lines at character boundaries.
+Selected text is copied two ways at once: to the system clipboard, and as an
+OSC 52 escape so the copy also works over SSH and inside tmux
+(`set -g set-clipboard on`) or zellij, provided your terminal supports OSC 52.
+To use the terminal emulator's native selection instead, hold `Shift` while
+dragging. Output wrap (`w`) breaks lines at character boundaries.
 
 **State explorer**
 
-Press `s` on either screen to browse the highlighted module's state. Resources are
-grouped by child module: a header row like `▸ module.net (3)` sits above its indented
-member resources. Pressing `Space` on a header selects the whole module as a single
-`-target=module.net`; pressing it on a resource selects that resource individually.
-Targeted operations act on the current selection (or the highlighted row if nothing
-is selected).
+Resources are grouped by child module: a header row like `▸ module.net (3)`
+sits above its indented member resources. `Space` on a header selects the whole
+module as a single `-target=`; on a resource it selects that resource alone.
+Targeted operations act on the current selection, or the highlighted row if
+nothing is selected.
 
 | Key | Action |
 |---|---|
@@ -157,60 +257,14 @@ is selected).
 | `r` | Refresh state |
 | `Esc` / `q` | Close |
 
-Every operation launched from the state explorer — targeted plan, apply, destroy,
-taint, and state rm — appears on the Run screen task board. If you have no active
-Run session a fresh one is created automatically (containing the module you acted
-on); if a session already exists, the module is added to it. You stay in the state
-explorer either way, and reach the board with `Tab` or `Enter` as usual. A targeted
-task shows a `·T{n}` count next to its command (e.g. `apply·T2`) while it runs and in
-its finished result row, where `n` is the number of `-target=` addresses.
-
-Apply and destroy prompt for confirmation. `apply` consumes a cached plan (`P:{age}`)
-per module when one is available. A **targeted** plan (made with `p` in the state
-explorer) marks the module's plan badge with a `T{n}` suffix — `P:{age}·T{n}` — where
-`n` is the number of `-target=` addresses. (This plan-cache badge is distinct from the
-per-task `·T{n}` count above.) Applying a targeted cached plan warns you
-in the confirm dialog and lists exactly which addresses the apply covers. Targeted
-apply and destroy from the state explorer run `apply`/`destroy -target=…` directly
-and never consume the cached plan. The state explorer opens with `s` on either
-screen — `Enter` no longer opens it. Pane dragging has been removed. The minimum
-usable terminal size is 40×10; below that the TUI shows a resize prompt.
-
-## Configuration
-
-rug reads `rug.toml` from the directory it starts in (`--dir`, defaulting to the
-current directory) and, failing that, each parent directory in turn — the nearest one
-wins. So a single `rug.toml` at the top of your repo applies no matter how deep you
-`cd` before running rug.
-
-The search stops at your repository root (the directory holding `.git`) or your home
-directory, whichever comes first, so a `rug.toml` belonging to an unrelated project
-further up the tree is never picked up. `rug list` prints which file was used. A
-`rug.toml` that exists but can't be parsed is an error rather than being ignored.
-
-All fields are optional:
-
-```toml
-# Path to the terraform/tofu binary.
-# Overridden by TF_BINARY env var; auto-detected if omitted.
-binary = "tofu"
-
-# Maximum number of concurrent terraform processes (default: 4).
-parallelism = 4
-
-# Directories to skip during module discovery.
-ignore_dirs = [".terraform", ".git", "node_modules", ".terragrunt-cache"]
-
-# Show library modules (no backend/lock signals) in the TUI (default: false).
-show_library_modules = false
-```
-
-**Binary detection priority:**
-
-1. `TF_BINARY` environment variable
-2. `binary` field in `rug.toml`
-3. `tofu` on PATH
-4. `terraform` on PATH
+Operations launched from the state explorer appear on the Run screen task
+board, joining the existing session or creating one. A targeted task shows a
+`·T{n}` count next to its command (e.g. `apply·T2`), where `n` is the number of
+`-target=` addresses. A module's cached-plan badge gets the same suffix when
+the plan was targeted — `P:{age}·T{n}` — and applying such a plan warns you in
+the confirm dialog and lists exactly which addresses the apply covers. Targeted
+apply and destroy launched from the explorer run `-target=…` directly and never
+consume the cached plan.
 
 ## Supported platforms
 

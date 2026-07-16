@@ -2,13 +2,29 @@ Output docs/demo-headless.gif
 
 Set Shell "zsh"
 Set FontSize 14
-Set Width 1000
-Set Height 480
+Set Width 1200
+Set Height 720
 Set Theme "Dracula"
 Set Framerate 24
-Set TypingSpeed 60ms
+Set TypingSpeed 50ms
 
-# Move to project root and run headless plan
-Type "cd /Users/ian/projects/rug && ./target/release/rug --dir fixtures/ plan --filter infra"
+# Hidden setup: alias so the visible command is just `rug`
+Hide
+Type `alias rug="$PWD/target/release/rug"; clear`
 Enter
-Sleep 6s
+Show
+
+# List the discovered modules
+Type "rug --dir fixtures/ list"
+Enter
+Sleep 3s
+
+# Plan a subtree headlessly — output streams with a per-module prefix
+Type "rug --dir fixtures/ plan --filter platform"
+Enter
+Sleep 14s
+
+# Exit code for CI
+Type "echo $?"
+Enter
+Sleep 2.5s
