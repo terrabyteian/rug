@@ -104,3 +104,221 @@ fn apply_sgr(seq: &str, base: Style) -> Style {
         _ => s,
     })
 }
+
+/// Sub-line of `line` covering char range `range`, with the intersection of
+/// `sel` restyled reversed. Both ranges are char indices over the
+/// concatenation of the line's span contents (= the ANSI-stripped text).
+pub(crate) fn slice_spans(
+    line: &Line<'static>,
+    range: std::ops::Range<usize>,
+    sel: Option<std::ops::Range<usize>>,
+) -> Line<'static> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut offset = 0usize;
+
+    for span in line.spans.iter() {
+        let chars: Vec<char> = span.content.chars().collect();
+        let span_start = offset;
+        let span_end = span_start + chars.len();
+        offset = span_end;
+
+        // Intersect this span's char range with the requested `range`.
+        let lo = range.start.max(span_start);
+        let hi = range.end.min(span_end);
+        if lo >= hi {
+            continue;
+        }
+
+        // Split the kept portion further at any `sel` boundaries that fall
+        // strictly inside it, so each emitted fragment is either wholly
+        // inside or wholly outside the selection.
+        let mut points = vec![lo, hi];
+        if let Some(sel) = &sel {
+            if sel.start > lo && sel.start < hi {
+                points.push(sel.start);
+            }
+            if sel.end > lo && sel.end < hi {
+                points.push(sel.end);
+            }
+        }
+        points.sort_unstable();
+        points.dedup();
+
+        for w in points.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if a >= b {
+                continue;
+            }
+            let text: String = chars[(a - span_start)..(b - span_start)].iter().collect();
+            let mut style = span.style;
+            if let Some(sel) = &sel {
+                if a >= sel.start && b <= sel.end {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+            }
+            out.push(Span::styled(text, style));
+        }
+    }
+
+    Line::from(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_mid_span() {
+        let line = Line::from(vec![Span::styled(
+            "hello world".to_string(),
+            Style::default().fg(Color::Green),
+        )]);
+        let sliced = slice_spans(&line, 3..8, None);
+        assert_eq!(sliced.spans.len(), 1);
+        assert_eq!(sliced.spans[0].content, "lo wo");
+        assert_eq!(sliced.spans[0].style, Style::default().fg(Color::Green));
+    }
+
+    #[test]
+    fn slice_across_span_boundary() {
+        let line = Line::from(vec![
+            Span::styled("abc".to_string(), Style::default().fg(Color::Red)),
+            Span::styled("defgh".to_string(), Style::default().fg(Color::Blue)),
+        ]);
+        // Straddle the boundary: "bc" from the first span, "def" from the second.
+        let sliced = slice_spans(&line, 1..6, None);
+        assert_eq!(sliced.spans.len(), 2);
+        assert_eq!(sliced.spans[0].content, "bc");
+        assert_eq!(sliced.spans[0].style, Style::default().fg(Color::Red));
+        assert_eq!(sliced.spans[1].content, "def");
+        assert_eq!(sliced.spans[1].style, Style::default().fg(Color::Blue));
+    }
+
+    #[test]
+    fn slice_full_range_equals_whole_line() {
+        let line = Line::from(vec![Span::styled(
+            "abcdef".to_string(),
+            Style::default().fg(Color::Yellow),
+        )]);
+        let sliced = slice_spans(&line, 0..6, None);
+        assert_eq!(sliced.spans.len(), 1);
+        assert_eq!(sliced.spans[0].content, "abcdef");
+    }
+
+    #[test]
+    fn slice_empty_range_produces_empty_line() {
+        let line = Line::from(vec![Span::styled(
+            "abcdef".to_string(),
+            Style::default().fg(Color::Yellow),
+        )]);
+        let sliced = slice_spans(&line, 3..3, None);
+        assert!(sliced.spans.is_empty());
+    }
+
+    #[test]
+    fn slice_range_end_beyond_text_clamps() {
+        let line = Line::from(vec![Span::styled(
+            "abc".to_string(),
+            Style::default().fg(Color::Yellow),
+        )]);
+        let sliced = slice_spans(&line, 1..1000, None);
+        assert_eq!(sliced.spans.len(), 1);
+        assert_eq!(sliced.spans[0].content, "bc");
+    }
+
+    #[test]
+    fn slice_selection_overlay_partial() {
+        let line = Line::from(vec![Span::styled(
+            "hello world".to_string(),
+            Style::default().fg(Color::Green),
+        )]);
+        // Range covers "hello world" (0..11); sel covers "llo w" (2..7).
+        let sliced = slice_spans(&line, 0..11, Some(2..7));
+        assert_eq!(sliced.spans.len(), 3);
+        assert_eq!(sliced.spans[0].content, "he");
+        assert!(!sliced.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[0].style.fg, Some(Color::Green));
+
+        assert_eq!(sliced.spans[1].content, "llo w");
+        assert!(sliced.spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[1].style.fg, Some(Color::Green));
+
+        assert_eq!(sliced.spans[2].content, "orld");
+        assert!(!sliced.spans[2]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[2].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn slice_selection_outside_range_no_reverse() {
+        let line = Line::from(vec![Span::styled(
+            "hello world".to_string(),
+            Style::default(),
+        )]);
+        // sel is entirely outside the kept range.
+        let sliced = slice_spans(&line, 0..5, Some(6..11));
+        assert!(sliced
+            .spans
+            .iter()
+            .all(|s| !s.style.add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn slice_selection_none_no_reverse() {
+        let line = Line::from(vec![Span::styled(
+            "hello world".to_string(),
+            Style::default(),
+        )]);
+        let sliced = slice_spans(&line, 0..11, None);
+        assert!(sliced
+            .spans
+            .iter()
+            .all(|s| !s.style.add_modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn slice_multibyte() {
+        let line = Line::from(vec![Span::styled(
+            "日本語".to_string(),
+            Style::default().fg(Color::Cyan),
+        )]);
+        let sliced = slice_spans(&line, 1..3, None);
+        assert_eq!(sliced.spans.len(), 1);
+        assert_eq!(sliced.spans[0].content, "本語");
+    }
+
+    /// Coordinate-space invariant: `slice_spans` walks char offsets over the
+    /// concatenation of `parse_ansi`'s span contents, and callers will index
+    /// into that same space using `strip_ansi`. The two must agree on what
+    /// the "text" is, char-for-char, or a wrapped display row and its
+    /// selection highlight will land on the wrong characters.
+    #[test]
+    fn parse_ansi_and_strip_ansi_agree_on_text() {
+        let cases = [
+            "plain text",
+            "\x1b[1;32mgreen\x1b[0m mixed",
+            "pre\x1b[2Kpost",
+            "trailing\x1b[3",
+        ];
+        for s in cases {
+            let parsed_text: String = parse_ansi(s)
+                .spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect();
+            let stripped = crate::util::strip_ansi(s);
+            assert_eq!(
+                parsed_text, stripped,
+                "parse_ansi/strip_ansi text mismatch for {s:?}"
+            );
+        }
+    }
+}

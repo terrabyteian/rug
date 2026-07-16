@@ -9,6 +9,7 @@ use crate::lock::{parse_lock_from_output, read_lock_info};
 use crate::module::Module;
 use crate::state::StateContent;
 use crate::task::{ResourceCounts, Task, TaskStatus};
+use crate::ui::output_layout::OutputLayout;
 
 /// The two top-level screens: the module picker and the run board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +40,14 @@ pub struct RunSession {
     pub select_anchor: Option<usize>,
     /// Latest task id started by this session, per module path.
     pub latest_task: HashMap<PathBuf, usize>,
-    /// Output pane fills the whole window (mouse capture off).
+    /// Output pane fills the whole window.
     pub fullscreen: bool,
-    /// Lines scrolled up from the tail; 0 = tail-follow.
-    pub output_scroll: u16,
+    /// Display rows scrolled up from the tail; 0 = tail-follow.
+    pub output_scroll: usize,
     /// Soft-wrap long output lines.
     pub output_wrap: bool,
+    /// In-progress or completed drag selection over the output pane.
+    pub selection: Option<OutputSelection>,
     pub created_at: Instant,
 }
 
@@ -59,8 +62,45 @@ impl RunSession {
             fullscreen: false,
             output_scroll: 0,
             output_wrap: false,
+            selection: None,
             created_at: Instant::now(),
         }
+    }
+}
+
+/// A position in output content: source line index + char index into the
+/// ANSI-stripped line text. Content-anchored so selections survive resize,
+/// wrap toggles, and streaming appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelPos {
+    pub line: usize,
+    pub ch: usize,
+}
+
+/// An in-progress or completed drag selection over the output pane.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputSelection {
+    /// Display task the coordinates refer to; the selection is dropped when
+    /// the cursor module's display task changes.
+    pub task: Option<usize>,
+    pub anchor: SelPos,
+    pub head: SelPos,
+    pub dragging: bool,
+}
+
+impl OutputSelection {
+    /// `(min, max)` of `anchor`/`head` in document order.
+    pub fn ordered(&self) -> (SelPos, SelPos) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// True when `anchor == head` (a click with no drag).
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
     }
 }
 
@@ -239,6 +279,10 @@ pub struct ViewportHeights {
     pub board_offset: u16,
     /// Run output area top row; `u16::MAX` when no output pane is shown (H4).
     pub output_top: u16,
+    /// Run output area left column (mouse hit-testing).
+    pub output_left: u16,
+    /// Run output area width in columns (wrap math, mouse hit-testing).
+    pub output_width: u16,
 }
 
 /// One rendered row of the state explorer's grouped list: either a selectable
@@ -484,6 +528,9 @@ pub struct App {
     pub state_explorer: Option<StateExplorer>,
     /// Active Run session. Invariant: `screen == Run` ⇒ `session.is_some()`.
     pub session: Option<RunSession>,
+    /// Display-row layout cache for the Run output pane, kept in sync with
+    /// the display task/geometry every render pass (`sync_output_layout`).
+    pub output_layout: OutputLayout,
 }
 
 impl App {
@@ -507,6 +554,7 @@ impl App {
             engine,
             state_explorer: None,
             session: None,
+            output_layout: OutputLayout::default(),
         })
     }
 
@@ -741,19 +789,7 @@ impl App {
     /// this session's latest task for the path, else the newest non-terminal
     /// task for it in the engine, else none (idle).
     pub fn display_task_for(&self, path: &Path) -> Option<(&Task, bool)> {
-        if let Some(s) = &self.session {
-            if let Some(&id) = s.latest_task.get(path) {
-                if let Some(t) = self.engine.task(id) {
-                    return Some((t, false));
-                }
-            }
-        }
-        self.engine
-            .tasks
-            .iter()
-            .filter(|t| t.module_path == *path && !t.status.is_terminal())
-            .max_by_key(|t| t.id)
-            .map(|t| (t, true))
+        display_task(&self.engine, self.session.as_ref(), path)
     }
 
     /// Output lines of the highlighted board module's display task.
@@ -764,6 +800,47 @@ impl App {
             .and_then(|m| self.display_task_for(&m.path))
             .map(|(t, _)| t.output_lines.as_slice())
             .unwrap_or_default()
+    }
+
+    /// Id of the task whose output `run_output_lines` returns, if any.
+    pub fn run_display_task_id(&self) -> Option<usize> {
+        self.session
+            .as_ref()
+            .and_then(|s| s.modules.get(s.cursor))
+            .and_then(|m| self.display_task_for(&m.path))
+            .map(|(t, _)| t.id)
+    }
+
+    /// Bring `self.output_layout` up to date with the highlighted board
+    /// module's display-task output at the given pane geometry.
+    ///
+    /// Routed through the free `display_task` helper (rather than
+    /// `self.display_task_for`) because `lines` borrows `self.engine` while
+    /// `self.output_layout` needs a simultaneous `&mut` borrow; destructuring
+    /// `self` here lets the borrow checker see the two fields as disjoint.
+    pub fn sync_output_layout(&mut self, width: u16, wrap: bool) {
+        let App {
+            engine,
+            session,
+            output_layout,
+            ..
+        } = self;
+        let session_ref = session.as_ref();
+        let display = session_ref
+            .and_then(|s| s.modules.get(s.cursor))
+            .and_then(|m| display_task(engine, session_ref, &m.path));
+        let task_id = display.as_ref().map(|(t, _)| t.id);
+        let lines: &[String] = display.map(|(t, _)| t.output_lines.as_slice()).unwrap_or(&[]);
+        output_layout.sync(task_id, lines, width, wrap);
+
+        // A selection anchored to a display task that's no longer showing
+        // (cursor moved to a different module, or the module's display task
+        // changed) is no longer meaningful — drop it.
+        if let Some(s) = session.as_mut() {
+            if s.selection.is_some_and(|sel| sel.task != task_id) {
+                s.selection = None;
+            }
+        }
     }
 
     /// Move the board cursor by `delta`, resetting output scroll on a change.
@@ -781,6 +858,7 @@ impl App {
         s.cursor = new;
         if changed {
             s.output_scroll = 0;
+            s.selection = None;
         }
         changed
     }
@@ -798,6 +876,7 @@ impl App {
         s.cursor = pos;
         if changed {
             s.output_scroll = 0;
+            s.selection = None;
         }
         changed
     }
@@ -875,20 +954,195 @@ impl App {
         }
     }
 
-    /// Scroll the Run output pane (positive = scroll up toward older lines).
-    /// Clamped to the display task's line count. Returns true if it moved.
+    /// Scroll the Run output pane by `delta` DISPLAY rows (positive = scroll
+    /// up toward older lines). Clamped to `output_layout`'s total display-row
+    /// count minus the pane height recorded at the last draw
+    /// (`viewport.output`). Returns true if it moved.
     pub fn run_scroll_output(&mut self, delta: i32) -> bool {
-        let max = self.run_output_lines().len() as u16;
+        let max = self
+            .output_layout
+            .total_rows()
+            .saturating_sub(self.viewport.output as usize);
         let Some(s) = self.session.as_mut() else {
             return false;
         };
         let before = s.output_scroll;
         if delta < 0 {
-            s.output_scroll = s.output_scroll.saturating_sub((-delta) as u16);
+            s.output_scroll = s.output_scroll.saturating_sub((-delta) as usize);
         } else {
-            s.output_scroll = s.output_scroll.saturating_add(delta as u16).min(max);
+            s.output_scroll = s.output_scroll.saturating_add(delta as usize).min(max);
         }
         s.output_scroll != before
+    }
+
+    /// Scroll the Run output pane all the way up (oldest content), at the
+    /// pane geometry recorded at the last draw.
+    pub fn run_scroll_to_top(&mut self) {
+        let max = self
+            .output_layout
+            .total_rows()
+            .saturating_sub(self.viewport.output as usize);
+        if let Some(s) = self.session.as_mut() {
+            s.output_scroll = max;
+        }
+    }
+
+    /// Scroll the Run output pane back to the tail (0 = follow tail).
+    pub fn run_scroll_to_bottom(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            s.output_scroll = 0;
+        }
+    }
+
+    /// Map a mouse (column,row) to a content position in the output pane, using
+    /// the geometry recorded by the last draw. `clamp`: coordinates outside the
+    /// pane clamp to the nearest edge (used for drags); when false, misses
+    /// return None (used for the initial press).
+    pub fn output_hit_test(&self, col: u16, row: u16, clamp: bool) -> Option<SelPos> {
+        let vp = self.viewport;
+        if vp.output_top == u16::MAX || vp.output_width == 0 {
+            return None;
+        }
+        let total = self.output_layout.total_rows();
+        if total == 0 {
+            return None;
+        }
+        let session = self.session.as_ref()?;
+
+        // Same first_row math as the renderers.
+        let max_scroll = total.saturating_sub(vp.output as usize);
+        let scroll = session.output_scroll.min(max_scroll);
+        let first_row = max_scroll - scroll;
+
+        let bottom = vp.output_top.saturating_add(vp.output);
+        let right = vp.output_left.saturating_add(vp.output_width);
+
+        let (row, col) = if clamp {
+            (
+                row.clamp(vp.output_top, bottom.saturating_sub(1)),
+                col.clamp(vp.output_left, right.saturating_sub(1)),
+            )
+        } else {
+            if row < vp.output_top || row >= bottom || col < vp.output_left || col >= right {
+                return None;
+            }
+            (row, col)
+        };
+
+        let display_row = first_row + (row - vp.output_top) as usize;
+        let (line, row_in_line, cell) = if display_row >= total {
+            if !clamp {
+                return None;
+            }
+            // Past the last display row: clamp to the end of the last line
+            // (char_at_cell below clamps an overflowing cell to range.end).
+            let (line, row_in_line) = self.output_layout.locate(total - 1)?;
+            (line, row_in_line, usize::MAX)
+        } else {
+            let (line, row_in_line) = self.output_layout.locate(display_row)?;
+            (line, row_in_line, (col - vp.output_left) as usize)
+        };
+
+        let lines = self.run_output_lines();
+        let raw = lines.get(line)?;
+        let stripped = crate::util::strip_ansi(raw);
+        let ranges =
+            crate::ui::output_layout::wrap_ranges(&stripped, vp.output_width, session.output_wrap);
+        let row_range = ranges.get(row_in_line)?.clone();
+        let ch = crate::ui::output_layout::char_at_cell(&stripped, row_range, cell);
+
+        Some(SelPos { line, ch })
+    }
+
+    /// Begin a fresh drag selection at `pos`, anchored to the current display
+    /// task (so it's dropped if the display task changes underneath it).
+    pub fn run_selection_begin(&mut self, pos: SelPos) {
+        let task = self.run_display_task_id();
+        if let Some(s) = self.session.as_mut() {
+            s.selection = Some(OutputSelection {
+                task,
+                anchor: pos,
+                head: pos,
+                dragging: true,
+            });
+        }
+    }
+
+    /// Extend the in-progress drag selection to `pos`. No-op unless a
+    /// selection exists and is currently dragging.
+    pub fn run_selection_drag(&mut self, pos: SelPos) {
+        if let Some(sel) = self.session.as_mut().and_then(|s| s.selection.as_mut()) {
+            if sel.dragging {
+                sel.head = pos;
+            }
+        }
+    }
+
+    /// End the in-progress drag, leaving the selected range in place.
+    pub fn run_selection_end(&mut self) {
+        if let Some(sel) = self.session.as_mut().and_then(|s| s.selection.as_mut()) {
+            sel.dragging = false;
+        }
+    }
+
+    /// Clear any selection.
+    pub fn run_clear_selection(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            s.selection = None;
+        }
+    }
+
+    /// ANSI-stripped selected text, lines joined with '\n'. None when there is
+    /// no selection, it is empty, or its task no longer matches.
+    pub fn run_selected_text(&self) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let sel = session.selection?;
+        if sel.is_empty() || sel.task != self.run_display_task_id() {
+            return None;
+        }
+        let (a, b) = sel.ordered();
+        let lines = self.run_output_lines();
+
+        if a.line == b.line {
+            let stripped = crate::util::strip_ansi(lines.get(a.line)?);
+            let chars: Vec<char> = stripped.chars().collect();
+            let lo = a.ch.min(chars.len());
+            let hi = b.ch.min(chars.len());
+            return Some(chars[lo..hi].iter().collect());
+        }
+
+        let mut out = Vec::new();
+        if let Some(raw) = lines.get(a.line) {
+            let stripped = crate::util::strip_ansi(raw);
+            let chars: Vec<char> = stripped.chars().collect();
+            let lo = a.ch.min(chars.len());
+            out.push(chars[lo..].iter().collect::<String>());
+        }
+        for line in lines.iter().take(b.line).skip(a.line + 1) {
+            out.push(crate::util::strip_ansi(line));
+        }
+        if let Some(raw) = lines.get(b.line) {
+            let stripped = crate::util::strip_ansi(raw);
+            let chars: Vec<char> = stripped.chars().collect();
+            let hi = b.ch.min(chars.len());
+            out.push(chars[..hi].iter().collect::<String>());
+        }
+
+        Some(out.join("\n"))
+    }
+
+    /// ANSI-stripped full output of the highlighted task, lines joined with '\n'.
+    /// None when there are no output lines.
+    pub fn run_all_output_text(&self) -> Option<String> {
+        let lines = self.run_output_lines();
+        if lines.is_empty() {
+            return None;
+        }
+        let stripped: Vec<String> = lines
+            .iter()
+            .map(|line| crate::util::strip_ansi(line))
+            .collect();
+        Some(stripped.join("\n"))
     }
 
     /// `(module_count, running_count)` for the current session, if any.
@@ -1965,6 +2219,34 @@ fn module_depth(module: &crate::module::Module) -> usize {
     std::path::Path::new(&module.display_name)
         .components()
         .count()
+}
+
+/// Shared resolution behind `App::display_task_for`: the task shown for
+/// `path`, plus whether it is a background task from a previous session.
+/// Resolution: `session`'s latest task for the path, else the newest
+/// non-terminal task for it in `engine`, else none (idle).
+///
+/// A free function (rather than an `&self` method) so callers that need a
+/// simultaneous `&mut` borrow of another `App` field — see
+/// `App::sync_output_layout` — can call it without borrowing all of `self`.
+fn display_task<'a>(
+    engine: &'a TaskEngine,
+    session: Option<&RunSession>,
+    path: &Path,
+) -> Option<(&'a Task, bool)> {
+    if let Some(s) = session {
+        if let Some(&id) = s.latest_task.get(path) {
+            if let Some(t) = engine.task(id) {
+                return Some((t, false));
+            }
+        }
+    }
+    engine
+        .tasks
+        .iter()
+        .filter(|t| t.module_path == *path && !t.status.is_terminal())
+        .max_by_key(|t| t.id)
+        .map(|t| (t, true))
 }
 
 #[cfg(test)]

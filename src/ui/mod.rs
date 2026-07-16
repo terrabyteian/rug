@@ -1,6 +1,8 @@
+pub mod clipboard;
 pub mod keybar;
 pub mod layout;
 pub mod output;
+pub mod output_layout;
 pub mod run;
 pub mod select;
 pub mod theme;
@@ -12,8 +14,6 @@ pub enum ScreenAction {
     None,
     /// The user asked to quit (respect running tasks like the `q` binding).
     Quit,
-    /// Enter fullscreen output (loop turns off mouse capture).
-    EnterFullscreen,
 }
 
 use anyhow::Result;
@@ -67,110 +67,7 @@ fn event_loop<B: ratatui::backend::Backend>(
         // Poll for input events with a short timeout so we keep draining task events.
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Mouse(mouse) => {
-                    // Hard overlays absorb all mouse events. Help does not.
-                    if app.filter_active
-                        || app.modal.as_ref().is_some_and(|m| !matches!(m, Modal::Help))
-                    {
-                        continue;
-                    }
-
-                    // State explorer: only pass scroll events through.
-                    if app.state_explorer.is_some() {
-                        let in_detail = app
-                            .state_explorer
-                            .as_ref()
-                            .map(|e| e.detail_view.is_some())
-                            .unwrap_or(false);
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                if in_detail {
-                                    app.resource_detail_scroll(-3);
-                                } else {
-                                    app.state_explorer_move(-1);
-                                }
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if in_detail {
-                                    app.resource_detail_scroll(3);
-                                } else {
-                                    app.state_explorer_move(1);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Fullscreen output (Run session): wheel scrolls, nothing else.
-                    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                app.run_scroll_output(1);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                app.run_scroll_output(-1);
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Screen-specific: wheel moves the cursor / scrolls output;
-                    // a left click sets the cursor on the row it lands on.
-                    match app.screen {
-                        Screen::Select => match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                app.move_module_selection(-1);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                app.move_module_selection(1);
-                            }
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                let top = app.viewport.list_top;
-                                let h = app.viewport.list;
-                                if mouse.row >= top && mouse.row < top.saturating_add(h) {
-                                    let pos = app.viewport.list_offset as usize
-                                        + (mouse.row - top) as usize;
-                                    app.set_module_cursor(pos);
-                                }
-                            }
-                            _ => {}
-                        },
-                        Screen::Run => {
-                            let board_top = app.viewport.board_top;
-                            let board_h = app.viewport.board;
-                            let output_top = app.viewport.output_top;
-                            let in_board = mouse.row >= board_top
-                                && mouse.row < board_top.saturating_add(board_h);
-                            let in_output = mouse.row >= output_top;
-                            match mouse.kind {
-                                MouseEventKind::ScrollUp => {
-                                    if in_output {
-                                        app.run_scroll_output(3);
-                                    } else {
-                                        app.run_move_cursor(-1);
-                                    }
-                                }
-                                MouseEventKind::ScrollDown => {
-                                    if in_output {
-                                        app.run_scroll_output(-3);
-                                    } else {
-                                        app.run_move_cursor(1);
-                                    }
-                                }
-                                MouseEventKind::Down(MouseButton::Left) => {
-                                    if in_board {
-                                        let pos = app.viewport.board_offset as usize
-                                            + (mouse.row - board_top) as usize;
-                                        app.run_set_cursor(pos);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+                Event::Mouse(mouse) => handle_mouse(app, mouse),
                 Event::Key(key) => {
                     // Ctrl-C: quit immediately if no tasks are running, otherwise
                     // surface the same confirmation overlay as `q`. A second Ctrl-C
@@ -206,12 +103,7 @@ fn event_loop<B: ratatui::backend::Backend>(
                     // pass through, all else swallowed.
                     if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
                         match key.code {
-                            KeyCode::Esc => {
-                                if let Some(s) = app.session.as_mut() {
-                                    s.fullscreen = false;
-                                }
-                                execute!(io::stdout(), EnableMouseCapture)?;
-                            }
+                            KeyCode::Esc => fullscreen_esc(app),
                             KeyCode::Char('j') | KeyCode::Down => {
                                 app.run_scroll_output(-1);
                             }
@@ -225,15 +117,24 @@ fn event_loop<B: ratatui::backend::Backend>(
                                 app.run_scroll_output(app.viewport.output.max(1) as i32);
                             }
                             KeyCode::Char('g') => {
-                                let len = app.run_output_lines().len() as i32;
-                                app.run_scroll_output(len);
+                                app.run_scroll_to_top();
                             }
                             KeyCode::Char('G') => {
-                                app.run_scroll_output(-(app.run_output_lines().len() as i32));
+                                app.run_scroll_to_bottom();
                             }
                             KeyCode::Char('w') => {
                                 if let Some(s) = app.session.as_mut() {
                                     s.output_wrap = !s.output_wrap;
+                                }
+                            }
+                            KeyCode::Char('y') => {
+                                if let Some(text) = app.run_selected_text() {
+                                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
+                                }
+                            }
+                            KeyCode::Char('Y') => {
+                                if let Some(text) = app.run_all_output_text() {
+                                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
                                 }
                             }
                             _ => {}
@@ -462,9 +363,6 @@ fn event_loop<B: ratatui::backend::Backend>(
                             }
                             app.modal = Some(Modal::Quit);
                         }
-                        ScreenAction::EnterFullscreen => {
-                            execute!(io::stdout(), DisableMouseCapture)?;
-                        }
                         ScreenAction::None => {}
                     }
                 } // end Event::Key
@@ -473,6 +371,225 @@ fn event_loop<B: ratatui::backend::Backend>(
         }
     }
     Ok(())
+}
+
+/// Esc while the Run session is fullscreen: clear an active selection first;
+/// only exit fullscreen once there is no selection left to clear.
+fn fullscreen_esc(app: &mut App) {
+    if app.session.as_ref().is_some_and(|s| s.selection.is_some()) {
+        app.run_clear_selection();
+    } else if let Some(s) = app.session.as_mut() {
+        s.fullscreen = false;
+    }
+}
+
+/// Handle a single mouse event against the current app state.
+fn handle_mouse(app: &mut App, mouse: event::MouseEvent) {
+    // Hard overlays absorb all mouse events. Help does not.
+    if app.filter_active
+        || app
+            .modal
+            .as_ref()
+            .is_some_and(|m| !matches!(m, Modal::Help))
+    {
+        return;
+    }
+
+    // State explorer: only pass scroll events through.
+    if app.state_explorer.is_some() {
+        let in_detail = app
+            .state_explorer
+            .as_ref()
+            .map(|e| e.detail_view.is_some())
+            .unwrap_or(false);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if in_detail {
+                    app.resource_detail_scroll(-3);
+                } else {
+                    app.state_explorer_move(-1);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if in_detail {
+                    app.resource_detail_scroll(3);
+                } else {
+                    app.state_explorer_move(1);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // An in-progress drag owns the gesture regardless of pointer position: a
+    // drag that wanders over the board must not click board rows, and a
+    // release anywhere must end it.
+    let dragging = app
+        .session
+        .as_ref()
+        .and_then(|s| s.selection)
+        .is_some_and(|sel| sel.dragging);
+    if dragging
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+    {
+        handle_output_mouse(app, &mouse);
+        return;
+    }
+
+    // Fullscreen output (Run session): selection gestures, then wheel scroll.
+    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
+        if handle_output_mouse(app, &mouse) {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.run_scroll_output(1);
+            }
+            MouseEventKind::ScrollDown => {
+                app.run_scroll_output(-1);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Screen-specific: wheel moves the cursor / scrolls output;
+    // a left click sets the cursor on the row it lands on.
+    match app.screen {
+        Screen::Select => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.move_module_selection(-1);
+            }
+            MouseEventKind::ScrollDown => {
+                app.move_module_selection(1);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let top = app.viewport.list_top;
+                let h = app.viewport.list;
+                if mouse.row >= top && mouse.row < top.saturating_add(h) {
+                    let pos = app.viewport.list_offset as usize + (mouse.row - top) as usize;
+                    app.set_module_cursor(pos);
+                }
+            }
+            _ => {}
+        },
+        Screen::Run => {
+            // Selection gestures in the output pane take priority; a miss
+            // (e.g. the board, or dead space) falls through unconsumed.
+            if handle_output_mouse(app, &mouse) {
+                return;
+            }
+            let board_top = app.viewport.board_top;
+            let board_h = app.viewport.board;
+            let output_top = app.viewport.output_top;
+            let in_board = mouse.row >= board_top && mouse.row < board_top.saturating_add(board_h);
+            let in_output = mouse.row >= output_top;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if in_output {
+                        app.run_scroll_output(3);
+                    } else {
+                        app.run_move_cursor(-1);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if in_output {
+                        app.run_scroll_output(-3);
+                    } else {
+                        app.run_move_cursor(1);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if in_board {
+                        let pos =
+                            app.viewport.board_offset as usize + (mouse.row - board_top) as usize;
+                        app.run_set_cursor(pos);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// True when `(mouse.column, mouse.row)` falls inside the output pane's
+/// geometry from the last draw (independent of whether it lands on content).
+fn point_in_output_region(app: &App, mouse: &event::MouseEvent) -> bool {
+    let vp = app.viewport;
+    if vp.output_top == u16::MAX || vp.output_width == 0 {
+        return false;
+    }
+    mouse.row >= vp.output_top
+        && mouse.row < vp.output_top.saturating_add(vp.output)
+        && mouse.column >= vp.output_left
+        && mouse.column < vp.output_left.saturating_add(vp.output_width)
+}
+
+/// Selection gestures (press/drag/release) over the Run output pane, shared
+/// between the fullscreen viewer and the normal Run screen's output region.
+/// Returns whether the event was consumed.
+fn handle_output_mouse(app: &mut App, mouse: &event::MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(pos) = app.output_hit_test(mouse.column, mouse.row, false) {
+                app.run_selection_begin(pos);
+                true
+            } else if point_in_output_region(app, mouse) {
+                // A click inside the pane that didn't land on content (e.g.
+                // below the last line): drop any stale selection.
+                app.run_clear_selection();
+                true
+            } else {
+                false
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let dragging = app
+                .session
+                .as_ref()
+                .and_then(|s| s.selection)
+                .is_some_and(|sel| sel.dragging);
+            if !dragging {
+                return false;
+            }
+            // Edge auto-scroll: dragging past the top/bottom of the pane
+            // reveals more content in that direction.
+            let vp = app.viewport;
+            if vp.output_top != u16::MAX {
+                if mouse.row < vp.output_top {
+                    app.run_scroll_output(1);
+                } else if mouse.row >= vp.output_top.saturating_add(vp.output) {
+                    app.run_scroll_output(-1);
+                }
+            }
+            if let Some(pos) = app.output_hit_test(mouse.column, mouse.row, true) {
+                app.run_selection_drag(pos);
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let dragging = app
+                .session
+                .as_ref()
+                .and_then(|s| s.selection)
+                .is_some_and(|sel| sel.dragging);
+            if dragging {
+                app.run_selection_end();
+                // Auto-copy on mouse release.
+                if let Some(text) = app.run_selected_text() {
+                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
@@ -616,6 +733,8 @@ const RUN_HELP: &[(&str, &str)] = &[
     ("I/P/A/D", "same, this row"),
     ("C / x", "cancel / clear tasks"),
     ("Enter", "fullscreen output"),
+    ("drag / y", "select / copy output"),
+    ("Y", "copy all output"),
     ("w", "wrap output"),
     ("s", "state explorer"),
     ("Esc", "back (tasks run on)"),
@@ -1979,7 +2098,7 @@ fn highlight_filter_match(text: String, filter_lower: &str) -> ratatui::text::Li
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{RunSession, SessionModule};
+    use crate::app::{OutputSelection, RunSession, SelPos, SessionModule};
     use crate::config::Config;
     use crate::module::{Module, ModuleKind};
     use crate::task::{Task, TaskStatus};
@@ -2025,9 +2144,66 @@ mod tests {
         app.screen = Screen::Run;
     }
 
+    /// `n` output lines of `len` chars each; the LAST line ends with `marker`
+    /// (padded with `a` to `len` total) so tail-visibility assertions have a
+    /// unique needle regardless of wrap/scroll math.
+    fn make_output_lines(n: usize, len: usize, marker: &str) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                if i + 1 == n {
+                    let pad = len.saturating_sub(marker.len());
+                    format!("{}{}", "a".repeat(pad), marker)
+                } else {
+                    "b".repeat(len)
+                }
+            })
+            .collect()
+    }
+
+    /// Attach `lines` as a running task's output for the session's (single)
+    /// module, and record it as that module's latest/display task.
+    fn attach_output(app: &mut App, lines: Vec<String>) {
+        let path = app.modules[0].path.clone();
+        let id = app.engine.tasks.len();
+        app.engine.tasks.push(Task {
+            id,
+            module_path: path.clone(),
+            module_name: "mod0".to_string(),
+            command: "apply".to_string(),
+            status: TaskStatus::Running,
+            output_lines: lines,
+            started_at: Some(Instant::now()),
+            finished_at: None,
+            plan_output_path: None,
+            targets: Vec::new(),
+            cleanup_plan_path: None,
+            resource_counts: None,
+            cancel_handle: None,
+        });
+        app.session.as_mut().unwrap().latest_task.insert(path, id);
+    }
+
     fn draw_at(app: &mut App, w: u16, h: u16) {
         let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
+    }
+
+    /// Draw and return the back buffer, for tests that inspect cell styling
+    /// (e.g. the selection's REVERSED overlay) rather than just symbols.
+    fn draw_buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// A left-button mouse event at `(column, row)`, no modifiers.
+    fn left_mouse(kind: MouseEventKind, column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     /// Render and flatten the back buffer to a per-row string for substring
@@ -2197,6 +2373,33 @@ mod tests {
     }
 
     #[test]
+    fn run_help_shows_drag_copy_hint() {
+        let mut app = demo_app(3);
+        app.screen = Screen::Run;
+        app.enter_run();
+        app.modal = Some(Modal::Help);
+        let s = render_to_string(&mut app, 120u16, 35u16);
+        // Check that the drag/copy help text is rendered.
+        assert!(
+            s.contains("drag / y") || s.contains("drag/y"),
+            "Run help missing drag/y key hint"
+        );
+        assert!(
+            s.contains("select / copy"),
+            "Run help missing select/copy description"
+        );
+        // Check that the Y (copy all) help text is rendered.
+        assert!(
+            s.contains("Y"),
+            "Run help missing Y key hint"
+        );
+        assert!(
+            s.contains("copy all output"),
+            "Run help missing copy all output description"
+        );
+    }
+
+    #[test]
     fn too_small_guard_never_panics() {
         let mut app = demo_app(3);
         for &(w, h) in &[(38u16, 9u16), (20, 8), (2, 2), (1, 1)] {
@@ -2351,6 +2554,554 @@ mod tests {
         assert!(
             s.contains("TARGETED"),
             "apply confirm missing TARGETED warning"
+        );
+    }
+
+    // ── Output pane: wrap + resize scroll math (WP3) ─────────────────────────
+
+    /// With wrap on, the tail of the last output line must be visible at
+    /// `output_scroll == 0` (tail-follow). Regression test for the bug where
+    /// `auto_bottom` was computed from the unwrapped source-line count instead
+    /// of the layout's wrapped display-row count, pinning the view above the
+    /// real tail whenever wrapping expanded the content past the pane height.
+    #[test]
+    fn wrap_tail_visible_after_draw() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        let marker = "TAILMARK9182";
+        attach_output(&mut app, make_output_lines(30, 100, marker));
+        {
+            let s = app.session.as_mut().unwrap();
+            s.output_wrap = true;
+            s.output_scroll = 0;
+        }
+
+        let s = render_to_string(&mut app, 40, 24);
+        assert!(
+            s.contains(marker),
+            "tail marker not visible at scroll=0 with wrap on"
+        );
+    }
+
+    /// Growing the terminal after scrolling up must reclamp `output_scroll`
+    /// to the new (smaller) max — not leave it pinned at a stale value that
+    /// now points above the top of the content.
+    #[test]
+    fn resize_grow_reclamps_scroll() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        let marker = "TAILRESIZE42";
+        attach_output(&mut app, make_output_lines(50, 20, marker));
+
+        // Small draw: H3 tier (40x16) still renders a real output pane —
+        // H4 (height < 15) drops it entirely for a one-line status tail.
+        draw_at(&mut app, 40, 16);
+        app.run_scroll_output(i32::MAX);
+        let scrolled_small = app.session.as_ref().unwrap().output_scroll;
+        assert!(scrolled_small > 0, "scroll should have moved off the tail");
+
+        // Grow the terminal: the output pane gets much taller, so max_scroll
+        // shrinks well below the stale `scrolled_small` value.
+        draw_at(&mut app, 40, 30);
+        let total = app.output_layout.total_rows();
+        let new_viewport = app.viewport.output as usize;
+        let max_scroll = total.saturating_sub(new_viewport);
+        let after = app.session.as_ref().unwrap().output_scroll;
+        assert!(
+            after <= max_scroll,
+            "resize should reclamp output_scroll ({after}) to the new max ({max_scroll}); \
+             old code left it at the stale small-viewport value ({scrolled_small})"
+        );
+
+        // Scrolled back to the tail, the marker line is visible again.
+        app.session.as_mut().unwrap().output_scroll = 0;
+        let s = render_to_string(&mut app, 40, 30);
+        assert!(
+            s.contains(marker),
+            "tail marker not visible after resize+follow"
+        );
+    }
+
+    /// `run_scroll_output`'s upper clamp is `total_rows - viewport height`,
+    /// not the raw output-line count.
+    #[test]
+    fn scroll_clamp_bound() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(&mut app, make_output_lines(50, 20, "END"));
+
+        draw_at(&mut app, 40, 30);
+        let total = app.output_layout.total_rows();
+        let viewport = app.viewport.output as usize;
+        assert!(viewport > 0, "expected a real output pane at 40x30");
+
+        app.run_scroll_output(i32::MAX);
+        let scroll = app.session.as_ref().unwrap().output_scroll;
+        assert_eq!(scroll, total.saturating_sub(viewport));
+        assert_ne!(
+            scroll, 50,
+            "clamp must use display rows minus viewport height, not the raw line count"
+        );
+    }
+
+    /// Same tail-visibility guarantee as `wrap_tail_visible_after_draw`, in
+    /// the fullscreen renderer — geometry is measured off the bordered
+    /// block's inner rect, so this also exercises the border inset.
+    #[test]
+    fn fullscreen_wrap_tail_visible() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        let marker = "FSTAILMARK77";
+        attach_output(&mut app, make_output_lines(30, 100, marker));
+        {
+            let s = app.session.as_mut().unwrap();
+            s.fullscreen = true;
+            s.output_wrap = true;
+            s.output_scroll = 0;
+        }
+
+        let s = render_to_string(&mut app, 40, 24);
+        assert!(
+            s.contains(marker),
+            "tail marker not visible in fullscreen wrap mode"
+        );
+    }
+
+    /// Direct unit test of `visible_lines`' selection overlay: a multi-line
+    /// selection reverses exactly the intersection of each row with the
+    /// (start, end) span — partial on the first and last lines, whole on any
+    /// line strictly between them.
+    #[test]
+    fn visible_lines_selection_overlay_multiline() {
+        use crate::app::SelPos;
+        use crate::ui::output_layout::{visible_lines, OutputLayout};
+        use ratatui::style::Modifier;
+
+        let lines = vec![
+            "hello world".to_string(),
+            "middle line".to_string(),
+            "goodbye all".to_string(),
+        ];
+        let mut layout = OutputLayout::default();
+        layout.sync(Some(0), &lines, 80, false);
+
+        // line 0 char 6 → line 2 char 7: tail of line 0 ("world"), all of
+        // line 1, head of line 2 ("goodbye").
+        let sel = Some((SelPos { line: 0, ch: 6 }, SelPos { line: 2, ch: 7 }));
+        let rows = visible_lines(&lines, &layout, 0, 3, 80, false, sel);
+        assert_eq!(rows.len(), 3);
+
+        let reversed_text = |spans: &[ratatui::text::Span]| -> String {
+            spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let plain_text = |spans: &[ratatui::text::Span]| -> String {
+            spans
+                .iter()
+                .filter(|s| !s.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+
+        assert_eq!(plain_text(&rows[0].spans), "hello ");
+        assert_eq!(reversed_text(&rows[0].spans), "world");
+
+        assert_eq!(plain_text(&rows[1].spans), "");
+        assert_eq!(reversed_text(&rows[1].spans), "middle line");
+
+        assert_eq!(plain_text(&rows[2].spans), " all");
+        assert_eq!(reversed_text(&rows[2].spans), "goodbye");
+    }
+
+    // ── Mouse-driven output selection (WP4) ──────────────────────────────────
+
+    /// Press-drag over the output pane records the anchor/head content
+    /// coordinates and the subsequent render reverses exactly the selected
+    /// cells (and nothing outside them).
+    #[test]
+    fn mouse_drag_selects_and_renders_reversed() {
+        use ratatui::style::Modifier;
+
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(
+            &mut app,
+            vec![
+                "hello world".to_string(),
+                "second row here".to_string(),
+                "third row texts".to_string(),
+            ],
+        );
+        draw_at(&mut app, 80, 30);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+        assert_ne!(top, u16::MAX, "expected a real output pane at 80x30");
+
+        // Press at line 0, char 6 ('w' of "world").
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left + 6, top),
+        );
+        // Drag down two rows to line 2, char 5 (the space before "row").
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), left + 5, top + 2),
+        );
+
+        let sel = app
+            .session
+            .as_ref()
+            .unwrap()
+            .selection
+            .expect("selection should exist after a drag");
+        assert_eq!(sel.anchor, SelPos { line: 0, ch: 6 });
+        assert_eq!(sel.head, SelPos { line: 2, ch: 5 });
+
+        let buffer = draw_buffer(&mut app, 80, 30);
+        assert!(
+            buffer[(left + 6, top)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "expected the selected cell ('w' of world) to be reversed"
+        );
+        assert!(
+            !buffer[(left, top)].modifier.contains(Modifier::REVERSED),
+            "expected a cell outside the selection ('h' of hello) to not be reversed"
+        );
+    }
+
+    /// `run_selected_text` slices by CHAR index, not byte index — a wide char
+    /// on the first line must not corrupt the offset — and joins a
+    /// partial-first/whole-middle/partial-last selection with '\n'.
+    #[test]
+    fn selected_text_multiline() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(
+            &mut app,
+            vec![
+                "abc日def".to_string(),
+                "whole middle line".to_string(),
+                "xyz last END".to_string(),
+            ],
+        );
+
+        let task = app.run_display_task_id();
+        app.session.as_mut().unwrap().selection = Some(OutputSelection {
+            task,
+            anchor: SelPos { line: 0, ch: 3 },
+            head: SelPos { line: 2, ch: 3 },
+            dragging: false,
+        });
+
+        let text = app.run_selected_text().expect("expected selected text");
+        assert_eq!(text, "日def\nwhole middle line\nxyz");
+    }
+
+    /// `run_all_output_text` strips ANSI codes from all lines and joins them
+    /// with '\n'. Returns None when there are no output lines.
+    #[test]
+    fn run_all_output_text_strips_ansi_and_joins() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(
+            &mut app,
+            vec![
+                "\x1b[32mgreen text\x1b[0m".to_string(),
+                "plain line".to_string(),
+                "\x1b[1mbold日unicode\x1b[0m".to_string(),
+            ],
+        );
+
+        let text = app.run_all_output_text().expect("expected all output text");
+        assert_eq!(text, "green text\nplain line\nbold日unicode");
+    }
+
+    /// `run_all_output_text` returns None when there are no output lines.
+    #[test]
+    fn run_all_output_text_empty() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(&mut app, vec![]);
+
+        let text = app.run_all_output_text();
+        assert_eq!(text, None);
+    }
+
+    /// With wrap on, clicking display row 2 of a single long wrapped line must
+    /// resolve to the char offset of THAT row, not the row-0 offset (i.e. the
+    /// hit-test must walk through `layout.locate`, not just index the line).
+    #[test]
+    fn drag_maps_through_wrapped_rows() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        if let Some(s) = app.session.as_mut() {
+            s.output_wrap = true;
+        }
+        // Draw once (empty output) purely to learn the pane's content width.
+        draw_at(&mut app, 60, 30);
+        let width = app.viewport.output_width as usize;
+        assert!(width > 0, "expected a real output pane at 60x30");
+
+        // 3 full rows + 1 char into a 4th, so display row 2 is a full middle row.
+        let long_line = "x".repeat(width * 3 + 1);
+        attach_output(&mut app, vec![long_line]);
+        draw_at(&mut app, 60, 30);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left + 4, top + 2),
+        );
+
+        let sel = app
+            .session
+            .as_ref()
+            .unwrap()
+            .selection
+            .expect("selection should exist");
+        assert_eq!(
+            sel.anchor,
+            SelPos {
+                line: 0,
+                ch: width * 2 + 4
+            },
+            "expected the wrapped row-2 offset, not the row-0 offset"
+        );
+    }
+
+    /// H4 (collapsed layout, e.g. 40×10) drops the output pane entirely — a
+    /// click anywhere must not create a selection.
+    #[test]
+    fn h4_collapsed_no_selection() {
+        let mut app = demo_app(3);
+        make_session(&mut app);
+        draw_at(&mut app, 40, 10);
+        assert_eq!(
+            app.viewport.output_top,
+            u16::MAX,
+            "expected the collapsed H4 layout to have no output pane"
+        );
+
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
+        );
+
+        assert!(app.session.as_ref().unwrap().selection.is_none());
+    }
+
+    /// Fullscreen output is measured off the bordered block's inner rect —
+    /// a click at the recorded `(output_left, output_top)` must map to the
+    /// very first visible char, one cell in from the window edge.
+    #[test]
+    fn fullscreen_selection_border_offset() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(
+            &mut app,
+            vec!["ABCDEFGH".to_string(), "second line".to_string()],
+        );
+        if let Some(s) = app.session.as_mut() {
+            s.fullscreen = true;
+        }
+        draw_at(&mut app, 40, 20);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+        assert_eq!(top, 1, "fullscreen pane should be inset by the top border");
+        assert_eq!(
+            left, 1,
+            "fullscreen pane should be inset by the left border"
+        );
+
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left, top),
+        );
+
+        let sel = app
+            .session
+            .as_ref()
+            .unwrap()
+            .selection
+            .expect("selection should exist");
+        assert_eq!(sel.anchor, SelPos { line: 0, ch: 0 });
+    }
+
+    /// Moving the board cursor (even via keyboard, not just clicking a
+    /// different row) drops any in-progress or completed selection, since it
+    /// no longer refers to the now-displayed task's content.
+    #[test]
+    fn cursor_move_clears_selection() {
+        let mut app = demo_app(2);
+        make_session(&mut app);
+        attach_output(
+            &mut app,
+            vec!["one line".to_string(), "two line".to_string()],
+        );
+        draw_at(&mut app, 80, 30);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left + 1, top),
+        );
+        assert!(
+            app.session.as_ref().unwrap().selection.is_some(),
+            "expected a selection after the press"
+        );
+
+        app.run_move_cursor(1);
+        assert!(
+            app.session.as_ref().unwrap().selection.is_none(),
+            "moving the board cursor should clear the selection"
+        );
+    }
+
+    /// A selection's content coordinates are anchored to line/char indices,
+    /// not screen position, so streamed output appended after the selection
+    /// was made (tail-follow, scroll == 0) must not disturb it.
+    #[test]
+    fn selection_survives_append() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(
+            &mut app,
+            vec!["hello world".to_string(), "second line".to_string()],
+        );
+        draw_at(&mut app, 80, 30);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+
+        // Select "world" (chars 6..11) on line 0.
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left + 6, top),
+        );
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), left + 11, top),
+        );
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Up(MouseButton::Left), left + 11, top),
+        );
+
+        let before = app.run_selected_text();
+        assert_eq!(before.as_deref(), Some("world"));
+
+        // Append more lines directly to the same still-running task.
+        let path = app.modules[0].path.clone();
+        if let Some(task) = app.engine.tasks.iter_mut().find(|t| t.module_path == path) {
+            task.output_lines.push("third line".to_string());
+            task.output_lines.push("fourth line".to_string());
+        }
+        draw_at(&mut app, 80, 30);
+
+        assert_eq!(
+            app.session
+                .as_ref()
+                .unwrap()
+                .selection
+                .map(|s| (s.anchor, s.head)),
+            Some((SelPos { line: 0, ch: 6 }, SelPos { line: 0, ch: 11 })),
+            "selection coordinates should survive an append"
+        );
+        assert_eq!(app.run_selected_text().as_deref(), before.as_deref());
+    }
+
+    /// Dragging above the top of the output pane auto-scrolls up (toward
+    /// older content) and the drag head clamps to the new topmost visible row.
+    #[test]
+    fn drag_above_pane_autoscrolls() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(&mut app, make_output_lines(50, 20, "TAILEND"));
+        draw_at(&mut app, 40, 20);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+        assert_eq!(app.session.as_ref().unwrap().output_scroll, 0);
+
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left, top),
+        );
+        assert!(app.session.as_ref().unwrap().selection.is_some());
+
+        // Drag one row above the pane's top edge.
+        handle_mouse(
+            &mut app,
+            left_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                left,
+                top.saturating_sub(1),
+            ),
+        );
+
+        let scroll_after = app.session.as_ref().unwrap().output_scroll;
+        assert!(scroll_after > 0, "dragging above the pane should scroll up");
+
+        let total = app.output_layout.total_rows();
+        let viewport_h = app.viewport.output as usize;
+        let max_scroll = total.saturating_sub(viewport_h);
+        let expected_first_row = max_scroll.saturating_sub(scroll_after);
+
+        let head = app.session.as_ref().unwrap().selection.unwrap().head;
+        assert_eq!(
+            head.line, expected_first_row,
+            "head should clamp to the new top visible row"
+        );
+        assert_eq!(
+            head.ch, 0,
+            "clamped column should map to the row's first char"
+        );
+    }
+
+    /// Esc while fullscreen clears a selection before it exits fullscreen —
+    /// only a second Esc (with nothing left to clear) leaves fullscreen.
+    #[test]
+    fn esc_clears_selection_before_exiting_fullscreen() {
+        let mut app = demo_app(1);
+        make_session(&mut app);
+        attach_output(&mut app, vec!["hello world".to_string()]);
+        if let Some(s) = app.session.as_mut() {
+            s.fullscreen = true;
+        }
+        draw_at(&mut app, 40, 20);
+
+        let top = app.viewport.output_top;
+        let left = app.viewport.output_left;
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Down(MouseButton::Left), left, top),
+        );
+        assert!(app.session.as_ref().unwrap().selection.is_some());
+        assert!(app.session.as_ref().unwrap().fullscreen);
+
+        fullscreen_esc(&mut app);
+        assert!(
+            app.session.as_ref().unwrap().selection.is_none(),
+            "first Esc should clear the selection"
+        );
+        assert!(
+            app.session.as_ref().unwrap().fullscreen,
+            "first Esc should not exit fullscreen yet"
+        );
+
+        fullscreen_esc(&mut app);
+        assert!(
+            !app.session.as_ref().unwrap().fullscreen,
+            "second Esc should exit fullscreen"
         );
     }
 }

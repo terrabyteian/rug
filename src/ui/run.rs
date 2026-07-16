@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -15,7 +15,7 @@ use crate::app::App;
 use crate::task::{Task, TaskStatus};
 use crate::ui::keybar::render_keybar;
 use crate::ui::layout::{Breakpoints, HeightTier, WidthTier};
-use crate::ui::output::parse_ansi;
+use crate::ui::output_layout;
 use crate::ui::theme;
 use crate::ui::widgets::count_spans;
 use crate::ui::ScreenAction;
@@ -99,6 +99,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     app.viewport.board_top = list_area.y;
     app.viewport.board_offset = board_offset;
     app.viewport.output_top = output_area.y;
+    app.viewport.output_left = output_area.x;
+    app.viewport.output_width = output_area.width;
 }
 
 /// H4 layout: no output pane; board fills the space with a one-line status
@@ -140,6 +142,7 @@ fn render_collapsed(f: &mut Frame, area: Rect, app: &mut App, bp: Breakpoints) {
     // No scrollable output pane in the collapsed layout: keep wheel events on
     // the board by placing the output region past the bottom of the screen.
     app.viewport.output_top = u16::MAX;
+    app.viewport.output_width = 0;
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
@@ -395,24 +398,56 @@ fn status_word(status: &TaskStatus) -> &'static str {
     }
 }
 
-fn render_output(f: &mut Frame, area: Rect, app: &App) {
+/// Render the output pane: exactly the rows the viewport can show, built by
+/// `output_layout::visible_lines` (no `Paragraph::scroll`/`wrap` — the layout
+/// cache already accounts for wrapped display rows, not source lines).
+///
+/// Content shorter than the pane stays top-anchored (`max_scroll == 0` forces
+/// `first_row == 0` regardless of a stale `scroll`).
+fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
     let wrap = app.session.as_ref().map(|s| s.output_wrap).unwrap_or(false);
     let scroll = app.session.as_ref().map(|s| s.output_scroll).unwrap_or(0);
-    let out = app.run_output_lines();
-    let lines: Vec<Line> = out.iter().map(|l| parse_ansi(l)).collect();
 
+    let content_width = area.width;
+    app.sync_output_layout(content_width, wrap);
+    let total = app.output_layout.total_rows();
     let visible_height = area.height as usize;
-    let auto_bottom = lines.len().saturating_sub(visible_height);
-    let scroll_row = auto_bottom.saturating_sub(scroll as usize) as u16;
-
-    let mut para = Paragraph::new(lines).scroll((scroll_row, 0));
-    if wrap {
-        para = para.wrap(Wrap { trim: false });
+    let max_scroll = total.saturating_sub(visible_height);
+    // Render-time reclamp: a stale `scroll` from before a resize (or a wrap
+    // toggle) can no longer exceed the pane's current max.
+    let scroll = scroll.min(max_scroll);
+    if let Some(s) = app.session.as_mut() {
+        s.output_scroll = scroll;
     }
-    f.render_widget(para, area);
+    let first_row = max_scroll.saturating_sub(scroll);
+
+    let selection = run_selection_arg(app);
+    let rows = output_layout::visible_lines(
+        app.run_output_lines(),
+        &app.output_layout,
+        first_row,
+        visible_height,
+        content_width,
+        wrap,
+        selection,
+    );
+    f.render_widget(Paragraph::new(rows), area);
 }
 
-/// Fullscreen output for the highlighted module.
+/// The current selection, validated for `visible_lines`: `None` unless it's
+/// non-empty and still anchored to the module's current display task.
+fn run_selection_arg(app: &App) -> Option<(crate::app::SelPos, crate::app::SelPos)> {
+    let display_task = app.run_display_task_id();
+    app.session
+        .as_ref()
+        .and_then(|s| s.selection)
+        .filter(|sel| !sel.is_empty() && sel.task == display_task)
+        .map(|sel| sel.ordered())
+}
+
+/// Fullscreen output for the highlighted module. Same row-building approach
+/// as `render_output`; geometry is measured against the bordered block's
+/// inner rect.
 pub fn render_fullscreen_output(f: &mut Frame, area: Rect, app: &mut App) {
     let wrap = app.session.as_ref().map(|s| s.output_wrap).unwrap_or(false);
     let scroll = app.session.as_ref().map(|s| s.output_scroll).unwrap_or(0);
@@ -430,27 +465,38 @@ pub fn render_fullscreen_output(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .unwrap_or_else(|| " output ".to_string());
 
-    let out = app.run_output_lines();
-    let lines: Vec<Line> = out.iter().map(|l| parse_ansi(l)).collect();
+    let block = Block::default().borders(Borders::ALL).border_style(theme::dim());
+    let inner = block.inner(area);
 
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let auto_bottom = lines.len().saturating_sub(inner_h);
-    let scroll_row = auto_bottom.saturating_sub(scroll as usize) as u16;
+    app.sync_output_layout(inner.width, wrap);
+    let total = app.output_layout.total_rows();
+    let visible_height = inner.height as usize;
+    let max_scroll = total.saturating_sub(visible_height);
+    let scroll = scroll.min(max_scroll);
+    if let Some(s) = app.session.as_mut() {
+        s.output_scroll = scroll;
+    }
+    let first_row = max_scroll.saturating_sub(scroll);
+
+    let selection = run_selection_arg(app);
+    let rows = output_layout::visible_lines(
+        app.run_output_lines(),
+        &app.output_layout,
+        first_row,
+        visible_height,
+        inner.width,
+        wrap,
+        selection,
+    );
 
     let scroll_tag = if scroll > 0 { " [↑ scrolled]" } else { "" };
-    let mut para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(format!("{title}{scroll_tag}"))
-                .borders(Borders::ALL)
-                .border_style(theme::dim()),
-        )
-        .scroll((scroll_row, 0));
-    if wrap {
-        para = para.wrap(Wrap { trim: false });
-    }
+    let para = Paragraph::new(rows).block(block.title(format!("{title}{scroll_tag}")));
     f.render_widget(para, area);
-    app.viewport.output = area.height.saturating_sub(2);
+
+    app.viewport.output = inner.height;
+    app.viewport.output_top = inner.y;
+    app.viewport.output_left = inner.x;
+    app.viewport.output_width = inner.width;
 }
 
 fn render_run_keybar(f: &mut Frame, area: Rect) {
@@ -466,6 +512,7 @@ fn render_run_keybar(f: &mut Frame, area: Rect) {
             ("space", "subset"),
             ("C", "cancel"),
             ("enter", "output"),
+            ("y/Y", "copy"),
             ("s", "state"),
             ("esc", "back"),
             ("?", "help"),
@@ -496,7 +543,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> ScreenAction {
     match key.code {
         KeyCode::Char('q') => return ScreenAction::Quit,
         KeyCode::Char('?') => app.modal = Some(crate::app::Modal::Help),
-        KeyCode::Esc => app.screen = crate::app::Screen::Select,
+        KeyCode::Esc => {
+            if app.session.as_ref().is_some_and(|s| s.selection.is_some()) {
+                app.run_clear_selection();
+            } else {
+                app.screen = crate::app::Screen::Select;
+            }
+        }
 
         // Board cursor.
         KeyCode::Char('j') | KeyCode::Down => {
@@ -538,7 +591,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> ScreenAction {
             if let Some(s) = app.session.as_mut() {
                 s.fullscreen = true;
             }
-            return ScreenAction::EnterFullscreen;
         }
         // Toggle output wrap.
         KeyCode::Char('w') => {
@@ -606,6 +658,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> ScreenAction {
         }
         // Clear completed history (engine-wide).
         KeyCode::Char('x') => app.request_clear_tasks_confirm(),
+
+        // Copy selected output to clipboard.
+        KeyCode::Char('y') => {
+            if let Some(text) = app.run_selected_text() {
+                let _ = crate::ui::clipboard::copy_to_clipboard(&text);
+            }
+        }
+        // Copy all output to clipboard.
+        KeyCode::Char('Y') => {
+            if let Some(text) = app.run_all_output_text() {
+                let _ = crate::ui::clipboard::copy_to_clipboard(&text);
+            }
+        }
 
         _ => {}
     }

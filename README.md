@@ -121,12 +121,17 @@ apply consumes that cached plan file automatically.
 | `u` / `U` | Init `-upgrade` / force-unlock |
 | `C` | Cancel active tasks in scope |
 | `x` | Clear completed task history |
+| Mouse drag | Select output text (copied to clipboard on release) |
+| `y` | Re-copy current text selection |
+| `Y` | Copy the whole output of the highlighted task |
 | `Enter` | Fullscreen output |
 | `w` | Toggle output wrap |
 | `s` | State explorer for the highlighted module |
 | `Esc` | Back to Select (tasks keep running) |
 | `?` | Help |
 | `q` / `Ctrl-C` | Quit |
+
+Selected text is copied two ways at once: to the system clipboard, and as an OSC 52 escape so the copy also works over SSH and inside tmux (`set -g set-clipboard on`) or zellij, provided your terminal supports OSC 52. If you prefer the terminal emulator's native selection, hold `Shift` while dragging — this bypasses rug's selection handling. Output wrap (`w`) breaks lines at character boundaries.
 
 **State explorer**
 
