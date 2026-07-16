@@ -216,11 +216,10 @@ fn render_board(f: &mut Frame, area: Rect, app: &App, w: WidthTier) -> u16 {
             let is_multi = session.selected.contains(&pos);
             let display = app.display_task_for(&sm.path);
             let line = board_row(app, sm, is_cursor, is_multi, display, w);
-            let item = ListItem::new(line);
             if is_cursor {
-                item.style(theme::row_cursor())
+                ListItem::new(theme::lift_fg(line)).style(theme::row_cursor())
             } else {
-                item
+                ListItem::new(line)
             }
         })
         .collect();

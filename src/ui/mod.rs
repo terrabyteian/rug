@@ -1355,6 +1355,9 @@ fn render_state_explorer(
 
     // Reserve rows: 2 border + 1 blank top + 1 blank before hint + 1 hint + 1 counter (worst case).
     let max_resource_rows = area.height.saturating_sub(7).max(3) as usize;
+    // Inner width of the bordered block — `theme::cursor_row` pads to this so the
+    // selected row's bar spans the popup instead of stopping at the text.
+    let inner_width = area.width.saturating_sub(2);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
 
@@ -1438,29 +1441,20 @@ fn render_state_explorer(
                     match row {
                         ExplorerRow::ModuleHeader { prefix, count } => {
                             let marked = explorer.module_select.contains(prefix);
-                            let marker = if marked { "●" } else { " " };
-                            if is_selected {
-                                lines.push(Line::from(Span::styled(
-                                    format!(" {} ▸ {} ({})", marker, prefix, count),
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(Color::Cyan)
-                                        .add_modifier(Modifier::BOLD),
-                                )));
+                            let (marker, marker_style) = if marked {
+                                (" ● ", theme::multi_select_marker())
                             } else {
-                                let marker_style = if marked {
-                                    theme::multi_select_marker()
-                                } else {
-                                    theme::title()
-                                };
-                                lines.push(Line::from(vec![
-                                    Span::styled(format!(" {} ", marker), marker_style),
-                                    Span::styled(
-                                        format!("▸ {} ({})", prefix, count),
-                                        theme::title(),
-                                    ),
-                                ]));
-                            }
+                                ("   ", theme::title())
+                            };
+                            let line = Line::from(vec![
+                                Span::styled(marker.to_string(), marker_style),
+                                Span::styled(format!("▸ {} ({})", prefix, count), theme::title()),
+                            ]);
+                            lines.push(if is_selected {
+                                theme::cursor_row(line, inner_width)
+                            } else {
+                                line
+                            });
                         }
                         ExplorerRow::Resource { res_idx, indent } => {
                             let resource = &resources[*res_idx];
@@ -1471,62 +1465,35 @@ fn render_state_explorer(
                                     .module_select
                                     .iter()
                                     .any(|p| crate::state::is_covered_by(&resource.address, p));
-                            let tainted = resource.is_tainted();
-
-                            if is_selected {
-                                let marker = if is_multi || covered { "●" } else { " " };
-                                let taint_tag = if tainted { " [tainted]" } else { "" };
-                                let full = format!(
-                                    " {} {}{}{}",
-                                    marker, indent_str, resource.address, taint_tag
-                                );
-                                lines.push(Line::from(Span::styled(
-                                    full,
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(Color::Cyan)
-                                        .add_modifier(Modifier::BOLD),
-                                )));
-                            } else if is_multi || covered {
-                                let marker_style = if is_multi {
-                                    theme::multi_select_marker()
-                                } else {
-                                    theme::covered_marker()
-                                };
-                                let mut spans = vec![
-                                    Span::styled(" ● ".to_string(), marker_style),
-                                    Span::raw(format!("{}{}", indent_str, resource.address)),
-                                ];
-                                if tainted {
-                                    spans.push(Span::styled(
-                                        " [tainted]".to_string(),
-                                        Style::default().fg(Color::Red),
-                                    ));
-                                }
-                                lines.push(Line::from(spans));
-                            } else if !explorer.filter.is_empty() {
-                                let addr = format!("   {}{}", indent_str, resource.address);
-                                let mut line = highlight_filter_match(addr, &filter_lower);
-                                if tainted {
-                                    line.spans.push(Span::styled(
-                                        " [tainted]".to_string(),
-                                        Style::default().fg(Color::Red),
-                                    ));
-                                }
-                                lines.push(line);
+                            // Build the row once, then let `cursor_row` highlight
+                            // it: the marker, the filter match and the taint tag
+                            // keep their colours on the selected row.
+                            let (marker, marker_style) = if is_multi {
+                                (" ● ", theme::multi_select_marker())
+                            } else if covered {
+                                (" ● ", theme::covered_marker())
                             } else {
-                                let mut spans = vec![Span::raw(format!(
-                                    "   {}{}",
-                                    indent_str, resource.address
-                                ))];
-                                if tainted {
-                                    spans.push(Span::styled(
-                                        " [tainted]".to_string(),
-                                        Style::default().fg(Color::Red),
-                                    ));
-                                }
-                                lines.push(Line::from(spans));
+                                ("   ", Style::default())
+                            };
+                            let addr = format!("{}{}", indent_str, resource.address);
+                            let mut spans = vec![Span::styled(marker.to_string(), marker_style)];
+                            if explorer.filter.is_empty() {
+                                spans.push(Span::raw(addr));
+                            } else {
+                                spans.extend(highlight_filter_match(addr, &filter_lower).spans);
                             }
+                            if resource.is_tainted() {
+                                spans.push(Span::styled(
+                                    " [tainted]".to_string(),
+                                    Style::default().fg(Color::Red),
+                                ));
+                            }
+                            let line = Line::from(spans);
+                            lines.push(if is_selected {
+                                theme::cursor_row(line, inner_width)
+                            } else {
+                                line
+                            });
                         }
                     }
                 }
@@ -2101,7 +2068,7 @@ mod tests {
     use crate::app::{OutputSelection, RunSession, SelPos, SessionModule};
     use crate::config::Config;
     use crate::module::{Module, ModuleKind};
-    use crate::task::{Task, TaskStatus};
+    use crate::task::{ResourceCounts, Task, TaskStatus};
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -2341,6 +2308,116 @@ mod tests {
         }
     }
 
+    /// The cursor bar is bg = MUTED, and ratatui draws span foregrounds over it
+    /// (spans carry bg = None), so a MUTED fg lands MUTED-on-MUTED and vanishes —
+    /// which is what made the Run board's elapsed timer invisible.
+    ///
+    /// The invariant checked is `lift_color(fg) == fg`: every fg on the bar must
+    /// already be a lifted colour. That is stricter than `fg != bg` — it also
+    /// rejects merely-dark foregrounds such as plain `Blue` — and it needs no
+    /// hand-maintained list of styles, so any span later drawn on the bar by any
+    /// producer is covered automatically.
+    ///
+    /// Reports every offending cell at once: the first one is usually the cursor
+    /// bar glyph, which would otherwise mask the columns further right.
+    fn assert_cursor_bar_is_lifted(buffer: &ratatui::buffer::Buffer, w: u16, h: u16, ctx: &str) {
+        let mut bad: Vec<String> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let cell = &buffer[(x, y)];
+                if cell.bg != theme::MUTED || cell.symbol().trim().is_empty() {
+                    continue;
+                }
+                if theme::lift_color(cell.fg) != cell.fg {
+                    bad.push(format!(
+                        "({x},{y}) {:?} fg {:?} should be {:?}",
+                        cell.symbol(),
+                        cell.fg,
+                        theme::lift_color(cell.fg)
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{ctx} at {w}x{h}: {} cell(s) on the cursor bar carry an unlifted fg:\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
+    }
+
+    /// Give module 0 a finished task with every optional column populated, and
+    /// modules 1/2 the two MUTED-styled statuses (queued, cancelled).
+    fn attach_board_tasks(app: &mut App) {
+        let counts = ResourceCounts {
+            add: 2,
+            change: 1,
+            destroy: 1,
+            import: 1,
+            forget: 1, // COUNT_FORGET is DarkGray — invisible on the bar before the fix
+            no_changes: false,
+            has_summary: true,
+        };
+        let statuses = [
+            (TaskStatus::Success, Some(counts)),
+            (TaskStatus::Pending, None),   // status_style() -> MUTED
+            (TaskStatus::Cancelled, None), // status_style() -> MUTED
+        ];
+        for (i, (status, resource_counts)) in statuses.into_iter().enumerate() {
+            let path = app.modules[i].path.clone();
+            let id = app.engine.tasks.len();
+            app.engine.tasks.push(Task {
+                id,
+                module_path: path.clone(),
+                module_name: format!("mod{i}"),
+                command: "apply".to_string(), // command_text()
+                status,
+                output_lines: Vec::new(),
+                started_at: Some(Instant::now()), // drives elapsed_str() -> dim()
+                finished_at: None,
+                plan_output_path: None,
+                targets: Vec::new(),
+                cleanup_plan_path: None,
+                resource_counts,
+                cancel_handle: None,
+            });
+            app.session.as_mut().unwrap().latest_task.insert(path, id);
+        }
+    }
+
+    #[test]
+    fn run_board_cursor_row_stays_legible() {
+        let mut app = demo_app(3);
+        make_session(&mut app);
+        attach_board_tasks(&mut app);
+
+        // Walk the cursor over every row: each carries a different status, and
+        // only the highlighted one is drawn on the bar.
+        for cursor in 0..3 {
+            app.session.as_mut().unwrap().cursor = cursor;
+            for &(w, h) in SIZES {
+                let buffer = draw_buffer(&mut app, w, h);
+                assert_cursor_bar_is_lifted(&buffer, w, h, &format!("run board row {cursor}"));
+            }
+        }
+    }
+
+    #[test]
+    fn select_cursor_row_stays_legible() {
+        let mut app = demo_app(3);
+        make_session(&mut app);
+        attach_board_tasks(&mut app);
+        app.screen = Screen::Select;
+
+        for selected in 0..3 {
+            app.selected_module = selected;
+            for &(w, h) in SIZES {
+                let buffer = draw_buffer(&mut app, w, h);
+                assert_cursor_bar_is_lifted(&buffer, w, h, &format!("select row {selected}"));
+            }
+        }
+    }
+
     #[test]
     fn run_board_and_output_render_at_all_sizes() {
         let mut app = demo_app(6);
@@ -2454,6 +2531,62 @@ mod tests {
                 "indented member missing at {w}×{h}"
             );
         }
+    }
+
+    /// The explorer's selected row used to be one flat Black-on-Cyan span. Now it
+    /// shares the boards' bar, so it has to hold the same invariant — including
+    /// for `covered_marker()`, which is MUTED and only ever reaches the bar via
+    /// this screen.
+    #[test]
+    fn explorer_selected_row_stays_legible() {
+        let mut app = demo_explorer_app();
+        {
+            let ex = app.state_explorer.as_mut().unwrap();
+            ex.multi_select = vec![0];
+            ex.module_select = vec!["module.net".to_string()]; // -> covered_marker() on members
+        }
+        // Rows: module header, its 2 members, the root resource.
+        for selected in 0..4 {
+            app.state_explorer.as_mut().unwrap().selected = selected;
+            for &(w, h) in SIZES {
+                let buffer = draw_buffer(&mut app, w, h);
+                assert_cursor_bar_is_lifted(&buffer, w, h, &format!("explorer row {selected}"));
+            }
+        }
+    }
+
+    /// A tainted resource keeps its red tag and a marked one its yellow marker on
+    /// the selected row — both were flattened to black by the old Cyan highlight.
+    #[test]
+    fn explorer_selected_row_keeps_column_colours() {
+        use crate::state::{StateContent, StateResource};
+        let mut app = demo_explorer_app();
+        {
+            let ex = app.state_explorer.as_mut().unwrap();
+            ex.content = StateContent::Resources(vec![StateResource {
+                address: "aws_vpc.main".to_string(),
+                instance: serde_json::json!({ "status": "tainted" }),
+            }]);
+            ex.multi_select = vec![0];
+            ex.selected = 0;
+        }
+        let buffer = draw_buffer(&mut app, 120, 35);
+        let on_bar = |want: ratatui::style::Color| {
+            (0..35).any(|y| {
+                (0..120u16).any(|x| {
+                    let c = &buffer[(x, y)];
+                    c.bg == theme::MUTED && c.fg == want
+                })
+            })
+        };
+        assert!(
+            on_bar(ratatui::style::Color::LightRed),
+            "the [tainted] tag should stay red on the selected row"
+        );
+        assert!(
+            on_bar(ratatui::style::Color::LightYellow),
+            "the multi-select marker should stay yellow on the selected row"
+        );
     }
 
     #[test]

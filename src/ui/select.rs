@@ -128,11 +128,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
                     }
                 }
 
-                let item = ListItem::new(Line::from(spans));
+                let line = Line::from(spans);
                 if is_cursor {
-                    item.style(theme::row_cursor())
+                    ListItem::new(theme::lift_fg(line)).style(theme::row_cursor())
                 } else {
-                    item
+                    ListItem::new(line)
                 }
             })
             .collect();
