@@ -20,7 +20,8 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
+        KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -38,11 +39,27 @@ pub fn run_tui(app: &mut App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Where supported, ask for unambiguous Esc encoding so a lone Esc press
+    // isn't at the mercy of escape-sequence timing heuristics (ssh and
+    // multiplexers split byte streams mid-sequence). The probe needs raw mode
+    // active; the drain loop already ignores the Release events this enables.
+    let kitty_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kitty_keys {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, app);
 
+    // Pop before leaving the alternate screen (terminals may keep per-screen
+    // flag stacks); never let a failed pop skip restoring the terminal.
+    if kitty_keys {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
