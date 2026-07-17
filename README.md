@@ -19,6 +19,8 @@ Pin a specific version:
 curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | RUG_VERSION=v0.6.0 sh
 ```
 
+The installer places the `rug` binary in `~/.local/bin` (override with `RUG_INSTALL_DIR`) — make sure that directory is on your `PATH`.
+
 **Build from source** (requires Rust):
 
 ```sh

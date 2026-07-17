@@ -6,11 +6,13 @@
 #
 # Specific version:
 #   curl -fsSL https://raw.githubusercontent.com/terrabyteian/rug/master/install.sh | RUG_VERSION=v0.6.0 sh
+#
+# Installs to ~/.local/bin by default; override the location with RUG_INSTALL_DIR.
 set -e
 
 REPO="terrabyteian/rug"
 BINARY="rug"
-INSTALL_DIR="${RUG_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${RUG_INSTALL_DIR:-$HOME/.local/bin}"
 
 # ---------------------------------------------------------------------------
 # Detect OS
@@ -96,3 +98,12 @@ fi
 
 echo "==> Installed: $(command -v ${BINARY} || echo ${INSTALL_DIR}/${BINARY})"
 "${INSTALL_DIR}/${BINARY}" --version
+
+# Warn if the install dir isn't on PATH (common for ~/.local/bin on a fresh setup).
+case ":${PATH}:" in
+  *":${INSTALL_DIR}:"*) ;;
+  *)
+    echo "==> note: ${INSTALL_DIR} is not on your PATH — add it with:"
+    echo "         export PATH=\"${INSTALL_DIR}:\$PATH\""
+    ;;
+esac
