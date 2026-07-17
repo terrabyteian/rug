@@ -48,6 +48,8 @@ pub struct RunSession {
     pub output_wrap: bool,
     /// In-progress or completed drag selection over the output pane.
     pub selection: Option<OutputSelection>,
+    /// A press anchor waiting to be promoted into a selection by a drag.
+    pub pending_sel: Option<PendingSel>,
     pub created_at: Instant,
 }
 
@@ -63,6 +65,7 @@ impl RunSession {
             output_scroll: 0,
             output_wrap: false,
             selection: None,
+            pending_sel: None,
             created_at: Instant::now(),
         }
     }
@@ -102,6 +105,15 @@ impl OutputSelection {
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
+}
+
+/// A left-press on output content that has not yet become a selection.
+/// Promoted to an `OutputSelection` by the first drag; discarded on release.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingSel {
+    /// Display task at press time; stale pendings are discarded.
+    pub task: Option<usize>,
+    pub pos: SelPos,
 }
 
 /// Per-module info shown in a confirmation overlay.
@@ -840,6 +852,9 @@ impl App {
             if s.selection.is_some_and(|sel| sel.task != task_id) {
                 s.selection = None;
             }
+            if s.pending_sel.is_some_and(|p| p.task != task_id) {
+                s.pending_sel = None;
+            }
         }
     }
 
@@ -859,6 +874,7 @@ impl App {
         if changed {
             s.output_scroll = 0;
             s.selection = None;
+            s.pending_sel = None;
         }
         changed
     }
@@ -877,6 +893,7 @@ impl App {
         if changed {
             s.output_scroll = 0;
             s.selection = None;
+            s.pending_sel = None;
         }
         changed
     }
@@ -1054,18 +1071,47 @@ impl App {
         Some(SelPos { line, ch })
     }
 
-    /// Begin a fresh drag selection at `pos`, anchored to the current display
-    /// task (so it's dropped if the display task changes underneath it).
-    pub fn run_selection_begin(&mut self, pos: SelPos) {
+    /// Record a press anchor on output content, anchored to the current
+    /// display task (so it's discarded if the display task changes
+    /// underneath it). Clears any existing selection (click-to-deselect) but
+    /// creates none of its own — see `run_selection_begin_from_pending`.
+    pub fn run_selection_arm(&mut self, pos: SelPos) {
         let task = self.run_display_task_id();
         if let Some(s) = self.session.as_mut() {
-            s.selection = Some(OutputSelection {
-                task,
-                anchor: pos,
-                head: pos,
-                dragging: true,
-            });
+            s.selection = None;
+            s.pending_sel = Some(PendingSel { task, pos });
         }
+    }
+
+    /// Promote the pending press anchor into a real dragging selection.
+    /// Consumes the pending anchor; returns false (and creates nothing) if
+    /// none exists or its display task no longer matches the current one.
+    pub fn run_selection_begin_from_pending(&mut self) -> bool {
+        let task = self.run_display_task_id();
+        let Some(s) = self.session.as_mut() else {
+            return false;
+        };
+        let Some(p) = s.pending_sel.take() else {
+            return false;
+        };
+        if p.task != task {
+            return false;
+        }
+        s.selection = Some(OutputSelection {
+            task,
+            anchor: p.pos,
+            head: p.pos,
+            dragging: true,
+        });
+        true
+    }
+
+    /// Discard the pending press anchor, if any. Returns whether one existed.
+    pub fn run_discard_pending_sel(&mut self) -> bool {
+        let Some(s) = self.session.as_mut() else {
+            return false;
+        };
+        s.pending_sel.take().is_some()
     }
 
     /// Extend the in-progress drag selection to `pos`. No-op unless a
@@ -1078,17 +1124,25 @@ impl App {
         }
     }
 
-    /// End the in-progress drag, leaving the selected range in place.
+    /// End the in-progress drag, leaving the selected range in place — unless
+    /// the drag never moved, in which case the zero-length selection is
+    /// dropped rather than left lingering to eat the next Esc.
     pub fn run_selection_end(&mut self) {
-        if let Some(sel) = self.session.as_mut().and_then(|s| s.selection.as_mut()) {
-            sel.dragging = false;
+        if let Some(s) = self.session.as_mut() {
+            if let Some(sel) = s.selection.as_mut() {
+                sel.dragging = false;
+                if sel.is_empty() {
+                    s.selection = None;
+                }
+            }
         }
     }
 
-    /// Clear any selection.
+    /// Clear any selection and any not-yet-promoted press anchor.
     pub fn run_clear_selection(&mut self) {
         if let Some(s) = self.session.as_mut() {
             s.selection = None;
+            s.pending_sel = None;
         }
     }
 
@@ -2772,5 +2826,149 @@ mod tests {
             app.engine.task(id).unwrap().targets,
             vec!["module.net".to_string()]
         );
+    }
+
+    // ── Drag-only output selection ─────────────────────────────────────────
+
+    /// A Run session over `n` modules with some running output attached to
+    /// module 0 (the initial cursor), so `run_display_task_id()` resolves.
+    fn selection_test_app(n: usize) -> App {
+        let mut app = multi_module_app(n);
+        app.multi_select = (0..n).collect();
+        app.enter_run();
+        let path = app.session.as_ref().unwrap().modules[0].path.clone();
+        let id = app.engine.tasks.len();
+        app.engine.tasks.push(Task {
+            id,
+            module_path: path.clone(),
+            module_name: "m0".to_string(),
+            command: "apply".to_string(),
+            status: TaskStatus::Running,
+            output_lines: vec!["hello world".to_string(), "second line".to_string()],
+            started_at: Some(Instant::now()),
+            finished_at: None,
+            plan_output_path: None,
+            targets: Vec::new(),
+            cleanup_plan_path: None,
+            resource_counts: None,
+            cancel_handle: None,
+        });
+        app.session.as_mut().unwrap().latest_task.insert(path, id);
+        app
+    }
+
+    #[test]
+    fn click_arms_but_does_not_select() {
+        let mut app = selection_test_app(1);
+        let pos = SelPos { line: 0, ch: 0 };
+
+        app.run_selection_arm(pos);
+        let session = app.session.as_ref().unwrap();
+        assert!(session.selection.is_none(), "a plain press must not select");
+        assert!(
+            session.pending_sel.is_some(),
+            "press should arm a pending anchor"
+        );
+
+        assert!(app.run_discard_pending_sel(), "pending anchor existed");
+        assert!(app.session.as_ref().unwrap().pending_sel.is_none());
+    }
+
+    #[test]
+    fn drag_materializes_selection() {
+        let mut app = selection_test_app(1);
+        let pos = SelPos { line: 0, ch: 0 };
+        let pos2 = SelPos { line: 0, ch: 3 };
+
+        app.run_selection_arm(pos);
+        assert!(app.run_selection_begin_from_pending());
+        {
+            let sel = app
+                .session
+                .as_ref()
+                .unwrap()
+                .selection
+                .expect("selection created");
+            assert!(sel.dragging);
+            assert_eq!(sel.anchor, pos);
+            assert_eq!(sel.head, pos);
+        }
+        assert!(app.session.as_ref().unwrap().pending_sel.is_none());
+
+        app.run_selection_drag(pos2);
+        app.run_selection_end();
+
+        let sel = app
+            .session
+            .as_ref()
+            .unwrap()
+            .selection
+            .expect("non-empty drag retains its selection");
+        assert!(!sel.dragging);
+        assert_eq!(sel.head, pos2);
+    }
+
+    #[test]
+    fn click_deselects_existing() {
+        let mut app = selection_test_app(1);
+        let pos = SelPos { line: 0, ch: 0 };
+        let pos2 = SelPos { line: 0, ch: 3 };
+
+        app.run_selection_arm(pos);
+        app.run_selection_begin_from_pending();
+        app.run_selection_drag(pos2);
+        app.run_selection_end();
+        assert!(app.session.as_ref().unwrap().selection.is_some());
+
+        // A fresh press elsewhere clears the old selection outright.
+        app.run_selection_arm(SelPos { line: 1, ch: 0 });
+        assert!(app.session.as_ref().unwrap().selection.is_none());
+        assert!(app.session.as_ref().unwrap().pending_sel.is_some());
+    }
+
+    #[test]
+    fn empty_drag_drops_selection() {
+        let mut app = selection_test_app(1);
+        let pos = SelPos { line: 0, ch: 0 };
+
+        app.run_selection_arm(pos);
+        assert!(app.run_selection_begin_from_pending());
+        // No `run_selection_drag` call: the release lands right where it began.
+        app.run_selection_end();
+
+        assert!(
+            app.session.as_ref().unwrap().selection.is_none(),
+            "a zero-length drag must not leave a lingering selection"
+        );
+    }
+
+    #[test]
+    fn cursor_move_clears_pending() {
+        let mut app = selection_test_app(2);
+        app.run_selection_arm(SelPos { line: 0, ch: 0 });
+        assert!(app.session.as_ref().unwrap().pending_sel.is_some());
+
+        assert!(app.run_move_cursor(1));
+        assert!(app.session.as_ref().unwrap().pending_sel.is_none());
+    }
+
+    #[test]
+    fn stale_task_pending() {
+        let mut app = selection_test_app(1);
+        app.run_selection_arm(SelPos { line: 0, ch: 0 });
+
+        // Simulate the display task changing out from under the pending
+        // anchor without going through a cleanup path that would already
+        // discard it — `run_selection_begin_from_pending` itself must refuse.
+        app.session
+            .as_mut()
+            .unwrap()
+            .pending_sel
+            .as_mut()
+            .unwrap()
+            .task = Some(999_999);
+
+        assert!(!app.run_selection_begin_from_pending());
+        assert!(app.session.as_ref().unwrap().selection.is_none());
     }
 }

@@ -422,15 +422,15 @@ fn handle_mouse(app: &mut App, mouse: event::MouseEvent) {
         return;
     }
 
-    // An in-progress drag owns the gesture regardless of pointer position: a
-    // drag that wanders over the board must not click board rows, and a
-    // release anywhere must end it.
-    let dragging = app
+    // An in-progress drag (or a still-pending press anchor that a drag would
+    // promote) owns the gesture regardless of pointer position: a drag that
+    // wanders over the board must not click board rows, and a release
+    // anywhere must end it.
+    let gesture_active = app
         .session
         .as_ref()
-        .and_then(|s| s.selection)
-        .is_some_and(|sel| sel.dragging);
-    if dragging
+        .is_some_and(|s| s.pending_sel.is_some() || s.selection.is_some_and(|sel| sel.dragging));
+    if gesture_active
         && matches!(
             mouse.kind,
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
@@ -536,7 +536,9 @@ fn handle_output_mouse(app: &mut App, mouse: &event::MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(pos) = app.output_hit_test(mouse.column, mouse.row, false) {
-                app.run_selection_begin(pos);
+                // Arm a press anchor but don't select yet — a plain click
+                // (no drag) must not create a (zero-length) selection.
+                app.run_selection_arm(pos);
                 true
             } else if point_in_output_region(app, mouse) {
                 // A click inside the pane that didn't land on content (e.g.
@@ -553,7 +555,7 @@ fn handle_output_mouse(app: &mut App, mouse: &event::MouseEvent) -> bool {
                 .as_ref()
                 .and_then(|s| s.selection)
                 .is_some_and(|sel| sel.dragging);
-            if !dragging {
+            if !dragging && !app.run_selection_begin_from_pending() {
                 return false;
             }
             // Edge auto-scroll: dragging past the top/bottom of the pane
@@ -585,7 +587,9 @@ fn handle_output_mouse(app: &mut App, mouse: &event::MouseEvent) -> bool {
                 }
                 true
             } else {
-                false
+                // No drag happened: consume the release iff a press anchor
+                // is still pending (a plain click).
+                app.run_discard_pending_sel()
             }
         }
         _ => false,
@@ -2992,6 +2996,11 @@ mod tests {
             &mut app,
             left_mouse(MouseEventKind::Down(MouseButton::Left), left + 4, top + 2),
         );
+        // A plain press only arms a pending anchor; a drag materializes it.
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), left + 4, top + 2),
+        );
 
         let sel = app
             .session
@@ -3058,6 +3067,11 @@ mod tests {
             &mut app,
             left_mouse(MouseEventKind::Down(MouseButton::Left), left, top),
         );
+        // A plain press only arms a pending anchor; a drag materializes it.
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), left, top),
+        );
 
         let sel = app
             .session
@@ -3087,9 +3101,14 @@ mod tests {
             &mut app,
             left_mouse(MouseEventKind::Down(MouseButton::Left), left + 1, top),
         );
+        // A plain press only arms a pending anchor; a drag materializes it.
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), left + 1, top),
+        );
         assert!(
             app.session.as_ref().unwrap().selection.is_some(),
-            "expected a selection after the press"
+            "expected a selection after the drag"
         );
 
         app.run_move_cursor(1);
@@ -3169,9 +3188,14 @@ mod tests {
             &mut app,
             left_mouse(MouseEventKind::Down(MouseButton::Left), left, top),
         );
-        assert!(app.session.as_ref().unwrap().selection.is_some());
+        // A plain press only arms a pending anchor — no selection yet.
+        assert!(app.session.as_ref().unwrap().selection.is_none());
+        assert!(app.session.as_ref().unwrap().pending_sel.is_some());
 
-        // Drag one row above the pane's top edge.
+        // Drag one row above the pane's top edge. Even though this is the
+        // first drag event and it already left the content area, it must
+        // still promote the pending anchor into a selection anchored at the
+        // press point, then extend to the clamped position.
         handle_mouse(
             &mut app,
             left_mouse(
@@ -3217,6 +3241,11 @@ mod tests {
         handle_mouse(
             &mut app,
             left_mouse(MouseEventKind::Down(MouseButton::Left), left, top),
+        );
+        // A plain press only arms a pending anchor; a drag materializes it.
+        handle_mouse(
+            &mut app,
+            left_mouse(MouseEventKind::Drag(MouseButton::Left), left, top),
         );
         assert!(app.session.as_ref().unwrap().selection.is_some());
         assert!(app.session.as_ref().unwrap().fullscreen);

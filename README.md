@@ -221,12 +221,13 @@ back into the running session. The minimum usable terminal size is 40×10.
 | `C` | Cancel active tasks in scope |
 | `x` | Clear completed task history |
 | Mouse drag | Select output text (copied to clipboard on release) |
+| Mouse click | Clear the current selection |
 | `y` | Re-copy current text selection |
 | `Y` | Copy the whole output of the highlighted task |
 | `Enter` | Fullscreen output |
 | `w` | Toggle output wrap |
 | `s` | State explorer for the highlighted module |
-| `Esc` | Back to Select (tasks keep running) |
+| `Esc` | Clear an active selection, then back to Select / exit fullscreen |
 | `?` | Help |
 | `q` / `Ctrl-C` | Quit |
 
@@ -234,7 +235,8 @@ Selected text is copied two ways at once: to the system clipboard, and as an
 OSC 52 escape so the copy also works over SSH and inside tmux
 (`set -g set-clipboard on`) or zellij, provided your terminal supports OSC 52.
 To use the terminal emulator's native selection instead, hold `Shift` while
-dragging. Output wrap (`w`) breaks lines at character boundaries.
+dragging. Output wrap (`w`) breaks lines at character boundaries. A plain
+click (no drag) never starts a selection — it only clears the current one.
 
 **State explorer**
 
