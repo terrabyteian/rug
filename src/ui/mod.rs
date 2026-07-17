@@ -19,8 +19,8 @@ pub enum ScreenAction {
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -66,311 +66,326 @@ fn event_loop<B: ratatui::backend::Backend>(
 
         // Poll for input events with a short timeout so we keep draining task events.
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Mouse(mouse) => handle_mouse(app, mouse),
-                Event::Key(key) => {
-                    // Ctrl-C: quit immediately if no tasks are running, otherwise
-                    // surface the same confirmation overlay as `q`. A second Ctrl-C
-                    // while the overlay is up forces the quit through.
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        if matches!(app.modal, Some(Modal::Quit)) || app.active_tasks().is_empty()
-                        {
-                            break;
+            // Drain everything already queued before the next render, so a burst
+            // of input doesn't cost one full draw per event.
+            loop {
+                match event::read()? {
+                    Event::Mouse(mouse) => handle_mouse(app, mouse),
+                    Event::Key(key) => {
+                        // The kitty keyboard protocol (enabled in a follow-up) can
+                        // deliver Release events; Press and Repeat both act.
+                        let quit = key.kind != KeyEventKind::Release
+                            && matches!(handle_key_event(terminal, app, key), ScreenAction::Quit);
+                        if quit {
+                            return Ok(());
                         }
-                        app.modal = Some(Modal::Quit);
-                        continue;
                     }
-
-                    // Min-size guard: below 40×10 the UI can't render, so swallow
-                    // everything except quit (Ctrl-C handled above).
-                    if terminal
-                        .size()
-                        .map(|s| s.width < layout::MIN_W || s.height < layout::MIN_H)
-                        .unwrap_or(false)
-                    {
-                        if key.code == KeyCode::Char('q') {
-                            if app.active_tasks().is_empty() {
-                                break;
-                            }
-                            app.modal = Some(Modal::Quit);
-                        }
-                        continue;
-                    }
-
-                    // Fullscreen output mode (Run session): Esc exits, scroll keys
-                    // pass through, all else swallowed.
-                    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
-                        match key.code {
-                            KeyCode::Esc => fullscreen_esc(app),
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                app.run_scroll_output(-1);
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                app.run_scroll_output(1);
-                            }
-                            KeyCode::PageDown => {
-                                app.run_scroll_output(-(app.viewport.output.max(1) as i32));
-                            }
-                            KeyCode::PageUp => {
-                                app.run_scroll_output(app.viewport.output.max(1) as i32);
-                            }
-                            KeyCode::Char('g') => {
-                                app.run_scroll_to_top();
-                            }
-                            KeyCode::Char('G') => {
-                                app.run_scroll_to_bottom();
-                            }
-                            KeyCode::Char('w') => {
-                                if let Some(s) = app.session.as_mut() {
-                                    s.output_wrap = !s.output_wrap;
-                                }
-                            }
-                            KeyCode::Char('y') => {
-                                if let Some(text) = app.run_selected_text() {
-                                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
-                                }
-                            }
-                            KeyCode::Char('Y') => {
-                                if let Some(text) = app.run_all_output_text() {
-                                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // Modal overlay intercepts all keys: Quit (q force-quits, Esc
-                    // cancels); Confirm/CancelTasks/ClearTasks/Reset (y/Y/Enter act,
-                    // anything else dismisses); Help (any key closes).
-                    if app.modal.is_some() {
-                        if matches!(app.modal, Some(Modal::Quit)) {
-                            match key.code {
-                                KeyCode::Char('q') => break,
-                                KeyCode::Esc => app.modal = None,
-                                _ => {}
-                            }
-                        } else if matches!(app.modal, Some(Modal::Confirm(_))) {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                    app.confirm_execute();
-                                }
-                                _ => {
-                                    app.cancel_confirm();
-                                }
-                            }
-                        } else if matches!(app.modal, Some(Modal::CancelTasks(_))) {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                    app.cancel_staged_tasks();
-                                }
-                                _ => {
-                                    app.modal = None;
-                                }
-                            }
-                        } else if matches!(app.modal, Some(Modal::ClearTasks)) {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                    app.clear_completed_tasks();
-                                }
-                                _ => {
-                                    app.modal = None;
-                                }
-                            }
-                        } else if matches!(app.modal, Some(Modal::Reset)) {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                    app.reset_session();
-                                }
-                                _ => {
-                                    app.modal = None;
-                                }
-                            }
-                        } else {
-                            // Help: any key closes.
-                            app.modal = None;
-                        }
-                        continue;
-                    }
-
-                    // State explorer overlay.
-                    if app.state_explorer.is_some() {
-                        let has_op_result = app
-                            .state_explorer
-                            .as_ref()
-                            .map(|e| e.op_result.is_some())
-                            .unwrap_or(false);
-                        let op_confirm = app.state_explorer.as_ref().and_then(|e| e.op_confirm);
-                        let has_pending_op = app
-                            .state_explorer
-                            .as_ref()
-                            .map(|e| e.pending_op.is_some())
-                            .unwrap_or(false);
-                        let in_detail = app
-                            .state_explorer
-                            .as_ref()
-                            .map(|e| e.detail_view.is_some())
-                            .unwrap_or(false);
-                        let filter_active = app
-                            .state_explorer
-                            .as_ref()
-                            .map(|e| e.filter_active)
-                            .unwrap_or(false);
-
-                        let plan_queued = app
-                            .state_explorer
-                            .as_ref()
-                            .map(|e| e.plan_queued_notice)
-                            .unwrap_or(false);
-
-                        if has_op_result {
-                            // Any key dismisses the result overlay.
-                            app.dismiss_op_result();
-                        } else if plan_queued {
-                            if let Some(e) = app.state_explorer.as_mut() {
-                                e.plan_queued_notice = false;
-                            }
-                        } else if op_confirm.is_some() {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                    app.start_op();
-                                }
-                                _ => {
-                                    app.cancel_op_confirm();
-                                }
-                            }
-                        } else if has_pending_op {
-                            // Absorb all keys while the op is running.
-                        } else if in_detail {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.close_resource_detail();
-                                }
-                                KeyCode::Char('q') => {
-                                    app.close_state_explorer();
-                                }
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    app.resource_detail_scroll(1);
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    app.resource_detail_scroll(-1);
-                                }
-                                KeyCode::PageDown => {
-                                    app.resource_detail_scroll(
-                                        app.viewport.explorer.max(1) as i32
-                                    );
-                                }
-                                KeyCode::PageUp => {
-                                    app.resource_detail_scroll(
-                                        -(app.viewport.explorer.max(1) as i32),
-                                    );
-                                }
-                                KeyCode::Char('g') => {
-                                    app.resource_detail_go_first();
-                                }
-                                KeyCode::Char('G') => {
-                                    app.resource_detail_go_last();
-                                }
-                                _ => {}
-                            }
-                        } else if filter_active {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.state_explorer_clear_filter();
-                                }
-                                KeyCode::Enter => {
-                                    app.state_explorer_deactivate_filter();
-                                }
-                                KeyCode::Backspace => {
-                                    app.state_explorer_filter_pop();
-                                }
-                                KeyCode::Char(c) => {
-                                    app.state_explorer_filter_push(c);
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    app.close_state_explorer();
-                                }
-                                KeyCode::Enter => {
-                                    app.open_resource_detail();
-                                }
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    app.state_explorer_move(1);
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    app.state_explorer_move(-1);
-                                }
-                                KeyCode::PageDown => {
-                                    app.state_explorer_move(app.viewport.explorer.max(1) as i32);
-                                }
-                                KeyCode::PageUp => {
-                                    app.state_explorer_move(
-                                        -(app.viewport.explorer.max(1) as i32),
-                                    );
-                                }
-                                KeyCode::Char('g') => {
-                                    app.state_explorer_go_first();
-                                }
-                                KeyCode::Char('G') => {
-                                    app.state_explorer_go_last();
-                                }
-                                KeyCode::Char('/') => {
-                                    app.state_explorer_activate_filter();
-                                }
-                                KeyCode::Char(' ') => {
-                                    app.state_explorer_toggle_select();
-                                }
-                                KeyCode::Char('c') => {
-                                    app.state_explorer_clear_select();
-                                }
-                                KeyCode::Char('t') => {
-                                    app.request_op_confirm(ExplorerOpKind::Taint);
-                                }
-                                KeyCode::Char('D') => {
-                                    app.request_op_confirm(ExplorerOpKind::StateRm);
-                                }
-                                KeyCode::Char('p') => {
-                                    app.enqueue_targeted_plan();
-                                }
-                                KeyCode::Char('a') => {
-                                    app.request_op_confirm(ExplorerOpKind::TargetedApply);
-                                }
-                                KeyCode::Char('d') => {
-                                    app.request_op_confirm(ExplorerOpKind::TargetedDestroy);
-                                }
-                                KeyCode::Char('r') => {
-                                    app.refresh_state_explorer();
-                                }
-                                _ => {}
-                            }
-                        }
-                        continue;
-                    }
-
-                    let action = match app.screen {
-                        Screen::Select => select::handle_key(app, key),
-                        Screen::Run => run::handle_key(app, key),
-                    };
-                    match action {
-                        ScreenAction::Quit => {
-                            if app.active_tasks().is_empty() {
-                                break;
-                            }
-                            app.modal = Some(Modal::Quit);
-                        }
-                        ScreenAction::None => {}
-                    }
-                } // end Event::Key
-                _ => {}
-            } // end match event::read()
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
         }
     }
-    Ok(())
+}
+
+/// Dispatch one key event against the app. Returns `ScreenAction::Quit`
+/// when the event loop must exit immediately.
+fn handle_key_event<B: ratatui::backend::Backend>(
+    terminal: &Terminal<B>,
+    app: &mut App,
+    key: event::KeyEvent,
+) -> ScreenAction {
+    // Ctrl-C: quit immediately if no tasks are running, otherwise
+    // surface the same confirmation overlay as `q`. A second Ctrl-C
+    // while the overlay is up forces the quit through.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if matches!(app.modal, Some(Modal::Quit)) || app.active_tasks().is_empty() {
+            return ScreenAction::Quit;
+        }
+        app.modal = Some(Modal::Quit);
+        return ScreenAction::None;
+    }
+
+    // Min-size guard: below 40×10 the UI can't render, so swallow
+    // everything except quit (Ctrl-C handled above).
+    if terminal
+        .size()
+        .map(|s| s.width < layout::MIN_W || s.height < layout::MIN_H)
+        .unwrap_or(false)
+    {
+        if key.code == KeyCode::Char('q') {
+            if app.active_tasks().is_empty() {
+                return ScreenAction::Quit;
+            }
+            app.modal = Some(Modal::Quit);
+        }
+        return ScreenAction::None;
+    }
+
+    // Fullscreen output mode (Run session): Esc exits, scroll keys
+    // pass through, all else swallowed.
+    if app.session.as_ref().map(|s| s.fullscreen).unwrap_or(false) {
+        match key.code {
+            KeyCode::Esc => fullscreen_esc(app),
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.run_scroll_output(-1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.run_scroll_output(1);
+            }
+            KeyCode::PageDown => {
+                app.run_scroll_output(-(app.viewport.output.max(1) as i32));
+            }
+            KeyCode::PageUp => {
+                app.run_scroll_output(app.viewport.output.max(1) as i32);
+            }
+            KeyCode::Char('g') => {
+                app.run_scroll_to_top();
+            }
+            KeyCode::Char('G') => {
+                app.run_scroll_to_bottom();
+            }
+            KeyCode::Char('w') => {
+                if let Some(s) = app.session.as_mut() {
+                    s.output_wrap = !s.output_wrap;
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(text) = app.run_selected_text() {
+                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
+                }
+            }
+            KeyCode::Char('Y') => {
+                if let Some(text) = app.run_all_output_text() {
+                    let _ = crate::ui::clipboard::copy_to_clipboard(&text);
+                }
+            }
+            _ => {}
+        }
+        return ScreenAction::None;
+    }
+
+    // Modal overlay intercepts all keys: Quit (q force-quits, Esc
+    // cancels); Confirm/CancelTasks/ClearTasks/Reset (y/Y/Enter act,
+    // anything else dismisses); Help (any key closes).
+    if app.modal.is_some() {
+        if matches!(app.modal, Some(Modal::Quit)) {
+            match key.code {
+                KeyCode::Char('q') => return ScreenAction::Quit,
+                KeyCode::Esc => app.modal = None,
+                _ => {}
+            }
+        } else if matches!(app.modal, Some(Modal::Confirm(_))) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.confirm_execute();
+                }
+                _ => {
+                    app.cancel_confirm();
+                }
+            }
+        } else if matches!(app.modal, Some(Modal::CancelTasks(_))) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.cancel_staged_tasks();
+                }
+                _ => {
+                    app.modal = None;
+                }
+            }
+        } else if matches!(app.modal, Some(Modal::ClearTasks)) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.clear_completed_tasks();
+                }
+                _ => {
+                    app.modal = None;
+                }
+            }
+        } else if matches!(app.modal, Some(Modal::Reset)) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.reset_session();
+                }
+                _ => {
+                    app.modal = None;
+                }
+            }
+        } else {
+            // Help: any key closes.
+            app.modal = None;
+        }
+        return ScreenAction::None;
+    }
+
+    // State explorer overlay.
+    if app.state_explorer.is_some() {
+        let has_op_result = app
+            .state_explorer
+            .as_ref()
+            .map(|e| e.op_result.is_some())
+            .unwrap_or(false);
+        let op_confirm = app.state_explorer.as_ref().and_then(|e| e.op_confirm);
+        let has_pending_op = app
+            .state_explorer
+            .as_ref()
+            .map(|e| e.pending_op.is_some())
+            .unwrap_or(false);
+        let in_detail = app
+            .state_explorer
+            .as_ref()
+            .map(|e| e.detail_view.is_some())
+            .unwrap_or(false);
+        let filter_active = app
+            .state_explorer
+            .as_ref()
+            .map(|e| e.filter_active)
+            .unwrap_or(false);
+
+        let plan_queued = app
+            .state_explorer
+            .as_ref()
+            .map(|e| e.plan_queued_notice)
+            .unwrap_or(false);
+
+        if has_op_result {
+            // Any key dismisses the result overlay.
+            app.dismiss_op_result();
+        } else if plan_queued {
+            if let Some(e) = app.state_explorer.as_mut() {
+                e.plan_queued_notice = false;
+            }
+        } else if op_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.start_op();
+                }
+                _ => {
+                    app.cancel_op_confirm();
+                }
+            }
+        } else if has_pending_op {
+            // Absorb all keys while the op is running.
+        } else if in_detail {
+            match key.code {
+                KeyCode::Esc => {
+                    app.close_resource_detail();
+                }
+                KeyCode::Char('q') => {
+                    app.close_state_explorer();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.resource_detail_scroll(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.resource_detail_scroll(-1);
+                }
+                KeyCode::PageDown => {
+                    app.resource_detail_scroll(app.viewport.explorer.max(1) as i32);
+                }
+                KeyCode::PageUp => {
+                    app.resource_detail_scroll(-(app.viewport.explorer.max(1) as i32));
+                }
+                KeyCode::Char('g') => {
+                    app.resource_detail_go_first();
+                }
+                KeyCode::Char('G') => {
+                    app.resource_detail_go_last();
+                }
+                _ => {}
+            }
+        } else if filter_active {
+            match key.code {
+                KeyCode::Esc => {
+                    app.state_explorer_clear_filter();
+                }
+                KeyCode::Enter => {
+                    app.state_explorer_deactivate_filter();
+                }
+                KeyCode::Backspace => {
+                    app.state_explorer_filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    app.state_explorer_filter_push(c);
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.close_state_explorer();
+                }
+                KeyCode::Enter => {
+                    app.open_resource_detail();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.state_explorer_move(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.state_explorer_move(-1);
+                }
+                KeyCode::PageDown => {
+                    app.state_explorer_move(app.viewport.explorer.max(1) as i32);
+                }
+                KeyCode::PageUp => {
+                    app.state_explorer_move(-(app.viewport.explorer.max(1) as i32));
+                }
+                KeyCode::Char('g') => {
+                    app.state_explorer_go_first();
+                }
+                KeyCode::Char('G') => {
+                    app.state_explorer_go_last();
+                }
+                KeyCode::Char('/') => {
+                    app.state_explorer_activate_filter();
+                }
+                KeyCode::Char(' ') => {
+                    app.state_explorer_toggle_select();
+                }
+                KeyCode::Char('c') => {
+                    app.state_explorer_clear_select();
+                }
+                KeyCode::Char('t') => {
+                    app.request_op_confirm(ExplorerOpKind::Taint);
+                }
+                KeyCode::Char('D') => {
+                    app.request_op_confirm(ExplorerOpKind::StateRm);
+                }
+                KeyCode::Char('p') => {
+                    app.enqueue_targeted_plan();
+                }
+                KeyCode::Char('a') => {
+                    app.request_op_confirm(ExplorerOpKind::TargetedApply);
+                }
+                KeyCode::Char('d') => {
+                    app.request_op_confirm(ExplorerOpKind::TargetedDestroy);
+                }
+                KeyCode::Char('r') => {
+                    app.refresh_state_explorer();
+                }
+                _ => {}
+            }
+        }
+        return ScreenAction::None;
+    }
+
+    let action = match app.screen {
+        Screen::Select => select::handle_key(app, key),
+        Screen::Run => run::handle_key(app, key),
+    };
+    match action {
+        ScreenAction::Quit => {
+            if app.active_tasks().is_empty() {
+                return ScreenAction::Quit;
+            }
+            app.modal = Some(Modal::Quit);
+        }
+        ScreenAction::None => {}
+    }
+
+    ScreenAction::None
 }
 
 /// Esc while the Run session is fullscreen: clear an active selection first;
