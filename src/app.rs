@@ -301,9 +301,15 @@ pub struct ViewportHeights {
 /// module header, or a resource line (indented when it belongs to a group).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplorerRow {
-    ModuleHeader { prefix: String, count: usize },
+    ModuleHeader {
+        prefix: String,
+        count: usize,
+    },
     /// `res_idx` is the UNFILTERED index into `StateContent::Resources`.
-    Resource { res_idx: usize, indent: bool },
+    Resource {
+        res_idx: usize,
+        indent: bool,
+    },
 }
 
 /// Build the grouped explorer row list from `resources` under `filter`.
@@ -313,7 +319,10 @@ pub enum ExplorerRow {
 /// members in original order. A group header is emitted only when at least one
 /// member survives the (case-insensitive substring) filter; `count` is the
 /// number of surviving members.
-pub fn build_explorer_rows(resources: &[crate::state::StateResource], filter: &str) -> Vec<ExplorerRow> {
+pub fn build_explorer_rows(
+    resources: &[crate::state::StateResource],
+    filter: &str,
+) -> Vec<ExplorerRow> {
     let filter_lower = filter.to_lowercase();
     let matches = |addr: &str| filter.is_empty() || addr.to_lowercase().contains(&filter_lower);
 
@@ -708,8 +717,7 @@ impl App {
             .iter()
             .filter(|t| t.module_path == *path && !t.status.is_terminal())
             .max_by_key(|t| t.id)?;
-        let frame =
-            (self.spinner_tick as usize / 2) % crate::ui::theme::SPINNER_FRAMES.len();
+        let frame = (self.spinner_tick as usize / 2) % crate::ui::theme::SPINNER_FRAMES.len();
         Some((frame, task.command.clone()))
     }
 
@@ -842,7 +850,9 @@ impl App {
             .and_then(|s| s.modules.get(s.cursor))
             .and_then(|m| display_task(engine, session_ref, &m.path));
         let task_id = display.as_ref().map(|(t, _)| t.id);
-        let lines: &[String] = display.map(|(t, _)| t.output_lines.as_slice()).unwrap_or(&[]);
+        let lines: &[String] = display
+            .map(|(t, _)| t.output_lines.as_slice())
+            .unwrap_or(&[]);
         output_layout.sync(task_id, lines, width, wrap);
 
         // A selection anchored to a display task that's no longer showing
@@ -1357,7 +1367,10 @@ impl App {
     pub fn enqueue_plan(&mut self, targets: &[usize]) -> Vec<usize> {
         let mut ids = Vec::new();
         for &idx in targets {
-            let plan_path = self.engine.plan_cache.plan_path_for(&self.modules[idx].path);
+            let plan_path = self
+                .engine
+                .plan_cache
+                .plan_path_for(&self.modules[idx].path);
             let args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
             ids.push(self.push_task_for(idx, "plan", args, Some(plan_path), Vec::new(), None));
         }
@@ -1583,7 +1596,14 @@ impl App {
     fn enqueue_init_upgrade_for(&mut self, targets: &[usize]) -> Vec<usize> {
         let mut ids = Vec::new();
         for &idx in targets {
-            ids.push(self.push_task_for(idx, "init", vec!["-upgrade".to_string()], None, Vec::new(), None));
+            ids.push(self.push_task_for(
+                idx,
+                "init",
+                vec!["-upgrade".to_string()],
+                None,
+                Vec::new(),
+                None,
+            ));
         }
         ids
     }
@@ -2039,8 +2059,14 @@ impl App {
                 let remaining = targets;
                 let mut args: Vec<String> = kind.pre_args().iter().map(|s| s.to_string()).collect();
                 args.push(first.clone());
-                let task_id =
-                    self.push_task_for(module_idx, kind.command(), args, None, vec![first.clone()], None);
+                let task_id = self.push_task_for(
+                    module_idx,
+                    kind.command(),
+                    args,
+                    None,
+                    vec![first.clone()],
+                    None,
+                );
                 self.record_explorer_task(module_idx, task_id);
                 if let Some(explorer) = self.state_explorer.as_mut() {
                     explorer.pending_op = Some(PendingOp {

@@ -123,7 +123,10 @@ pub fn detect_binary() -> Result<String> {
 /// Testable core of binary detection: takes the env override and a PATH
 /// predicate as parameters so tests never need to mutate real env vars or
 /// touch the real PATH.
-fn detect_binary_impl(env_override: Option<&str>, on_path: impl Fn(&str) -> bool) -> Result<String> {
+fn detect_binary_impl(
+    env_override: Option<&str>,
+    on_path: impl Fn(&str) -> bool,
+) -> Result<String> {
     if let Some(bin) = env_override {
         if !bin.is_empty() {
             return Ok(bin.to_string());

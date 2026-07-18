@@ -82,7 +82,8 @@ pub fn osc52_sequence(text: &str, tmux_wrap: bool) -> String {
 /// the OSC 52 payload is truncated to MAX_OSC52_BYTES at a char boundary.
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     // Try native clipboard with the full text; ignore errors.
-    let _ = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()));
+    let _ =
+        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()));
 
     // Truncate to MAX_OSC52_BYTES at a char boundary for the OSC 52 payload only.
     let truncated = truncate_on_char_boundary(text, MAX_OSC52_BYTES);

@@ -384,10 +384,7 @@ mod tests {
             resource_type: "aws_instance".to_string(),
             name: "web".to_string(),
             module: None,
-            instances: vec![
-                json!({"index_key": 0}),
-                json!({"index_key": 1}),
-            ],
+            instances: vec![json!({"index_key": 0}), json!({"index_key": 1})],
         };
         let addrs: Vec<String> = expand_resource(r).into_iter().map(|s| s.address).collect();
         assert_eq!(addrs, vec!["aws_instance.web[0]", "aws_instance.web[1]"]);
@@ -415,7 +412,10 @@ mod tests {
             module: Some("module.net".to_string()),
             instances: vec![json!({})],
         };
-        let addrs: Vec<String> = expand_resource(data).into_iter().map(|s| s.address).collect();
+        let addrs: Vec<String> = expand_resource(data)
+            .into_iter()
+            .map(|s| s.address)
+            .collect();
         assert_eq!(addrs, vec!["module.net.data.aws_ami.ubuntu"]);
     }
 

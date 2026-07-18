@@ -81,7 +81,9 @@ pub fn cursor_row(line: Line<'static>, width: u16) -> Line<'static> {
 
 /// Column-header style: dim, underlined.
 pub fn col_header() -> Style {
-    Style::default().fg(MUTED).add_modifier(Modifier::UNDERLINED)
+    Style::default()
+        .fg(MUTED)
+        .add_modifier(Modifier::UNDERLINED)
 }
 
 /// A single key-hint fragment: bold accent key + muted label.
@@ -117,7 +119,9 @@ pub fn overlay_border_filter() -> Style {
 }
 
 pub fn multi_select_marker() -> Style {
-    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
 }
 pub fn multi_select_item() -> Style {
     Style::default().fg(Color::Yellow)
@@ -127,7 +131,9 @@ pub fn covered_marker() -> Style {
     Style::default().fg(MUTED)
 }
 pub fn plan_marker() -> Style {
-    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD)
 }
 /// Marker for a cached plan that was scoped with `-target=` (partial plan).
 pub fn plan_marker_targeted() -> Style {

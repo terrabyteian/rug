@@ -100,7 +100,10 @@ mod tests {
 
     #[test]
     fn no_lock_block_returns_none() {
-        let out = lines(&["Apply complete!", "Resources: 1 added, 0 changed, 0 destroyed."]);
+        let out = lines(&[
+            "Apply complete!",
+            "Resources: 1 added, 0 changed, 0 destroyed.",
+        ]);
         assert!(parse_lock_from_output(&out).is_none());
     }
 
@@ -132,4 +135,3 @@ mod tests {
         assert_eq!(info.who, "second@host");
     }
 }
-

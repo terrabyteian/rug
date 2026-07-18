@@ -127,7 +127,10 @@ fn render_collapsed(f: &mut Frame, area: Rect, app: &mut App, bp: Breakpoints) {
         .unwrap_or_default();
     let tail = Line::from(vec![
         Span::styled(
-            format!("{} ", truncate(&last, area.width.saturating_sub(12) as usize)),
+            format!(
+                "{} ",
+                truncate(&last, area.width.saturating_sub(12) as usize)
+            ),
             theme::dim(),
         ),
         Span::styled("⏎ output", theme::dim()),
@@ -273,7 +276,9 @@ fn board_row(
     // and in the finished result row — distinct from the CACHED-PLAN P:{age}·T
     // badge below, which describes the plan-cache entry).
     if show_command {
-        let cmd = task.map(|t| t.command.clone()).unwrap_or_else(|| "—".to_string());
+        let cmd = task
+            .map(|t| t.command.clone())
+            .unwrap_or_else(|| "—".to_string());
         spans.push(Span::styled(format!("  {cmd}"), theme::command_text()));
         if let Some(t) = task {
             if !t.targets.is_empty() {
@@ -340,10 +345,16 @@ fn status_parts(app: &App, task: Option<&Task>) -> (String, &'static str, Style)
     let style = theme::status_style(&t.status);
     match t.status {
         TaskStatus::Pending => ("○".to_string(), "queued", style),
-        TaskStatus::Running => (theme::spinner(app.spinner_tick).to_string(), "running", style),
-        TaskStatus::Cancelling => {
-            (theme::spinner(app.spinner_tick).to_string(), "cancel", style)
-        }
+        TaskStatus::Running => (
+            theme::spinner(app.spinner_tick).to_string(),
+            "running",
+            style,
+        ),
+        TaskStatus::Cancelling => (
+            theme::spinner(app.spinner_tick).to_string(),
+            "cancel",
+            style,
+        ),
         TaskStatus::Success => ("✓".to_string(), "done", style),
         TaskStatus::Failed => ("✗".to_string(), "failed", style),
         TaskStatus::Cancelled => ("⊘".to_string(), "cancelled", style),
@@ -464,7 +475,9 @@ pub fn render_fullscreen_output(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .unwrap_or_else(|| " output ".to_string());
 
-    let block = Block::default().borders(Borders::ALL).border_style(theme::dim());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::dim());
     let inner = block.inner(area);
 
     app.sync_output_layout(inner.width, wrap);

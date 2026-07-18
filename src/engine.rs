@@ -49,9 +49,16 @@ pub enum EngineUpdate {
     // rather than deleting it). Kept for Plan B: API symmetry with the other
     // variants, and a natural hook for a future "started" indicator.
     #[allow(dead_code)]
-    Started { task_id: usize },
-    Line { task_id: usize },
-    Finished { task_id: usize, success: bool },
+    Started {
+        task_id: usize,
+    },
+    Line {
+        task_id: usize,
+    },
+    Finished {
+        task_id: usize,
+        success: bool,
+    },
 }
 
 /// Owns task execution: the task list, the plan cache, and per-module

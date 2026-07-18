@@ -270,8 +270,7 @@ mod tests {
 
     #[test]
     fn parses_destroy_complete_line() {
-        let counts =
-            parse_counts_from_line("Destroy complete! Resources: 3 destroyed.").unwrap();
+        let counts = parse_counts_from_line("Destroy complete! Resources: 3 destroyed.").unwrap();
         assert_eq!(counts.destroy, 3);
         assert!(counts.has_summary);
     }
@@ -297,7 +296,6 @@ mod tests {
 
     #[test]
     fn ordinary_line_returns_none() {
-        assert!(parse_counts_from_line("Terraform will perform the following actions:")
-            .is_none());
+        assert!(parse_counts_from_line("Terraform will perform the following actions:").is_none());
     }
 }

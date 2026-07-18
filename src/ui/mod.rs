@@ -953,7 +953,10 @@ fn render_confirm(f: &mut ratatui::Frame, area: ratatui::layout::Rect, confirm: 
         let plan_span = match &confirm.kind {
             ConfirmKind::Apply => match &target.plan_age {
                 Some(age) if !target.plan_targets.is_empty() => Span::styled(
-                    format!("  plan from {age} · TARGETED ({})", target.plan_targets.len()),
+                    format!(
+                        "  plan from {age} · TARGETED ({})",
+                        target.plan_targets.len()
+                    ),
                     Style::default().fg(Color::Yellow),
                 ),
                 Some(age) => Span::styled(
@@ -2049,7 +2052,10 @@ fn render_op_result(f: &mut ratatui::Frame, area: ratatui::layout::Rect, result:
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  [any key] Dismiss", theme::dim())));
+    lines.push(Line::from(Span::styled(
+        "  [any key] Dismiss",
+        theme::dim(),
+    )));
 
     let height = (lines.len() + 2).min(area.height as usize) as u16;
     let width = (content_w + 2).min(area.width as usize) as u16;
@@ -2303,10 +2309,7 @@ mod tests {
             app.session.as_mut().unwrap().latest_task.insert(path, 0);
 
             let s = render_to_string(&mut app, 120, 30);
-            assert!(
-                s.contains("apply"),
-                "command missing (terminal={terminal})"
-            );
+            assert!(s.contains("apply"), "command missing (terminal={terminal})");
             assert!(
                 s.contains("·T2"),
                 "target chip missing (terminal={terminal})"
@@ -2330,10 +2333,7 @@ mod tests {
         make_session(&mut app);
         app.modal = Some(Modal::Help);
         let run_help = render_to_string(&mut app, 120, 30);
-        assert!(
-            run_help.contains("back"),
-            "run help should list esc back"
-        );
+        assert!(run_help.contains("back"), "run help should list esc back");
     }
 
     #[test]
@@ -2502,10 +2502,7 @@ mod tests {
             "Run help missing select/copy description"
         );
         // Check that the Y (copy all) help text is rendered.
-        assert!(
-            s.contains("Y"),
-            "Run help missing Y key hint"
-        );
+        assert!(s.contains("Y"), "Run help missing Y key hint");
         assert!(
             s.contains("copy all output"),
             "Run help missing copy all output description"
@@ -2525,13 +2522,17 @@ mod tests {
     fn demo_explorer_app() -> App {
         use crate::state::{StateContent, StateResource};
         let mut app = demo_app(1);
-        let resources = ["aws_vpc.main", "module.net.null_resource.a", "module.net.null_resource.b"]
-            .iter()
-            .map(|a| StateResource {
-                address: a.to_string(),
-                instance: serde_json::json!({}),
-            })
-            .collect();
+        let resources = [
+            "aws_vpc.main",
+            "module.net.null_resource.a",
+            "module.net.null_resource.b",
+        ]
+        .iter()
+        .map(|a| StateResource {
+            address: a.to_string(),
+            instance: serde_json::json!({}),
+        })
+        .collect();
         app.state_explorer = Some(crate::app::StateExplorer {
             module_idx: 0,
             module_name: "mod0".to_string(),

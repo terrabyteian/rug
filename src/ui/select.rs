@@ -23,12 +23,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                            // header line 1
-            Constraint::Length(1),                            // header line 2
+            Constraint::Length(1),                               // header line 1
+            Constraint::Length(1),                               // header line 2
             Constraint::Length(if show_spacer { 1 } else { 0 }), // spacer
-            Constraint::Min(0),                               // module list
-            Constraint::Length(1),                            // status line
-            Constraint::Length(1),                            // keybar
+            Constraint::Min(0),                                  // module list
+            Constraint::Length(1),                               // status line
+            Constraint::Length(1),                               // keybar
         ])
         .split(area);
     let header1 = chunks[0];
@@ -138,7 +138,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
             .collect();
 
         let mut state = ListState::default();
-        state.select(Some(app.selected_module.min(visible_count.saturating_sub(1))));
+        state.select(Some(
+            app.selected_module.min(visible_count.saturating_sub(1)),
+        ));
         f.render_stateful_widget(List::new(items), list_area, &mut state);
         app.viewport.list_offset = state.offset() as u16;
     }
