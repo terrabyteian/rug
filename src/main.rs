@@ -223,8 +223,7 @@ fn confirm_headless(command: &str, modules: &[&module::Module]) -> Result<()> {
 /// Run `command` on every module in `modules`, streaming output to stdout,
 /// via the same `TaskEngine` the TUI uses.
 ///
-/// Accepted trade-offs versus the old hand-rolled channel/semaphore loop
-/// (Plan A step 7):
+/// Accepted trade-offs versus the old hand-rolled channel/semaphore loop:
 /// - Termination is driven by `engine.has_active_tasks()` rather than the
 ///   event channel closing — the engine holds its own sender for the whole
 ///   run, so the channel never closes on its own.
