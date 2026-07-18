@@ -1,8 +1,11 @@
 //! Clipboard integration: native clipboard via arboard, plus OSC 52 for tmux/SSH.
 
-use std::io::{self, Write};
+use std::io;
+#[cfg(not(test))]
+use std::io::Write;
 
 /// Cap on raw text bytes before base64 (terminals limit OSC 52 payloads).
+#[cfg(not(test))]
 const MAX_OSC52_BYTES: usize = 1_000_000;
 
 /// RFC 4648 standard-alphabet base64 with padding (hand-rolled: not worth a dep).
@@ -81,23 +84,34 @@ pub fn osc52_sequence(text: &str, tmux_wrap: bool) -> String {
 /// setups lack one), then OSC 52 to stdout. Arboard receives the full text;
 /// the OSC 52 payload is truncated to MAX_OSC52_BYTES at a char boundary.
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    // Try native clipboard with the full text; ignore errors.
-    let _ =
-        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()));
+    // Under `cargo test`, UI tests drive the real mouse-release path; without
+    // this guard they would clobber the developer's clipboard and leak OSC 52
+    // escapes into test output.
+    #[cfg(test)]
+    {
+        let _ = text;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        // Try native clipboard with the full text; ignore errors.
+        let _ = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.to_string()));
 
-    // Truncate to MAX_OSC52_BYTES at a char boundary for the OSC 52 payload only.
-    let truncated = truncate_on_char_boundary(text, MAX_OSC52_BYTES);
+        // Truncate to MAX_OSC52_BYTES at a char boundary for the OSC 52 payload only.
+        let truncated = truncate_on_char_boundary(text, MAX_OSC52_BYTES);
 
-    // Detect tmux.
-    let tmux_wrap = std::env::var_os("TMUX").is_some();
+        // Detect tmux.
+        let tmux_wrap = std::env::var_os("TMUX").is_some();
 
-    // Write OSC 52 sequence.
-    let sequence = osc52_sequence(truncated, tmux_wrap);
-    let mut stdout = io::stdout();
-    stdout.write_all(sequence.as_bytes())?;
-    stdout.flush()?;
+        // Write OSC 52 sequence.
+        let sequence = osc52_sequence(truncated, tmux_wrap);
+        let mut stdout = io::stdout();
+        stdout.write_all(sequence.as_bytes())?;
+        stdout.flush()?;
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[cfg(test)]

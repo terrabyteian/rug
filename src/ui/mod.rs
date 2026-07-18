@@ -535,12 +535,9 @@ fn handle_mouse(app: &mut App, mouse: event::MouseEvent) {
                         app.run_move_cursor(1);
                     }
                 }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if in_board {
-                        let pos =
-                            app.viewport.board_offset as usize + (mouse.row - board_top) as usize;
-                        app.run_set_cursor(pos);
-                    }
+                MouseEventKind::Down(MouseButton::Left) if in_board => {
+                    let pos = app.viewport.board_offset as usize + (mouse.row - board_top) as usize;
+                    app.run_set_cursor(pos);
                 }
                 _ => {}
             }
