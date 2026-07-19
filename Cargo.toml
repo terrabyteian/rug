@@ -1,6 +1,6 @@
 [package]
 name = "rug"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "A terraform/tofu multiplexer: discovers root modules under a directory tree and runs commands across them, as a TUI or headless CLI"
 repository = "https://github.com/terrabyteian/rug"
