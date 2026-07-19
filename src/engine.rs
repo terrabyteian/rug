@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::plan_cache::PlanCache;
+use crate::plan_cache::{PlanCache, PlanHandle};
 use crate::runner::spawn_task;
 use crate::task::{Task, TaskEvent, TaskEventReceiver, TaskEventSender, TaskStatus};
 
@@ -20,6 +20,10 @@ struct QueuedTask {
     module_name: String,
     command: String,
     args: Vec<String>,
+    /// The plan fd the child needs when this task eventually spawns (a
+    /// plan's output fd or an apply's input fd). The clone held here pins
+    /// the fd number so the `/dev/fd/N` baked into `args` stays valid.
+    plan_fd: Option<PlanHandle>,
 }
 
 /// Everything needed to enqueue a new task.
@@ -28,15 +32,15 @@ pub struct TaskSpec {
     pub module_name: String,
     pub command: String,
     pub args: Vec<String>,
-    /// For plan tasks: the path where the plan file is being written.
-    pub plan_output_path: Option<PathBuf>,
+    /// For plan tasks: the anonymous file terraform writes via `-out /dev/fd/N`.
+    pub plan_output: Option<PlanHandle>,
     /// The `-target=` addresses this task was scoped to (any command). Empty =
     /// untargeted. For plan tasks it is also registered into the plan cache
-    /// alongside `plan_output_path`.
+    /// alongside `plan_output`.
     pub targets: Vec<String>,
-    /// For apply tasks created from a cached plan: delete this plan after the
-    /// task exits or is cancelled before it starts.
-    pub cleanup_plan_path: Option<PathBuf>,
+    /// For apply tasks consuming a cached plan: dropped (fd closed) once the
+    /// task reaches a terminal state.
+    pub apply_plan: Option<PlanHandle>,
 }
 
 /// A processed engine event, returned to the caller so it can react (update
@@ -67,7 +71,7 @@ pub enum EngineUpdate {
 /// previously-queued task for that module).
 pub struct TaskEngine {
     pub tasks: Vec<Task>,
-    /// In-session plan file cache; files live in a managed temp dir.
+    /// In-session plan cache; plans live in anonymous fds, never on disk.
     pub plan_cache: PlanCache,
     next_task_id: usize,
     event_tx: TaskEventSender,
@@ -82,11 +86,11 @@ pub struct TaskEngine {
 }
 
 impl TaskEngine {
-    pub fn new(binary: String, parallelism: usize) -> std::io::Result<Self> {
+    pub fn new(binary: String, parallelism: usize) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        Ok(Self {
+        Self {
             tasks: Vec::new(),
-            plan_cache: PlanCache::new()?,
+            plan_cache: PlanCache::new(),
             next_task_id: 0,
             event_tx,
             event_rx,
@@ -94,7 +98,7 @@ impl TaskEngine {
             binary,
             running_modules: HashSet::new(),
             module_queues: HashMap::new(),
-        })
+        }
     }
 
     /// Push a task onto `self.tasks` and either start it immediately (if the
@@ -105,6 +109,8 @@ impl TaskEngine {
         let task_id = self.next_task_id;
         self.next_task_id += 1;
 
+        let child_fd = spec.plan_output.clone().or_else(|| spec.apply_plan.clone());
+
         self.tasks.push(Task {
             id: task_id,
             module_path: spec.module_path.clone(),
@@ -114,9 +120,9 @@ impl TaskEngine {
             output_lines: Vec::new(),
             started_at: None,
             finished_at: None,
-            plan_output_path: spec.plan_output_path,
+            plan_output: spec.plan_output,
             targets: spec.targets,
-            cleanup_plan_path: spec.cleanup_plan_path,
+            apply_plan: spec.apply_plan,
             resource_counts: None,
             cancel_handle: None,
         });
@@ -131,6 +137,7 @@ impl TaskEngine {
                 self.binary.clone(),
                 spec.command,
                 spec.args,
+                child_fd,
                 self.event_tx.clone(),
                 self.semaphore.clone(),
             );
@@ -144,16 +151,17 @@ impl TaskEngine {
                 module_name: spec.module_name,
                 command: spec.command,
                 args: spec.args,
+                plan_fd: child_fd,
             },
         ) {
             // Module is busy: slot as the single pending task, cancelling any
-            // previously-queued task that hasn't started yet.
+            // previously-queued task that hasn't started yet. The displaced
+            // task's plan handles drop with it (fd closed, bytes reclaimed).
             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == old.task_id) {
                 t.status = TaskStatus::Cancelled;
                 t.finished_at = Some(std::time::Instant::now());
-                if let Some(path) = t.cleanup_plan_path.take() {
-                    PlanCache::remove_file(&path);
-                }
+                t.plan_output = None;
+                t.apply_plan = None;
             }
         }
 
@@ -231,24 +239,25 @@ impl TaskEngine {
                     .map(|t| t.status == TaskStatus::Cancelling)
                     .unwrap_or(false);
 
-                // Collect plan info and module path before the mutable borrow below.
-                let (plan_info, module_path) = match self.tasks.iter().find(|t| t.id == task_id) {
-                    Some(t) => {
-                        let plan = if success && !is_cancelling {
-                            t.plan_output_path.as_ref().map(|p| {
-                                (t.module_path.clone(), p.clone(), t.id, t.targets.clone())
-                            })
-                        } else {
-                            None
-                        };
-                        (plan, Some(t.module_path.clone()))
-                    }
-                    None => (None, None),
-                };
-
-                let mut cleanup_plan_path = None;
+                let mut plan_to_register = None;
+                let mut module_path = None;
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                    cleanup_plan_path = task.cleanup_plan_path.take();
+                    module_path = Some(task.module_path.clone());
+                    // Terminal task rows must not retain plan handles: they
+                    // live forever as session history, and a lingering clone
+                    // would pin the fd open past cache eviction.
+                    task.apply_plan = None;
+                    let plan_output = task.plan_output.take();
+                    if success && !is_cancelling {
+                        if let Some(handle) = plan_output {
+                            plan_to_register = Some((
+                                task.module_path.clone(),
+                                handle,
+                                task.id,
+                                task.targets.clone(),
+                            ));
+                        }
+                    }
                     task.cancel_handle = None;
                     task.status = if is_cancelling {
                         TaskStatus::Cancelled
@@ -260,14 +269,10 @@ impl TaskEngine {
                     task.finished_at = Some(std::time::Instant::now());
                 }
 
-                // Register the plan file now that the mutable borrow is released.
-                if let Some((mp, plan_path, plan_task_id, plan_targets)) = plan_info {
+                // Register the plan now that the mutable borrow is released.
+                if let Some((mp, handle, plan_task_id, plan_targets)) = plan_to_register {
                     self.plan_cache
-                        .register(mp, plan_path, plan_task_id, plan_targets);
-                }
-
-                if let Some(path) = cleanup_plan_path {
-                    PlanCache::remove_file(&path);
+                        .register(mp, handle, plan_task_id, plan_targets);
                 }
 
                 // Dequeue the next task for this module, or mark it idle.
@@ -280,6 +285,7 @@ impl TaskEngine {
                             self.binary.clone(),
                             queued.command,
                             queued.args,
+                            queued.plan_fd,
                             self.event_tx.clone(),
                             self.semaphore.clone(),
                         );
@@ -320,9 +326,9 @@ impl TaskEngine {
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
                     t.status = TaskStatus::Cancelled;
                     t.finished_at = Some(std::time::Instant::now());
-                    if let Some(path) = t.cleanup_plan_path.take() {
-                        PlanCache::remove_file(&path);
-                    }
+                    // Drop plan handles: fd closes, bytes are reclaimed.
+                    t.plan_output = None;
+                    t.apply_plan = None;
                 }
                 return;
             }
@@ -373,16 +379,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let module_path = tmp.path().to_path_buf();
 
-        let mut engine = TaskEngine::new("echo".to_string(), 1).unwrap();
+        let mut engine = TaskEngine::new("echo".to_string(), 1);
 
         let spec = |command: &str| TaskSpec {
             module_path: module_path.clone(),
             module_name: "m".to_string(),
             command: command.to_string(),
             args: Vec::new(),
-            plan_output_path: None,
+            plan_output: None,
             targets: Vec::new(),
-            cleanup_plan_path: None,
+            apply_plan: None,
         };
 
         let a = engine.push_task(spec("a"));
@@ -405,5 +411,138 @@ mod tests {
         assert_eq!(engine.task(a).unwrap().status, TaskStatus::Success);
         assert_eq!(engine.task(c).unwrap().status, TaskStatus::Success);
         assert_eq!(engine.task(b).unwrap().status, TaskStatus::Cancelled);
+    }
+
+    /// A successful plan task moves its handle into the plan cache; the task
+    /// row itself keeps no clone (terminal rows must not pin fds open).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_plan_registers_handle_in_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_path = tmp.path().to_path_buf();
+
+        let mut engine = TaskEngine::new("echo".to_string(), 1);
+        let handle = PlanHandle::anonymous().unwrap();
+
+        let id = engine.push_task(TaskSpec {
+            module_path: module_path.clone(),
+            module_name: "m".to_string(),
+            command: "plan".to_string(),
+            args: vec!["-out".to_string(), handle.dev_fd_path()],
+            plan_output: Some(handle.clone()),
+            targets: Vec::new(),
+            apply_plan: None,
+        });
+
+        let drain = async {
+            while engine.has_active_tasks() {
+                engine.next_update().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("engine did not settle within 10s");
+
+        assert_eq!(engine.task(id).unwrap().status, TaskStatus::Success);
+        let entry = engine
+            .plan_cache
+            .get(&module_path)
+            .expect("plan not cached");
+        assert_eq!(entry.task_id, id);
+        assert!(engine.task(id).unwrap().plan_output.is_none());
+        // Only the test's clone and the cache's clone remain.
+        assert_eq!(handle.ref_count(), 2);
+    }
+
+    /// A failed plan registers nothing, and every clone of its handle is
+    /// dropped (fd closed) once the task is terminal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_plan_registers_nothing_and_drops_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_path = tmp.path().to_path_buf();
+
+        let mut engine = TaskEngine::new("false".to_string(), 1);
+        let handle = PlanHandle::anonymous().unwrap();
+
+        let id = engine.push_task(TaskSpec {
+            module_path: module_path.clone(),
+            module_name: "m".to_string(),
+            command: "plan".to_string(),
+            args: Vec::new(),
+            plan_output: Some(handle.clone()),
+            targets: Vec::new(),
+            apply_plan: None,
+        });
+
+        let drain = async {
+            while engine.has_active_tasks() {
+                engine.next_update().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("engine did not settle within 10s");
+
+        assert_eq!(engine.task(id).unwrap().status, TaskStatus::Failed);
+        assert!(engine.plan_cache.get(&module_path).is_none());
+        // Only the test's clone remains: engine and runner dropped theirs.
+        assert_eq!(handle.ref_count(), 1);
+    }
+
+    /// A queued apply displaced before it starts drops its plan handle
+    /// without spawning anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn displaced_queued_apply_drops_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_path = tmp.path().to_path_buf();
+
+        let mut engine = TaskEngine::new("echo".to_string(), 1);
+        let handle = PlanHandle::anonymous().unwrap();
+
+        let _a = engine.push_task(TaskSpec {
+            module_path: module_path.clone(),
+            module_name: "m".to_string(),
+            command: "a".to_string(),
+            args: Vec::new(),
+            plan_output: None,
+            targets: Vec::new(),
+            apply_plan: None,
+        });
+        // Queued behind a; carries a cached-plan handle.
+        let b = engine.push_task(TaskSpec {
+            module_path: module_path.clone(),
+            module_name: "m".to_string(),
+            command: "apply".to_string(),
+            args: vec![handle.dev_fd_path()],
+            plan_output: None,
+            targets: Vec::new(),
+            apply_plan: Some(handle.clone()),
+        });
+        // Displaces b before it ever starts.
+        let _c = engine.push_task(TaskSpec {
+            module_path: module_path.clone(),
+            module_name: "m".to_string(),
+            command: "c".to_string(),
+            args: Vec::new(),
+            plan_output: None,
+            targets: Vec::new(),
+            apply_plan: None,
+        });
+
+        assert_eq!(engine.task(b).unwrap().status, TaskStatus::Cancelled);
+        // b's task row and the displaced queue slot both released their
+        // clones; only the test's clone remains.
+        assert_eq!(handle.ref_count(), 1);
+
+        let drain = async {
+            while engine.has_active_tasks() {
+                engine.next_update().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("engine did not settle within 10s");
     }
 }

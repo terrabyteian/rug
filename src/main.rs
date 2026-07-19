@@ -85,8 +85,31 @@ struct ExecArgs {
     filter: Option<String>,
 }
 
+/// Raise the soft fd limit toward the hard limit. Each cached plan pins one
+/// anonymous fd, and macOS defaults the soft limit to 256 — tight for a big
+/// monorepo session plus the pipes of concurrently running tasks.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            let want = std::cmp::min(4096, lim.rlim_max);
+            if lim.rlim_cur < want {
+                lim.rlim_cur = want;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(unix)]
+    raise_nofile_soft_limit();
+
     let cli = Cli::parse();
 
     let root = cli.dir.canonicalize().unwrap_or(cli.dir.clone());
@@ -106,8 +129,7 @@ async fn main() -> Result<()> {
             if root_modules.is_empty() {
                 anyhow::bail!("No terraform root modules found under {}", root.display());
             }
-            let mut app = App::new(config, root.clone(), root_modules)
-                .context("creating secure plan cache")?;
+            let mut app = App::new(config, root.clone(), root_modules);
             ui::run_tui(&mut app)?;
         }
 
@@ -246,7 +268,7 @@ async fn run_headless(
     use engine::{EngineUpdate, TaskEngine, TaskSpec};
     use task::TaskStatus;
 
-    let mut engine = TaskEngine::new(config.binary.clone(), config.parallelism)?;
+    let mut engine = TaskEngine::new(config.binary.clone(), config.parallelism);
 
     let task_ids: Vec<usize> = modules
         .iter()
@@ -256,9 +278,9 @@ async fn run_headless(
                 module_name: module.display_name.clone(),
                 command: command.to_string(),
                 args: extra_args.to_vec(),
-                plan_output_path: None,
+                plan_output: None,
                 targets: Vec::new(),
-                cleanup_plan_path: None,
+                apply_plan: None,
             })
         })
         .collect();

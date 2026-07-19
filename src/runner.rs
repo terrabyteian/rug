@@ -4,6 +4,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
+use crate::plan_cache::PlanHandle;
 use crate::task::{CancelHandle, TaskEvent, TaskEventSender};
 
 /// Spawn a task in a background tokio task, emitting events to `tx`.
@@ -22,6 +23,7 @@ pub fn spawn_task(
     binary: String,
     command: String,
     args: Vec<String>,
+    plan_fd: Option<PlanHandle>,
     tx: TaskEventSender,
     semaphore: Arc<Semaphore>,
 ) -> CancelHandle {
@@ -52,6 +54,28 @@ pub fn spawn_task(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Hand the plan fd to the child: `args` already reference it as
+        // /dev/fd/N (same number in the child — fds are inherited across
+        // fork, and holding `plan_fd` here pins the number until the child
+        // has exited). The fd stays CLOEXEC in the parent so other children
+        // never see it; only this child clears the flag, post-fork.
+        #[cfg(unix)]
+        if let Some(handle) = plan_fd.as_ref() {
+            // Start at offset 0: macOS /dev/fd/N opens share this fd's offset.
+            handle.rewind();
+            let raw = handle.raw_fd();
+            // SAFETY: the closure runs in the forked child before exec and
+            // only calls fcntl, which is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fcntl(raw, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
 
         let _ = tx.send(TaskEvent::Started { task_id });
 

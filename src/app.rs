@@ -7,6 +7,7 @@ use crate::discovery;
 use crate::engine::{EngineUpdate, TaskEngine, TaskSpec};
 use crate::lock::{parse_lock_from_output, read_lock_info};
 use crate::module::Module;
+use crate::plan_cache::PlanHandle;
 use crate::state::StateContent;
 use crate::task::{ResourceCounts, Task, TaskStatus};
 use crate::ui::output_layout::OutputLayout;
@@ -555,10 +556,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, root: PathBuf, modules: Vec<Module>) -> std::io::Result<Self> {
+    pub fn new(config: Config, root: PathBuf, modules: Vec<Module>) -> Self {
         let parallelism = config.parallelism;
-        let engine = TaskEngine::new(config.binary.clone(), parallelism)?;
-        Ok(Self {
+        let engine = TaskEngine::new(config.binary.clone(), parallelism);
+        Self {
             config,
             root,
             screen: Screen::Select,
@@ -576,7 +577,7 @@ impl App {
             state_explorer: None,
             session: None,
             output_layout: OutputLayout::default(),
-        })
+        }
     }
 
     // ── Module navigation ────────────────────────────────────────────────────
@@ -1362,17 +1363,20 @@ impl App {
 
     // ── Command enqueueing ───────────────────────────────────────────────────
 
-    /// Enqueue `plan` for `targets`, writing plan files into the managed temp
-    /// dir so they can be reused by a subsequent apply. Returns created ids.
+    /// Enqueue `plan` for `targets`, writing each plan into an anonymous fd
+    /// (never a named file on disk) so it can be reused by a subsequent
+    /// apply. Returns created ids.
     pub fn enqueue_plan(&mut self, targets: &[usize]) -> Vec<usize> {
         let mut ids = Vec::new();
         for &idx in targets {
-            let plan_path = self
-                .engine
-                .plan_cache
-                .plan_path_for(&self.modules[idx].path);
-            let args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
-            ids.push(self.push_task_for(idx, "plan", args, Some(plan_path), Vec::new(), None));
+            // Fresh anonymous fd per plan run: no stale content to truncate.
+            let (args, handle) = match PlanHandle::anonymous() {
+                Ok(h) => (vec!["-out".to_string(), h.dev_fd_path()], Some(h)),
+                // Can't create the fd (fd exhaustion): degrade to an
+                // uncached plan rather than fail — still never touches disk.
+                Err(_) => (Vec::new(), None),
+            };
+            ids.push(self.push_task_for(idx, "plan", args, handle, Vec::new(), None));
         }
         ids
     }
@@ -1393,25 +1397,21 @@ impl App {
 
     /// Enqueue apply for explicitly captured target indices (from a PendingConfirm).
     ///
-    /// Per module: if a plan file exists in the cache, apply from that file;
+    /// Per module: if a plan exists in the cache, apply from its fd;
     /// otherwise fall back to `-auto-approve`. The cache entry is removed so
-    /// the UI stops advertising a stale plan, and the file is deleted after the
-    /// apply process exits.
+    /// the UI stops advertising a stale plan; the plan's fd closes (and its
+    /// bytes are reclaimed) once the apply task reaches a terminal state.
     fn enqueue_apply_for(&mut self, targets: &[usize]) -> Vec<usize> {
         let mut ids = Vec::new();
         for &idx in targets {
             let module_path = self.modules[idx].path.clone();
-            // `take` removes the cache entry but does NOT delete the file.
-            let (args, cleanup_plan_path) =
-                if let Some(plan_path) = self.engine.plan_cache.take(&module_path) {
-                    (
-                        vec![plan_path.to_string_lossy().into_owned()],
-                        Some(plan_path),
-                    )
-                } else {
-                    (vec!["-auto-approve".to_string()], None)
-                };
-            ids.push(self.push_task_for(idx, "apply", args, None, Vec::new(), cleanup_plan_path));
+            let (args, apply_plan) = if let Some(handle) = self.engine.plan_cache.take(&module_path)
+            {
+                (vec![handle.dev_fd_path()], Some(handle))
+            } else {
+                (vec!["-auto-approve".to_string()], None)
+            };
+            ids.push(self.push_task_for(idx, "apply", args, None, Vec::new(), apply_plan));
         }
 
         ids
@@ -1440,9 +1440,9 @@ impl App {
         module_idx: usize,
         command: &str,
         args: Vec<String>,
-        plan_output_path: Option<PathBuf>,
+        plan_output: Option<PlanHandle>,
         targets: Vec<String>,
-        cleanup_plan_path: Option<PathBuf>,
+        apply_plan: Option<PlanHandle>,
     ) -> usize {
         let module = &self.modules[module_idx];
         self.engine.push_task(TaskSpec {
@@ -1450,9 +1450,9 @@ impl App {
             module_name: module.display_name.clone(),
             command: command.to_string(),
             args,
-            plan_output_path,
+            plan_output,
             targets,
-            cleanup_plan_path,
+            apply_plan,
         })
     }
 
@@ -1464,18 +1464,16 @@ impl App {
         self.stage_module_confirm(ConfirmKind::Apply, targets);
     }
 
-    /// Whether `task` is the plan whose output file the plan cache currently
-    /// owns for its module (i.e. a subsequent apply would consume it). Retained
-    /// for the cache-owner invariant it encodes and its regression test; the
-    /// live apply path re-derives this via `plan_cache.take` in `enqueue_apply_for`.
+    /// Whether `task` is the plan whose output the plan cache currently owns
+    /// for its module (i.e. a subsequent apply would consume it). Task ids are
+    /// globally unique, so `plan.task_id == task.id` is a complete identity
+    /// check. Retained for the cache-owner invariant it encodes and its
+    /// regression test; the live apply path re-derives this via
+    /// `plan_cache.take` in `enqueue_apply_for`.
     #[allow(dead_code)]
     pub fn ready_plan_for_task(&self, task: &Task) -> Option<&crate::plan_cache::PlanEntry> {
         let plan = self.engine.plan_cache.get(&task.module_path)?;
-        if task.command == "plan"
-            && task.status == TaskStatus::Success
-            && task.plan_output_path.as_ref() == Some(&plan.path)
-            && plan.task_id == task.id
-        {
+        if task.command == "plan" && task.status == TaskStatus::Success && plan.task_id == task.id {
             Some(plan)
         } else {
             None
@@ -1993,22 +1991,16 @@ impl App {
             return;
         }
 
-        let plan_path = self
-            .engine
-            .plan_cache
-            .plan_path_for(&self.modules[module_idx].path);
-        let mut args = vec!["-out".to_string(), plan_path.to_string_lossy().into_owned()];
+        // Fresh anonymous fd per plan run; on failure (fd exhaustion),
+        // degrade to an uncached plan rather than fail.
+        let (mut args, handle) = match PlanHandle::anonymous() {
+            Ok(h) => (vec!["-out".to_string(), h.dev_fd_path()], Some(h)),
+            Err(_) => (Vec::new(), None),
+        };
         for addr in &targets {
             args.push(format!("-target={}", addr));
         }
-        let task_id = self.push_task_for(
-            module_idx,
-            "plan",
-            args,
-            Some(plan_path),
-            targets.clone(),
-            None,
-        );
+        let task_id = self.push_task_for(module_idx, "plan", args, handle, targets.clone(), None);
         self.record_explorer_task(module_idx, task_id);
         if let Some(explorer) = self.state_explorer.as_mut() {
             explorer.plan_queued_notice = true;
@@ -2351,10 +2343,10 @@ mod tests {
             ..Default::default()
         };
 
-        App::new(config, root, modules).unwrap()
+        App::new(config, root, modules)
     }
 
-    fn push_plan_task(app: &mut App, id: usize, plan_path: PathBuf) {
+    fn push_plan_task(app: &mut App, id: usize) {
         let module = &app.modules[0];
         app.engine.tasks.push(Task {
             id,
@@ -2365,9 +2357,9 @@ mod tests {
             output_lines: Vec::new(),
             started_at: Some(Instant::now()),
             finished_at: Some(Instant::now()),
-            plan_output_path: Some(plan_path),
+            plan_output: None,
             targets: Vec::new(),
-            cleanup_plan_path: None,
+            apply_plan: None,
             resource_counts: None,
             cancel_handle: None,
         });
@@ -2389,7 +2381,7 @@ mod tests {
             show_library_modules: false,
             ..Default::default()
         };
-        App::new(config, root, modules).unwrap()
+        App::new(config, root, modules)
     }
 
     #[test]
@@ -2426,13 +2418,13 @@ mod tests {
     fn ready_plan_for_task_requires_current_cache_owner() {
         let mut app = test_app();
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
 
-        push_plan_task(&mut app, 1, plan_path.clone());
-        push_plan_task(&mut app, 2, plan_path.clone());
+        push_plan_task(&mut app, 1);
+        push_plan_task(&mut app, 2);
+        let handle = crate::plan_cache::PlanHandle::anonymous().unwrap();
         app.engine
             .plan_cache
-            .register(module_path, plan_path, app.engine.tasks[1].id, Vec::new());
+            .register(module_path, handle, app.engine.tasks[1].id, Vec::new());
 
         assert!(app.ready_plan_for_task(&app.engine.tasks[0]).is_none());
         assert!(app.ready_plan_for_task(&app.engine.tasks[1]).is_some());
@@ -2619,7 +2611,7 @@ mod tests {
             show_library_modules: false,
             ..Default::default()
         };
-        App::new(config, dir, modules).unwrap()
+        App::new(config, dir, modules)
     }
 
     /// Drive the engine to quiescence (like the engine's own queue test).
@@ -2672,10 +2664,10 @@ mod tests {
         let module_path = app.modules[0].path.clone();
 
         // Pre-register a cached plan entry; a targeted apply must NOT consume it.
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        let handle = crate::plan_cache::PlanHandle::anonymous().unwrap();
         app.engine.plan_cache.register(
             module_path.clone(),
-            plan_path,
+            handle,
             99,
             vec!["null_resource.a".into()],
         );
@@ -2715,10 +2707,10 @@ mod tests {
     fn apply_confirm_carries_plan_targets() {
         let mut app = test_app();
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        let handle = crate::plan_cache::PlanHandle::anonymous().unwrap();
         app.engine.plan_cache.register(
             module_path,
-            plan_path,
+            handle,
             7,
             vec!["module.net".into(), "null_resource.a".into()],
         );
@@ -2757,7 +2749,7 @@ mod tests {
             show_library_modules: false,
             ..Default::default()
         };
-        App::new(config, root, modules).unwrap()
+        App::new(config, root, modules)
     }
 
     #[cfg(unix)]
@@ -2873,9 +2865,9 @@ mod tests {
             output_lines: vec!["hello world".to_string(), "second line".to_string()],
             started_at: Some(Instant::now()),
             finished_at: None,
-            plan_output_path: None,
+            plan_output: None,
             targets: Vec::new(),
-            cleanup_plan_path: None,
+            apply_plan: None,
             resource_counts: None,
             cancel_handle: None,
         });

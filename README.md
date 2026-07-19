@@ -60,10 +60,15 @@ terraform shuts down gracefully and releases its state lock.
 ### Apply the exact plan you reviewed
 
 A successful plan is saved per module and badged `P:{age}`. Apply consumes that
-saved plan file instead of re-planning, and the confirm dialog shows which plan
+saved plan instead of re-planning, and the confirm dialog shows which plan
 it will use and how old it is. No drift between what you reviewed and what ships.
 
-![Planning a module, then applying the cached plan file it produced](docs/demo-cached-plan.gif)
+Saved plans never touch disk — plan output can contain secrets. rug holds each
+plan in memory (Linux) or in an unlinked anonymous file (macOS) and hands it to
+terraform via `/dev/fd`, so it has no filesystem path and vanishes when rug
+exits, even on a crash.
+
+![Planning a module, then applying the cached plan it produced](docs/demo-cached-plan.gif)
 
 ### Browse state without leaving the terminal
 

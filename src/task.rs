@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+use crate::plan_cache::PlanHandle;
 use crate::util::strip_ansi;
 
 /// Status of a task.
@@ -185,17 +186,18 @@ pub struct Task {
     pub output_lines: Vec<String>,
     pub started_at: Option<Instant>,
     pub finished_at: Option<Instant>,
-    /// For plan tasks: the path where the plan file is being written.
-    /// Registered in PlanCache on successful completion.
-    pub plan_output_path: Option<PathBuf>,
+    /// For plan tasks: the anonymous file terraform writes via
+    /// `-out /dev/fd/N`. Moved into PlanCache on successful completion;
+    /// dropped (fd closed) otherwise.
+    pub plan_output: Option<PlanHandle>,
     /// The `-target=` addresses this task was scoped to (plan, apply, destroy,
     /// taint, state rm). Empty = untargeted (full) operation. Used for display;
     /// for plan tasks it is also registered into the plan cache alongside
-    /// `plan_output_path`.
+    /// `plan_output`.
     pub targets: Vec<String>,
-    /// For apply tasks created from a cached plan: delete this plan after the
-    /// apply task exits or is cancelled before it starts.
-    pub cleanup_plan_path: Option<PathBuf>,
+    /// For apply tasks consuming a cached plan: dropped (fd closed, plan
+    /// bytes reclaimed) once the task reaches a terminal state.
+    pub apply_plan: Option<PlanHandle>,
     /// Resource operation counts parsed from the plan/apply/destroy summary line.
     /// None until a summary line has been seen in the task output.
     pub resource_counts: Option<ResourceCounts>,

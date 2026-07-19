@@ -2132,7 +2132,7 @@ mod tests {
             show_library_modules: false,
             ..Default::default()
         };
-        App::new(config, root, modules).unwrap()
+        App::new(config, root, modules)
     }
 
     fn make_session(app: &mut App) {
@@ -2180,9 +2180,9 @@ mod tests {
             output_lines: lines,
             started_at: Some(Instant::now()),
             finished_at: None,
-            plan_output_path: None,
+            plan_output: None,
             targets: Vec::new(),
-            cleanup_plan_path: None,
+            apply_plan: None,
             resource_counts: None,
             cancel_handle: None,
         });
@@ -2297,9 +2297,9 @@ mod tests {
                 output_lines: Vec::new(),
                 started_at: Some(Instant::now()),
                 finished_at: terminal.then(Instant::now),
-                plan_output_path: None,
+                plan_output: None,
                 targets: vec!["null_resource.a".to_string(), "null_resource.b".to_string()],
-                cleanup_plan_path: None,
+                apply_plan: None,
                 resource_counts: None,
                 cancel_handle: None,
             });
@@ -2408,9 +2408,9 @@ mod tests {
                 output_lines: Vec::new(),
                 started_at: Some(Instant::now()), // drives elapsed_str() -> dim()
                 finished_at: None,
-                plan_output_path: None,
+                plan_output: None,
                 targets: Vec::new(),
-                cleanup_plan_path: None,
+                apply_plan: None,
                 resource_counts,
                 cancel_handle: None,
             });
@@ -2673,10 +2673,10 @@ mod tests {
         let mut app = demo_app(3);
         make_session(&mut app);
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        let handle = crate::plan_cache::PlanHandle::anonymous().unwrap();
         app.engine
             .plan_cache
-            .register(module_path, plan_path, 1, vec!["module.net".to_string()]);
+            .register(module_path, handle, 1, vec!["module.net".to_string()]);
 
         // The `P:{age}·T{n}` badge is a wide-tier-only extra (`show_extras`).
         let s = render_to_string(&mut app, 120, 35);
@@ -2690,10 +2690,10 @@ mod tests {
     fn select_list_shows_targeted_plan_badge() {
         let mut app = demo_app(3);
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        let handle = crate::plan_cache::PlanHandle::anonymous().unwrap();
         app.engine
             .plan_cache
-            .register(module_path, plan_path, 1, vec!["module.net".to_string()]);
+            .register(module_path, handle, 1, vec!["module.net".to_string()]);
 
         // The `P:{age}·T{n}` badge only renders once the list is wide enough
         // (`show_age`, width ≥ 80); use 120×35 to be safely inside that tier.
@@ -2708,10 +2708,10 @@ mod tests {
     fn apply_confirm_shows_targeted_warning() {
         let mut app = demo_app(3);
         let module_path = app.modules[0].path.clone();
-        let plan_path = app.engine.plan_cache.plan_path_for(&module_path);
+        let handle = crate::plan_cache::PlanHandle::anonymous().unwrap();
         app.engine.plan_cache.register(
             module_path,
-            plan_path,
+            handle,
             1,
             vec!["module.net".to_string(), "null_resource.a".to_string()],
         );
