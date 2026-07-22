@@ -84,10 +84,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         (None, board_area)
     };
+    // Computed once per frame so the column header and every board row draw
+    // their columns from the same x-positions (see `BoardLayout`).
+    let layout = BoardLayout::compute(app, session, bp.w);
     if let Some(col_area) = col_area {
-        render_col_header(f, col_area, bp.w);
+        render_col_header(f, col_area, bp.w, &layout);
     }
-    let board_offset = render_board(f, list_area, app, bp.w);
+    let board_offset = render_board(f, list_area, app, bp.w, &layout);
 
     render_separator(f, sep_area, app);
     render_output(f, output_area, app);
@@ -117,7 +120,14 @@ fn render_collapsed(f: &mut Frame, area: Rect, app: &mut App, bp: Breakpoints) {
         .split(area);
 
     render_header(f, chunks[0], app);
-    let board_offset = render_board(f, chunks[1], app, bp.w);
+    // `render_collapsed` is only reached once the caller has confirmed a
+    // session exists; the `unwrap_or_default` is just a defensive fallback.
+    let layout = app
+        .session
+        .as_ref()
+        .map(|s| BoardLayout::compute(app, s, bp.w))
+        .unwrap_or_default();
+    let board_offset = render_board(f, chunks[1], app, bp.w, &layout);
 
     // Status tail: last output line of the cursor module.
     let last = app
@@ -191,13 +201,131 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_col_header(f: &mut Frame, area: Rect, w: WidthTier) {
-    let text = match w {
-        WidthTier::W1 => "  MODULE                COMMAND  STATUS      TIME  CHANGES",
-        WidthTier::W2 => "  MODULE                COMMAND  STATUS      TIME",
-        WidthTier::W3 => "  MODULE                STATUS      TIME",
-        WidthTier::W4 => "  MODULE            STATUS",
-    };
+/// Fixed width of the padded TIME/elapsed column (rows and header agree).
+const ELAPSED_W: usize = 6;
+
+/// Column widths shared by `render_col_header` and `board_row`, computed once
+/// per frame so every x-position comes from this one source of truth instead
+/// of each function guessing its own padding.
+///
+/// Each width floors at its header word's length (`MODULE`/`COMMAND`/`STATUS`)
+/// so a short column's title never overflows into the next column.
+#[derive(Debug, Clone, Copy, Default)]
+struct BoardLayout {
+    /// MODULE column: longest module name in the session, clamped to a
+    /// per-tier cap; names longer than the cap are truncated with '…'.
+    name_w: usize,
+    /// COMMAND column (command + optional `·T{n}` chip). Meaningful on
+    /// W1/W2 only — 0 elsewhere, where the column isn't shown.
+    cmd_w: usize,
+    /// STATUS column: icon + space + longest status word on W1; on W2-W4
+    /// the row only shows the icon, so this is just wide enough for the
+    /// "STATUS" header word.
+    status_w: usize,
+}
+
+impl BoardLayout {
+    const NAME_MIN: usize = 6; // len("MODULE")
+    const CMD_MIN: usize = 7; // len("COMMAND")
+    const STATUS_MIN: usize = 6; // len("STATUS")
+
+    fn compute(app: &App, session: &crate::app::RunSession, w: WidthTier) -> Self {
+        let name_cap: usize = match w {
+            WidthTier::W1 => 36,
+            WidthTier::W2 => 28,
+            WidthTier::W3 => 24,
+            WidthTier::W4 => 16,
+        };
+        let name_w = session
+            .modules
+            .iter()
+            .map(|m| m.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .clamp(Self::NAME_MIN, name_cap);
+
+        let show_command = matches!(w, WidthTier::W1 | WidthTier::W2);
+        let cmd_w = if show_command {
+            session
+                .modules
+                .iter()
+                .map(|m| match app.display_task_for(&m.path) {
+                    Some((t, _)) => command_group_len(t),
+                    None => "—".chars().count(),
+                })
+                .max()
+                .unwrap_or(0)
+                .max(Self::CMD_MIN)
+        } else {
+            0
+        };
+
+        let status_w = if matches!(w, WidthTier::W1) {
+            (2 + status_word_max_len()).max(Self::STATUS_MIN)
+        } else {
+            Self::STATUS_MIN
+        };
+
+        Self {
+            name_w,
+            cmd_w,
+            status_w,
+        }
+    }
+}
+
+/// Cell width of a task's command group: the command string plus its
+/// `·T{n}` chip when the task has targets. Shared by `BoardLayout::compute`
+/// (sizing) and `board_row` (padding).
+fn command_group_len(t: &Task) -> usize {
+    let mut n = t.command.chars().count();
+    if !t.targets.is_empty() {
+        n += format!("\u{b7}T{}", t.targets.len()).chars().count();
+    }
+    n
+}
+
+/// Pad or truncate `s` to exactly `w` character cells: shorter strings are
+/// right-padded with spaces; longer ones are truncated with a trailing '…'
+/// (via `truncate`) so later columns land at the same x-offset on every row.
+fn pad_or_truncate(s: &str, w: usize) -> String {
+    let len = s.chars().count();
+    if len > w {
+        truncate(s, w)
+    } else {
+        format!("{s}{}", " ".repeat(w - len))
+    }
+}
+
+fn render_col_header(f: &mut Frame, area: Rect, w: WidthTier, layout: &BoardLayout) {
+    // 3-space prefix mirrors the row's cursor bar (1 cell) + multi-select
+    // mark (2 cells); each title then sits over the column `board_row` pads
+    // to the same width.
+    let mut text = format!("   {:<name_w$}", "MODULE", name_w = layout.name_w);
+    match w {
+        WidthTier::W1 => text.push_str(&format!(
+            "  {:<cmd_w$}  {:<status_w$}  {:<time_w$}  CHANGES",
+            "COMMAND",
+            "STATUS",
+            "TIME",
+            cmd_w = layout.cmd_w,
+            status_w = layout.status_w,
+            time_w = ELAPSED_W,
+        )),
+        WidthTier::W2 => text.push_str(&format!(
+            "  {:<cmd_w$}  {:<status_w$}  TIME",
+            "COMMAND",
+            "STATUS",
+            cmd_w = layout.cmd_w,
+            status_w = layout.status_w,
+        )),
+        WidthTier::W3 => text.push_str(&format!(
+            "  {:<status_w$}  TIME",
+            "STATUS",
+            status_w = layout.status_w,
+        )),
+        WidthTier::W4 => text.push_str("  STATUS"),
+    }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(text, theme::col_header()))),
         area,
@@ -205,7 +333,7 @@ fn render_col_header(f: &mut Frame, area: Rect, w: WidthTier) {
 }
 
 /// Render the board list and return its scroll offset (for mouse hit-testing).
-fn render_board(f: &mut Frame, area: Rect, app: &App, w: WidthTier) -> u16 {
+fn render_board(f: &mut Frame, area: Rect, app: &App, w: WidthTier, layout: &BoardLayout) -> u16 {
     let Some(session) = app.session.as_ref() else {
         return 0;
     };
@@ -218,7 +346,7 @@ fn render_board(f: &mut Frame, area: Rect, app: &App, w: WidthTier) -> u16 {
             let is_cursor = pos == session.cursor;
             let is_multi = session.selected.contains(&pos);
             let display = app.display_task_for(&sm.path);
-            let line = board_row(app, sm, is_cursor, is_multi, display, w);
+            let line = board_row(app, sm, is_cursor, is_multi, display, w, layout);
             if is_cursor {
                 ListItem::new(theme::lift_fg(line)).style(theme::row_cursor())
             } else {
@@ -242,6 +370,7 @@ fn board_row(
     is_multi: bool,
     display: Option<(&Task, bool)>,
     w: WidthTier,
+    layout: &BoardLayout,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
 
@@ -260,8 +389,8 @@ fn board_row(
     } else {
         spans.push(Span::raw("  "));
     }
-    // Name.
-    spans.push(Span::raw(sm.name.clone()));
+    // Name, padded/truncated to the shared column width.
+    spans.push(Span::raw(pad_or_truncate(&sm.name, layout.name_w)));
 
     let task = display.map(|(t, _)| t);
     let is_prev = display.map(|(_, p)| p).unwrap_or(false);
@@ -274,11 +403,13 @@ fn board_row(
 
     // Command (+ target chip: describes the task itself, shown while running
     // and in the finished result row — distinct from the CACHED-PLAN P:{age}·T
-    // badge below, which describes the plan-cache entry).
+    // badge below, which describes the plan-cache entry). Padded as a group
+    // to `cmd_w` so the STATUS column starts at the same x on every row.
     if show_command {
         let cmd = task
             .map(|t| t.command.clone())
             .unwrap_or_else(|| "—".to_string());
+        let content_w = task.map(command_group_len).unwrap_or(cmd.chars().count());
         spans.push(Span::styled(format!("  {cmd}"), theme::command_text()));
         if let Some(t) = task {
             if !t.targets.is_empty() {
@@ -288,23 +419,31 @@ fn board_row(
                 ));
             }
         }
+        let pad = layout.cmd_w.saturating_sub(content_w);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
     }
 
-    // Status icon (+ word).
+    // Status icon (+ word), padded as a group to `status_w`.
     let (icon, word, style) = status_parts(app, task);
     spans.push(Span::styled(format!("  {icon}"), style));
+    let mut status_content_w = icon.chars().count();
     if show_word {
         spans.push(Span::styled(format!(" {word}"), style));
+        status_content_w += 1 + word.chars().count();
+    }
+    let pad = layout.status_w.saturating_sub(status_content_w);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
     }
 
-    // Elapsed.
+    // Elapsed, padded to a fixed width — empty when there's no elapsed time
+    // yet, so counts/badges after it still line up on every row.
     if show_elapsed {
-        if let Some(t) = task {
-            let e = t.elapsed_str();
-            if !e.is_empty() {
-                spans.push(Span::styled(format!("  {e}"), theme::dim()));
-            }
-        }
+        let e = task.map(|t| t.elapsed_str()).unwrap_or_default();
+        let pad = " ".repeat(ELAPSED_W.saturating_sub(e.chars().count()));
+        spans.push(Span::styled(format!("  {e}{pad}"), theme::dim()));
     }
 
     // Resource counts.
@@ -340,25 +479,52 @@ fn board_row(
 /// (icon, word, style) for a board row's display task.
 fn status_parts(app: &App, task: Option<&Task>) -> (String, &'static str, Style) {
     let Some(t) = task else {
-        return ("·".to_string(), "—", theme::dim());
+        return ("·".to_string(), status_word_for(None), theme::dim());
     };
     let style = theme::status_style(&t.status);
-    match t.status {
-        TaskStatus::Pending => ("○".to_string(), "queued", style),
-        TaskStatus::Running => (
-            theme::spinner(app.spinner_tick).to_string(),
-            "running",
-            style,
-        ),
-        TaskStatus::Cancelling => (
-            theme::spinner(app.spinner_tick).to_string(),
-            "cancel",
-            style,
-        ),
-        TaskStatus::Success => ("✓".to_string(), "done", style),
-        TaskStatus::Failed => ("✗".to_string(), "failed", style),
-        TaskStatus::Cancelled => ("⊘".to_string(), "cancelled", style),
+    let icon = match t.status {
+        TaskStatus::Pending => "○".to_string(),
+        TaskStatus::Running | TaskStatus::Cancelling => {
+            theme::spinner(app.spinner_tick).to_string()
+        }
+        TaskStatus::Success => "✓".to_string(),
+        TaskStatus::Failed => "✗".to_string(),
+        TaskStatus::Cancelled => "⊘".to_string(),
+    };
+    (icon, status_word_for(Some(&t.status)), style)
+}
+
+/// The status word `status_parts` shows for a task's status (or "—" when
+/// idle) — pulled out so `BoardLayout::compute` can size the STATUS column
+/// from the same source instead of duplicating the word list.
+fn status_word_for(status: Option<&TaskStatus>) -> &'static str {
+    match status {
+        None => "—",
+        Some(TaskStatus::Pending) => "queued",
+        Some(TaskStatus::Running) => "running",
+        Some(TaskStatus::Cancelling) => "cancel",
+        Some(TaskStatus::Success) => "done",
+        Some(TaskStatus::Failed) => "failed",
+        Some(TaskStatus::Cancelled) => "cancelled",
     }
+}
+
+/// Longest word `status_word_for` can produce, across every status plus the
+/// idle "—" case — used to size the STATUS column on W1.
+fn status_word_max_len() -> usize {
+    [
+        None,
+        Some(TaskStatus::Pending),
+        Some(TaskStatus::Running),
+        Some(TaskStatus::Cancelling),
+        Some(TaskStatus::Success),
+        Some(TaskStatus::Failed),
+        Some(TaskStatus::Cancelled),
+    ]
+    .iter()
+    .map(|s| status_word_for(s.as_ref()).chars().count())
+    .max()
+    .unwrap_or(0)
 }
 
 fn render_separator(f: &mut Frame, area: Rect, app: &App) {

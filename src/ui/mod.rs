@@ -2314,6 +2314,228 @@ mod tests {
         }
     }
 
+    /// Build a session whose modules have clearly different name lengths and
+    /// tasks in different states, for the column-alignment tests below.
+    /// Module 0 ("db") has a finished, targeted task; module 1
+    /// ("networking-long-name") has a failed one; module 2 ("queue") has no
+    /// task at all, exercising the idle "—"/blank padding.
+    fn demo_app_with_varied_modules() -> App {
+        let root = PathBuf::from("/tmp/rug-ui-test-align");
+        let names = ["db", "networking-long-name", "queue"];
+        let modules: Vec<Module> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Module {
+                path: root.join(format!("mod{i}")),
+                display_name: n.to_string(),
+                kind: ModuleKind::Root,
+            })
+            .collect();
+        let config = Config {
+            binary: "terraform".to_string(),
+            parallelism: 2,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+            ..Default::default()
+        };
+        let mut app = App::new(config, root, modules);
+        make_session(&mut app);
+
+        let path0 = app.modules[0].path.clone();
+        app.engine.tasks.push(Task {
+            id: 0,
+            module_path: path0.clone(),
+            module_name: "db".to_string(),
+            command: "apply".to_string(),
+            status: TaskStatus::Success,
+            output_lines: Vec::new(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+            plan_output: None,
+            targets: vec!["null_resource.a".to_string(), "null_resource.b".to_string()],
+            apply_plan: None,
+            resource_counts: None,
+            cancel_handle: None,
+        });
+        app.session.as_mut().unwrap().latest_task.insert(path0, 0);
+
+        let path1 = app.modules[1].path.clone();
+        app.engine.tasks.push(Task {
+            id: 1,
+            module_path: path1.clone(),
+            module_name: "networking-long-name".to_string(),
+            command: "plan".to_string(),
+            status: TaskStatus::Failed,
+            output_lines: Vec::new(),
+            started_at: Some(Instant::now()),
+            finished_at: Some(Instant::now()),
+            plan_output: None,
+            targets: Vec::new(),
+            apply_plan: None,
+            resource_counts: None,
+            cancel_handle: None,
+        });
+        app.session.as_mut().unwrap().latest_task.insert(path1, 1);
+        // Module 2 ("queue") intentionally has no task.
+
+        app
+    }
+
+    /// Regression test for GH #3: the column header's titles must sit at
+    /// exactly the x-offset where each row's own content for that column
+    /// begins — on every row, regardless of module-name length or task
+    /// state — at both W1 (command word shown) and W2 (icon-only status)
+    /// widths.
+    #[test]
+    fn run_column_header_aligns_with_row_content() {
+        let mut app = demo_app_with_varied_modules();
+
+        for &(w, h) in &[(120u16, 30u16), (90u16, 30u16)] {
+            let s = render_to_string(&mut app, w, h);
+            let lines: Vec<&str> = s.lines().collect();
+            let header = *lines
+                .iter()
+                .find(|l| l.contains("MODULE"))
+                .unwrap_or_else(|| panic!("no column header at {w}x{h}"));
+            assert!(
+                header.starts_with("   "),
+                "header should start with a 3-space prefix at {w}x{h}: {header:?}"
+            );
+            assert!(header.contains("COMMAND"), "missing COMMAND at {w}x{h}");
+            assert!(header.contains("STATUS"), "missing STATUS at {w}x{h}");
+            assert!(header.contains("TIME"), "missing TIME at {w}x{h}");
+
+            let module_off = char_offset(header, "MODULE");
+            let command_off = char_offset(header, "COMMAND");
+            let status_off = char_offset(header, "STATUS");
+            let time_off = char_offset(header, "TIME");
+
+            let row_db = *lines
+                .iter()
+                .find(|l| l.contains("db") && l.contains("apply"))
+                .unwrap_or_else(|| panic!("no db row at {w}x{h}"));
+            let row_net = *lines
+                .iter()
+                .find(|l| l.contains("networking-long-name"))
+                .unwrap_or_else(|| panic!("no networking row at {w}x{h}"));
+            let row_queue = *lines
+                .iter()
+                .find(|l| l.contains("queue"))
+                .unwrap_or_else(|| panic!("no queue row at {w}x{h}"));
+
+            // MODULE: every row's name starts at the same x as the header.
+            assert_eq!(
+                char_offset(row_db, "db"),
+                module_off,
+                "MODULE x-offset mismatch (db row) at {w}x{h}"
+            );
+            assert_eq!(
+                char_offset(row_net, "networking-long-name"),
+                module_off,
+                "MODULE x-offset mismatch (networking row) at {w}x{h}"
+            );
+            assert_eq!(
+                char_offset(row_queue, "queue"),
+                module_off,
+                "MODULE x-offset mismatch (queue row) at {w}x{h}"
+            );
+
+            // COMMAND: shown at both W1 and W2. The idle row still pads out
+            // to the column width, so its "—" lands at the same offset.
+            assert_eq!(
+                char_offset(row_db, "apply"),
+                command_off,
+                "COMMAND x-offset mismatch (db row) at {w}x{h}"
+            );
+            assert_eq!(
+                char_offset(row_net, "plan"),
+                command_off,
+                "COMMAND x-offset mismatch (networking row) at {w}x{h}"
+            );
+            assert_eq!(
+                char_offset(row_queue, "—"),
+                command_off,
+                "COMMAND x-offset mismatch (queue/idle row) at {w}x{h}"
+            );
+
+            // STATUS: the icon is drawn at every tier (only the word is
+            // W1-only), so use the fixed Success/Failed glyphs to locate it.
+            assert_eq!(
+                char_offset(row_db, "✓"),
+                status_off,
+                "STATUS x-offset mismatch (db row) at {w}x{h}"
+            );
+            assert_eq!(
+                char_offset(row_net, "✗"),
+                status_off,
+                "STATUS x-offset mismatch (networking row) at {w}x{h}"
+            );
+
+            // TIME: both tasks finished instantly, so elapsed_str() is "0s".
+            assert_eq!(
+                char_offset(row_db, "0s"),
+                time_off,
+                "TIME x-offset mismatch (db row) at {w}x{h}"
+            );
+            assert_eq!(
+                char_offset(row_net, "0s"),
+                time_off,
+                "TIME x-offset mismatch (networking row) at {w}x{h}"
+            );
+        }
+    }
+
+    /// Character (not byte) offset of `needle`'s first occurrence in `s` —
+    /// rows can carry multi-byte glyphs (the cursor bar, status icons) before
+    /// a column, so a raw `str::find` byte offset would misalign against the
+    /// header's plain-ASCII prefix.
+    fn char_offset(s: &str, needle: &str) -> usize {
+        let byte_idx = s
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not found in {s:?}"));
+        s[..byte_idx].chars().count()
+    }
+
+    /// A module name longer than the tier's cap is truncated with a trailing
+    /// '…' so it still occupies exactly `name_w` cells — later columns must
+    /// not shift because of an oversized name.
+    #[test]
+    fn run_board_truncates_long_module_name() {
+        let root = PathBuf::from("/tmp/rug-ui-test-truncate");
+        let long_name = "a".repeat(50); // longer than every tier's name cap
+        let modules = vec![Module {
+            path: root.join("mod0"),
+            display_name: long_name,
+            kind: ModuleKind::Root,
+        }];
+        let config = Config {
+            binary: "terraform".to_string(),
+            parallelism: 2,
+            ignore_dirs: Vec::new(),
+            show_library_modules: false,
+            ..Default::default()
+        };
+        let mut app = App::new(config, root, modules);
+        make_session(&mut app);
+
+        // W1 caps MODULE at 36 cells; a 50-char name must be truncated.
+        let s = render_to_string(&mut app, 120, 30);
+        let row = s
+            .lines()
+            .find(|l| l.contains('…'))
+            .unwrap_or_else(|| panic!("expected a truncated module name row"));
+        let name_field: String = row.chars().skip(3).take(36).collect();
+        assert_eq!(name_field.chars().count(), 36);
+        assert!(
+            name_field.ends_with('…'),
+            "truncated name should end with an ellipsis: {name_field:?}"
+        );
+        assert!(
+            name_field.starts_with(&"a".repeat(35)),
+            "truncated name should keep its prefix: {name_field:?}"
+        );
+    }
+
     #[test]
     fn help_is_screen_aware() {
         // Select help mentions Select-only keys (filter/depth); Run help
